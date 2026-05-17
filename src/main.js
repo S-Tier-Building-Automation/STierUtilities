@@ -1,6 +1,10 @@
 const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const opener = window.__TAURI__.opener;
+const updater = window.__TAURI__.updater;
+const tauriProcess = window.__TAURI__.process;
+
+const APP_VERSION = "0.5.0";
 
 // ============================================================================
 // Tool catalog
@@ -462,18 +466,44 @@ function renderSettings() {
     el("h2", {}, "Settings"),
   ));
 
+  // ===== Updates card =====
+  const statusLine = el("p", { class: "muted small", id: "update-status" },
+    `You're running v${APP_VERSION}.`);
+  const progressBar = el("div", { class: "progress-bar", id: "update-progress" },
+    el("div", { class: "progress-fill", id: "update-progress-fill" }));
+  progressBar.style.display = "none";
+  const actions = el("div", { class: "tool-actions" });
+
+  const checkBtn = el("button", {
+    class: "btn btn-primary",
+    onclick: () => checkForUpdates({ manual: true }),
+  }, "Check for updates");
+  actions.appendChild(checkBtn);
+
+  root.appendChild(el("section", { class: "settings-card" },
+    el("h3", {}, "Updates"),
+    statusLine,
+    progressBar,
+    actions,
+    el("p", { class: "muted small", style: "margin-top: 10px;" },
+      "Updates are signed and delivered via GitHub Releases. The app checks on launch and prompts before installing.",
+    ),
+  ));
+
+  // ===== About =====
   root.appendChild(el("section", { class: "settings-card" },
     el("h3", {}, "About"),
-    el("p", {}, "MicroTools is a small Tauri desktop hub for native Windows utilities."),
+    el("p", {}, "S-Tier Utilities is a small Tauri desktop hub for native Windows utilities."),
     el("p", {},
       "Source: ",
       el("a", {
         href: "#",
-        onclick: (e) => { e.preventDefault(); openExternal("https://github.com/stier1ba/MicroTools"); },
-      }, "github.com/stier1ba/MicroTools"),
+        onclick: (e) => { e.preventDefault(); openExternal("https://github.com/S-Tier-Building-Automation/STierUtilities"); },
+      }, "github.com/S-Tier-Building-Automation/STierUtilities"),
     ),
   ));
 
+  // ===== Preferences =====
   root.appendChild(el("section", { class: "settings-card" },
     el("h3", {}, "Preferences"),
     el("p", { class: "muted small" },
@@ -493,6 +523,80 @@ function renderSettings() {
       },
     }, "Reset preferences"),
   ));
+}
+
+// ============================================================================
+// Updater
+// ============================================================================
+
+let updateInFlight = false;
+
+function setUpdateStatus(text, kind = "info") {
+  const node = document.getElementById("update-status");
+  if (!node) return;
+  node.textContent = text;
+  node.className = `muted small update-status-${kind}`;
+}
+
+async function checkForUpdates({ manual = false, silent = false } = {}) {
+  if (updateInFlight) return;
+  updateInFlight = true;
+  try {
+    if (!silent) setUpdateStatus("Checking for updates…");
+    const update = await updater.check();
+    if (!update) {
+      if (!silent) setUpdateStatus(`You're on the latest version (v${APP_VERSION}).`, "ok");
+      return;
+    }
+    setUpdateStatus(`Update available: v${update.version}. Download will start when confirmed.`, "warn");
+
+    const ok = confirm(
+      `A new version is available.\n\n` +
+      `Installed: v${APP_VERSION}\n` +
+      `Latest:    v${update.version}\n\n` +
+      (update.body ? `Notes:\n${update.body}\n\n` : "") +
+      `Download and install now?`,
+    );
+    if (!ok) {
+      setUpdateStatus(`Update v${update.version} available. Use "Check for updates" to install later.`, "warn");
+      return;
+    }
+
+    // Show progress bar
+    const bar = document.getElementById("update-progress");
+    const fill = document.getElementById("update-progress-fill");
+    if (bar) bar.style.display = "block";
+
+    let downloaded = 0;
+    let total = 0;
+    await update.downloadAndInstall((event) => {
+      if (event.event === "Started") {
+        total = event.data.contentLength || 0;
+        setUpdateStatus(`Downloading v${update.version}… 0%`);
+      } else if (event.event === "Progress") {
+        downloaded += event.data.chunkLength || 0;
+        if (total > 0 && fill) {
+          const pct = Math.min(100, Math.round((downloaded / total) * 100));
+          fill.style.width = `${pct}%`;
+          setUpdateStatus(`Downloading v${update.version}… ${pct}%`);
+        }
+      } else if (event.event === "Finished") {
+        setUpdateStatus("Installing… the app will relaunch.", "ok");
+      }
+    });
+
+    // Installer should relaunch the app on Windows, but force it for safety.
+    try {
+      await tauriProcess.relaunch();
+    } catch (_) {}
+  } catch (err) {
+    setUpdateStatus(`Update check failed: ${err}`, "error");
+    if (manual) {
+      alert(`Update check failed:\n${err}`);
+    }
+  } finally {
+    updateInFlight = false;
+  }
 }
 
 // ============================================================================
@@ -581,4 +685,8 @@ window.addEventListener("DOMContentLoaded", async () => {
     logTo("clipboardtyper", `Could not read state: ${err}`, "error");
   }
   renderAll();
+
+  // Background update check on launch. Runs silently — only surfaces a
+  // prompt when an update is found.
+  setTimeout(() => { checkForUpdates({ silent: true }).catch(() => {}); }, 2500);
 });

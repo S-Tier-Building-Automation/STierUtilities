@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    microtools_lib::run()
+    s_tier_utilities_lib::run()
 }

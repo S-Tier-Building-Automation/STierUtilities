@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "MicroTools",
-  "version": "0.4.0",
-  "identifier": "com.stier1ba.microtools",
+  "productName": "S-Tier Utilities",
+  "version": "0.5.0",
+  "identifier": "com.stierbuildings.utilities",
   "build": {
     "frontendDist": "../src"
   },
@@ -10,7 +10,7 @@
     "withGlobalTauri": true,
     "windows": [
       {
-        "title": "MicroTools",
+        "title": "S-Tier Utilities",
         "width": 960,
         "height": 700,
         "minWidth": 720,
@@ -30,6 +30,18 @@
       "icons/128x128@2x.png",
       "icons/icon.icns",
       "icons/icon.ico"
-    ]
+    ],
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://github.com/S-Tier-Building-Automation/STierUtilities/releases/latest/download/latest.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFGRDMxQjM1Nzc1MTlCOEIKUldTTG0xRjNOUnZUcjNQcGxJNjhybW9oWVhBY2FWN1ZQM1ZwWlVYLzBHcmhSR3hhUDdHRWJreS8K",
+      "windows": {
+        "installMode": "passive"
+      }
+    }
   }
 }

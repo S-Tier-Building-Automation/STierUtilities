@@ -1,10 +1,12 @@
-# MicroTools
+# S-Tier Utilities
 
 A small Tauri-based desktop hub that hosts little Windows utilities I (and friends) actually use.
 
 Each tool is implemented as a native Rust module inside the Tauri binary — no extra runtimes for end users. One installer, one window, knobs in the UI, done.
 
-The hub itself ships with a left **sidebar** (favorites + nav), a **Library** view that lists everything in the binary, and a **Settings** view. The Library is a compact catalog of tools; each tool has its own **dedicated page** with controls, settings, and a tool-scoped activity log. Star a tool to pin it to the sidebar; hide tools you don't use to keep the library clean.
+The hub ships with a left **sidebar** (favorites + nav), a **Library** view that lists everything in the binary, and a **Settings** view (with built-in update checks). The Library is a compact catalog of tools; each tool has its own **dedicated page** with controls, settings, and a tool-scoped activity log. Star a tool to pin it to the sidebar; hide tools you don't use to keep the library clean.
+
+The app **auto-updates** through the Tauri updater plugin — release a new tag on this repo and installed copies notify the user and apply the update on next launch.
 
 ## What's hosted
 
@@ -21,8 +23,8 @@ Requires:
 - **WebView2** runtime (default on Windows 11)
 
 ```bash
-git clone https://github.com/stier1ba/MicroTools.git
-cd MicroTools
+git clone https://github.com/S-Tier-Building-Automation/STierUtilities.git
+cd STierUtilities
 pnpm install
 pnpm tauri dev
 ```
@@ -36,6 +38,17 @@ pnpm tauri build
 ```
 
 The MSI / EXE lands in `src-tauri/target/release/bundle/`. End users do not need Rust, Node, or Python — only the WebView2 runtime, which ships with Windows 11.
+
+## Cutting a release (auto-update)
+
+Tag a commit on `main`:
+
+```bash
+git tag v0.5.1
+git push origin v0.5.1
+```
+
+`.github/workflows/release.yml` builds the Windows bundle, signs it with the `TAURI_SIGNING_PRIVATE_KEY` secret, and attaches the artifacts plus a `latest.json` manifest to a GitHub Release. Installed copies of S-Tier Utilities poll that manifest on launch and prompt the user to update.
 
 ## Adding a new micro-tool
 
