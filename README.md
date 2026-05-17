@@ -2,13 +2,13 @@
 
 A small Tauri-based desktop hub that hosts little Windows utilities I (and friends) actually use.
 
-The first hosted tool is [ClipboardTyper](https://github.com/stier1ba/ClipboardTyper) — middle-click to auto-type your clipboard, built for remote-desktop login fields.
+Each tool is implemented as a native Rust module inside the Tauri binary — no extra runtimes for end users. One installer, one window, knobs in the UI, done.
 
 ## What's hosted
 
 | Tool | What it does |
 | --- | --- |
-| **ClipboardTyper** | Middle-click anywhere to auto-type whatever's on your clipboard. Useful for RDP/DeskIn login screens, password fields, VMs. |
+| **ClipboardTyper** | Middle-click anywhere to auto-type whatever's on your clipboard. Useful for RDP/DeskIn login screens, password fields, VMs. Live tunables for type delay, modifier hold (matters for remote desktop), and start delay. |
 | _more soon_ | |
 
 ## Run it (dev)
@@ -16,7 +16,6 @@ The first hosted tool is [ClipboardTyper](https://github.com/stier1ba/ClipboardT
 Requires:
 - **Rust** 1.70+ (`rustup`)
 - **Node** 20+ and **pnpm**
-- **Python 3.10+** on PATH (the hosted tools need it)
 - **WebView2** runtime (default on Windows 11)
 
 ```bash
@@ -26,9 +25,7 @@ pnpm install
 pnpm tauri dev
 ```
 
-The hub window opens. Click **Launch** on ClipboardTyper to start it — a small Python console window pops up showing its status. The hub's **Stop** button kills it.
-
-If a tool errors out with `No module named …`, the hub will offer to `pip install --user -r requirements.txt` automatically.
+The hub window opens. **Enable** ClipboardTyper from its card; middle-click anywhere to auto-type your clipboard. **Disable** restores native middle-click. Sliders inside the card live-tune timing — useful if a remote-desktop client drops Shift on shifted characters (raise *Modifier hold*).
 
 ## Build a Windows installer
 
@@ -36,15 +33,15 @@ If a tool errors out with `No module named …`, the hub will offer to `pip inst
 pnpm tauri build
 ```
 
-The MSI / EXE lands in `src-tauri/target/release/bundle/`.
+The MSI / EXE lands in `src-tauri/target/release/bundle/`. End users do not need Rust, Node, or Python — only the WebView2 runtime, which ships with Windows 11.
 
 ## Adding a new micro-tool
 
-1. Drop the tool's files into `src-tauri/resources/<tool-id>/`.
-2. Add a `#[tauri::command]` in `src-tauri/src/lib.rs` that resolves the script via `app.path().resolve(..., BaseDirectory::Resource)` and spawns it. Register it in `invoke_handler![]`.
-3. Append an entry to the `TOOLS` array at the top of `src/main.js`.
+1. Add a Rust module under `src-tauri/src/<tool>.rs` and `mod` it from `lib.rs`.
+2. Expose its surface as `#[tauri::command]`s and register them in `invoke_handler![]`.
+3. Render a card and wire the buttons/sliders in `src/main.js`.
 
-That's it — the UI is data-driven.
+The Win32 plumbing in `clipboardtyper.rs` (low-level hook on a dedicated thread, `SendInput` with explicit modifier timing) is a reasonable template for keyboard/mouse-driven tools.
 
 ## License
 
