@@ -4,7 +4,7 @@ A small Tauri-based desktop hub that hosts little Windows utilities I (and frien
 
 Each tool is implemented as a native Rust module inside the Tauri binary — no extra runtimes for end users. One installer, one window, knobs in the UI, done.
 
-The hub itself ships with a left **sidebar** (favorites + nav), a **Library** view that lists everything in the binary, and a **Settings** view. Star a tool to pin it to the sidebar; hide tools you don't use to keep the library clean ("Show hidden" brings them back).
+The hub itself ships with a left **sidebar** (favorites + nav), a **Library** view that lists everything in the binary, and a **Settings** view. The Library is a compact catalog of tools; each tool has its own **dedicated page** with controls, settings, and a tool-scoped activity log. Star a tool to pin it to the sidebar; hide tools you don't use to keep the library clean.
 
 ## What's hosted
 

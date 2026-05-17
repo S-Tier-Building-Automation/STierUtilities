@@ -2,7 +2,9 @@ const { invoke } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const opener = window.__TAURI__.opener;
 
-// -------------------- Tool catalog --------------------
+// ============================================================================
+// Tool catalog
+// ============================================================================
 
 const TOOLS = [
   {
@@ -11,15 +13,23 @@ const TOOLS = [
     emoji: "⌨️",
     tagline: "Middle-click your mouse to auto-type your clipboard.",
     description:
-      "Useful for password fields, remote-desktop login screens, VMs, and anywhere Ctrl+V is blocked.",
+      "Useful for password fields, remote-desktop login screens, VMs, and " +
+      "anywhere Ctrl+V is blocked. ClipboardTyper installs a low-level mouse " +
+      "hook while enabled; middle-clicks are intercepted and your clipboard " +
+      "contents are typed at the focused field as real keystrokes.",
     repo: "https://github.com/stier1ba/ClipboardTyper",
-    renderControls: renderClipboardTyperControls,
+    renderStatusPill: ctStatusPill,
+    renderPage: renderClipboardTyperPage,
   },
 ];
 
-// -------------------- Persistent UI state --------------------
+function toolById(id) { return TOOLS.find((t) => t.id === id); }
 
-const STORAGE_KEY = "microtools.user_state.v1";
+// ============================================================================
+// Persistent UI state
+// ============================================================================
+
+const STORAGE_KEY = "microtools.user_state.v2";
 
 const userState = loadUserState();
 
@@ -34,7 +44,7 @@ function loadUserState() {
     favorites: stored.favorites || {},
     hidden: stored.hidden || {},
     showHidden: Boolean(stored.showHidden),
-    view: stored.view === "settings" ? "settings" : "library",
+    view: typeof stored.view === "string" ? stored.view : "library",
   };
 }
 
@@ -53,8 +63,14 @@ function setFavorite(id, on) {
 }
 
 function setHidden(id, on) {
-  if (on) userState.hidden[id] = true;
-  else delete userState.hidden[id];
+  if (on) {
+    userState.hidden[id] = true;
+    // If currently on the plugin page, bounce to library so we don't show
+    // a "page for a hidden tool" state.
+    if (currentPluginId() === id) userState.view = "library";
+  } else {
+    delete userState.hidden[id];
+  }
   saveUserState();
   renderAll();
 }
@@ -71,7 +87,26 @@ function setView(view) {
   renderAll();
 }
 
-// -------------------- Live tool state (ClipboardTyper) --------------------
+function currentView() {
+  if (userState.view === "library" || userState.view === "settings") {
+    return userState.view;
+  }
+  if (typeof userState.view === "string" && userState.view.startsWith("plugin:")) {
+    return userState.view;
+  }
+  return "library";
+}
+
+function currentPluginId() {
+  const v = currentView();
+  return v.startsWith("plugin:") ? v.slice("plugin:".length) : null;
+}
+
+function pluginView(id) { return `plugin:${id}`; }
+
+// ============================================================================
+// Live tool state (ClipboardTyper)
+// ============================================================================
 
 let ct = {
   running: false,
@@ -80,7 +115,37 @@ let ct = {
 };
 let ctPending = { ...ct.settings };
 
-// -------------------- DOM helpers --------------------
+// ============================================================================
+// Per-plugin activity log
+// ============================================================================
+
+const pluginLogs = new Map(); // toolId -> array (newest first), max 100
+
+function logTo(toolId, msg, kind = "info") {
+  let arr = pluginLogs.get(toolId);
+  if (!arr) {
+    arr = [];
+    pluginLogs.set(toolId, arr);
+  }
+  arr.unshift({ time: new Date(), msg, kind });
+  while (arr.length > 100) arr.pop();
+  // Hot-reload the log section if we're currently on that plugin page.
+  if (currentPluginId() === toolId) {
+    const node = document.getElementById("plugin-log-list");
+    if (node) node.replaceChildren(...arr.map(renderLogEntry));
+  }
+}
+
+function renderLogEntry(entry) {
+  return el("li", { class: `log-${entry.kind}` },
+    el("span", { class: "log-time" }, entry.time.toLocaleTimeString()),
+    el("span", { class: "log-msg" }, entry.msg),
+  );
+}
+
+// ============================================================================
+// DOM helpers
+// ============================================================================
 
 function el(tag, attrs = {}, ...children) {
   const node = document.createElement(tag);
@@ -98,28 +163,17 @@ function el(tag, attrs = {}, ...children) {
   return node;
 }
 
-function log(msg, kind = "info") {
-  const list = document.getElementById("log-list");
-  const time = new Date().toLocaleTimeString();
-  const li = el(
-    "li",
-    { class: `log-${kind}` },
-    el("span", { class: "log-time" }, time),
-    el("span", { class: "log-msg" }, msg),
-  );
-  list.prepend(li);
-  while (list.children.length > 50) list.removeChild(list.lastChild);
-}
-
 async function openExternal(url) {
   try {
     await opener.openUrl(url);
   } catch (err) {
-    log(`Couldn't open link: ${err}`, "error");
+    console.warn("openExternal failed:", err);
   }
 }
 
-// -------------------- ClipboardTyper controls --------------------
+// ============================================================================
+// ClipboardTyper-specific bits (status pill + page)
+// ============================================================================
 
 function ctStatusPill() {
   if (!ct.running) return { label: "Idle", cls: "pill-idle" };
@@ -155,7 +209,7 @@ function ctPushSettings() {
     try {
       await invoke("clipboardtyper_set_settings", { settings: { ...ctPending } });
     } catch (err) {
-      log(`Failed to update settings: ${err}`, "error");
+      logTo("clipboardtyper", `Failed to update settings: ${err}`, "error");
     }
   }, 100);
 }
@@ -164,25 +218,28 @@ async function ctToggleEnabled() {
   try {
     if (ct.running) {
       await invoke("clipboardtyper_stop");
-      log("ClipboardTyper disabled. Middle-click is back to normal.", "warn");
+      logTo("clipboardtyper", "Disabled. Middle-click is back to normal.", "warn");
     } else {
       await invoke("clipboardtyper_start");
-      log("ClipboardTyper enabled. Middle-click anywhere to type your clipboard.", "ok");
+      logTo("clipboardtyper", "Enabled. Middle-click anywhere to type your clipboard.", "ok");
     }
   } catch (err) {
-    log(`${err}`, "error");
+    logTo("clipboardtyper", `${err}`, "error");
   }
 }
 
 async function ctSetArmed(armed) {
   try {
     await invoke("clipboardtyper_set_armed", { armed });
+    logTo("clipboardtyper", armed ? "Armed." : "Disarmed (hook still installed).", "info");
   } catch (err) {
-    log(`Failed to set armed: ${err}`, "error");
+    logTo("clipboardtyper", `Failed to set armed: ${err}`, "error");
   }
 }
 
-function renderClipboardTyperControls() {
+function renderClipboardTyperPage(tool) {
+  const status = ctStatusPill();
+
   const enableBtn = el("button", {
     class: ct.running ? "btn btn-danger" : "btn btn-primary",
     onclick: ctToggleEnabled,
@@ -202,67 +259,73 @@ function renderClipboardTyperControls() {
     el("span", { class: "toggle-label" }, "Armed"),
   );
 
-  return el("div", {},
-    el("div", { class: "tool-actions" }, enableBtn, armToggle),
-    el("div", { class: "tool-settings" },
-      el("h4", {}, "Timing"),
+  return el("div", { class: "plugin-controls" },
+    el("section", { class: "plugin-section" },
+      el("div", { class: "action-row" }, enableBtn, armToggle),
+      el("p", { class: "muted small" },
+        ct.running
+          ? (ct.armed
+              ? "Middle-click anywhere — the clipboard text will be typed."
+              : "Hook installed but disarmed. Toggle Armed to react to middle-clicks.")
+          : "Click Enable to install the mouse hook.",
+      ),
+    ),
+
+    el("section", { class: "plugin-section" },
+      el("h3", {}, "Timing"),
       ctSlider("type_delay_ms", "Type delay", 0, 200, 5, "ms"),
       ctSlider("modifier_hold_ms", "Modifier hold", 0, 200, 5, "ms"),
       ctSlider("start_delay_ms", "Start delay", 0, 500, 10, "ms"),
-      el("p", { class: "settings-hint" },
-        "Modifier hold matters for remote-desktop tools like DeskIn — raise it if shifted characters drop.",
+      el("p", { class: "muted small" },
+        "Modifier hold matters for remote-desktop tools like DeskIn — raise it ",
+        "if shifted characters drop on the wire.",
       ),
     ),
   );
 }
 
-function renderClipboardTyperStatus() {
-  return ctStatusPill();
-}
-
-// -------------------- Tool card (full) --------------------
+// ============================================================================
+// Library card (compact)
+// ============================================================================
 
 function renderToolCard(tool) {
   const fav = isFavorite(tool.id);
-  const status = tool.id === "clipboardtyper" ? renderClipboardTyperStatus() : null;
+  const status = tool.renderStatusPill ? tool.renderStatusPill() : null;
 
-  const headerRight = el("div", { class: "card-header-right" });
-  if (status) {
-    headerRight.appendChild(el("span", { class: `pill ${status.cls}` }, status.label));
-  }
-  headerRight.appendChild(el("button", {
+  const star = el("button", {
     class: `star-btn ${fav ? "star-on" : ""}`,
     title: fav ? "Unfavorite" : "Favorite",
     "aria-pressed": fav ? "true" : "false",
-    onclick: () => setFavorite(tool.id, !fav),
-  }, fav ? "★" : "☆"));
+    onclick: (e) => { e.stopPropagation(); setFavorite(tool.id, !fav); },
+  }, fav ? "★" : "☆");
 
-  const controls = tool.renderControls ? tool.renderControls() : null;
+  const hideBtn = el("button", {
+    class: "btn-ghost",
+    onclick: (e) => { e.stopPropagation(); setHidden(tool.id, true); },
+  }, "Hide");
 
-  const meta = el("div", { class: "tool-actions tool-actions-secondary" },
-    el("button", { class: "btn-ghost", onclick: () => openExternal(tool.repo) }, "Source"),
-    el("button", {
-      class: "btn-ghost",
-      onclick: () => setHidden(tool.id, true),
-    }, "Hide"),
-  );
+  const openBtn = el("button", {
+    class: "btn btn-primary",
+    onclick: (e) => { e.stopPropagation(); setView(pluginView(tool.id)); },
+  }, "Open →");
 
   return el("article",
     {
       class: "tool-card",
       id: `tool-card-${tool.id}`,
-      "data-tool": tool.id,
+      onclick: () => setView(pluginView(tool.id)),
     },
     el("div", { class: "tool-icon" }, tool.emoji),
     el("div", { class: "tool-body" },
       el("div", { class: "tool-header" },
         el("h3", {}, tool.name),
-        headerRight,
+        el("div", { class: "card-header-right" },
+          status && el("span", { class: `pill ${status.cls}` }, status.label),
+          star,
+        ),
       ),
       el("p", { class: "tool-tagline" }, tool.tagline),
-      el("p", { class: "tool-desc" }, tool.description),
-      controls,
-      meta,
+      el("div", { class: "tool-actions card-footer" }, hideBtn, openBtn),
     ),
   );
 }
@@ -272,14 +335,13 @@ function renderHiddenRow(tool) {
     el("span", { class: "hidden-row-icon" }, tool.emoji),
     el("span", { class: "hidden-row-name" }, tool.name),
     el("span", { class: "hidden-row-tag" }, "hidden"),
-    el("button", {
-      class: "btn-ghost",
-      onclick: () => setHidden(tool.id, false),
-    }, "Restore"),
+    el("button", { class: "btn-ghost", onclick: () => setHidden(tool.id, false) }, "Restore"),
   );
 }
 
-// -------------------- Library view --------------------
+// ============================================================================
+// Views
+// ============================================================================
 
 function renderLibrary() {
   const root = document.getElementById("view-root");
@@ -288,7 +350,7 @@ function renderLibrary() {
   const visible = TOOLS.filter((t) => !isHidden(t.id));
   const hidden = TOOLS.filter((t) => isHidden(t.id));
 
-  const header = el("div", { class: "view-header" },
+  root.appendChild(el("div", { class: "view-header" },
     el("h2", {}, "Library"),
     el("div", { class: "view-header-right" },
       el("label", { class: "checkbox-row" },
@@ -300,8 +362,7 @@ function renderLibrary() {
         el("span", {}, `Show hidden (${hidden.length})`),
       ),
     ),
-  );
-  root.appendChild(header);
+  ));
 
   if (visible.length === 0) {
     root.appendChild(el("p", { class: "empty-state" },
@@ -323,7 +384,75 @@ function renderLibrary() {
   }
 }
 
-// -------------------- Settings view --------------------
+function renderPluginPage(id) {
+  const root = document.getElementById("view-root");
+  root.replaceChildren();
+  const tool = toolById(id);
+  if (!tool) {
+    root.appendChild(el("p", { class: "empty-state" }, "Unknown plugin."));
+    return;
+  }
+  const status = tool.renderStatusPill ? tool.renderStatusPill() : null;
+  const fav = isFavorite(tool.id);
+
+  root.appendChild(el("nav", { class: "breadcrumb" },
+    el("a", {
+      href: "#",
+      onclick: (e) => { e.preventDefault(); setView("library"); },
+    }, "← Library"),
+  ));
+
+  root.appendChild(el("header", { class: "plugin-header" },
+    el("div", { class: "plugin-header-left" },
+      el("div", { class: "tool-icon plugin-icon" }, tool.emoji),
+      el("div", {},
+        el("h2", { class: "plugin-title" }, tool.name),
+        el("p", { class: "plugin-tagline" }, tool.tagline),
+      ),
+    ),
+    el("div", { class: "plugin-header-right" },
+      status && el("span", { class: `pill ${status.cls}` }, status.label),
+      el("button", {
+        class: `star-btn ${fav ? "star-on" : ""}`,
+        title: fav ? "Unfavorite" : "Favorite",
+        "aria-pressed": fav ? "true" : "false",
+        onclick: () => setFavorite(tool.id, !fav),
+      }, fav ? "★" : "☆"),
+    ),
+  ));
+
+  // Plugin-specific page body.
+  if (tool.renderPage) root.appendChild(tool.renderPage(tool));
+
+  // Description / source row.
+  root.appendChild(el("section", { class: "plugin-section" },
+    el("h3", {}, "About"),
+    el("p", { class: "plugin-desc" }, tool.description),
+    el("p", {},
+      el("a", {
+        href: "#",
+        onclick: (e) => { e.preventDefault(); openExternal(tool.repo); },
+      }, "Source on GitHub →"),
+    ),
+  ));
+
+  // Per-plugin activity log.
+  const logEntries = pluginLogs.get(tool.id) || [];
+  root.appendChild(el("section", { class: "plugin-section" },
+    el("div", { class: "section-head" },
+      el("h3", {}, "Activity"),
+      el("button", {
+        class: "btn-ghost",
+        onclick: () => { pluginLogs.set(tool.id, []); renderPluginPage(tool.id); },
+      }, "Clear"),
+    ),
+    logEntries.length === 0
+      ? el("p", { class: "muted small" }, "No activity yet. Enable the tool and try it out.")
+      : el("ol", { id: "plugin-log-list", class: "plugin-log" },
+          ...logEntries.map(renderLogEntry),
+        ),
+  ));
+}
 
 function renderSettings() {
   const root = document.getElementById("view-root");
@@ -335,19 +464,19 @@ function renderSettings() {
 
   root.appendChild(el("section", { class: "settings-card" },
     el("h3", {}, "About"),
-    el("p", {},
-      "MicroTools is a small Tauri desktop hub for native Windows utilities.",
-    ),
+    el("p", {}, "MicroTools is a small Tauri desktop hub for native Windows utilities."),
     el("p", {},
       "Source: ",
-      el("a", { href: "#", onclick: (e) => { e.preventDefault(); openExternal("https://github.com/stier1ba/MicroTools"); } },
-        "github.com/stier1ba/MicroTools"),
+      el("a", {
+        href: "#",
+        onclick: (e) => { e.preventDefault(); openExternal("https://github.com/stier1ba/MicroTools"); },
+      }, "github.com/stier1ba/MicroTools"),
     ),
   ));
 
   root.appendChild(el("section", { class: "settings-card" },
     el("h3", {}, "Preferences"),
-    el("p", { class: "settings-hint" },
+    el("p", { class: "muted small" },
       "Favorites and hidden tools are stored locally in this app.",
     ),
     el("button", {
@@ -361,27 +490,29 @@ function renderSettings() {
         userState.view = "library";
         saveUserState();
         renderAll();
-        log("Preferences reset.", "ok");
       },
     }, "Reset preferences"),
   ));
 }
 
-// -------------------- Sidebar --------------------
+// ============================================================================
+// Sidebar
+// ============================================================================
 
 function renderSidebar() {
   const favList = document.getElementById("sidebar-favorites");
   favList.replaceChildren();
-  const favTools = TOOLS.filter((t) => isFavorite(t.id));
+  const favTools = TOOLS.filter((t) => isFavorite(t.id) && !isHidden(t.id));
   if (favTools.length === 0) {
     favList.appendChild(el("li", { class: "sidebar-empty" },
       "No favorites yet. Tap the star on a tool.",
     ));
   } else {
     for (const tool of favTools) {
+      const active = currentPluginId() === tool.id;
       favList.appendChild(el("li", {
-        class: "sidebar-fav",
-        onclick: () => focusTool(tool.id),
+        class: `sidebar-fav ${active ? "active" : ""}`,
+        onclick: () => setView(pluginView(tool.id)),
         title: tool.name,
       },
         el("span", { class: "sidebar-fav-icon" }, tool.emoji),
@@ -390,36 +521,32 @@ function renderSidebar() {
     }
   }
 
+  const view = currentView();
   for (const btn of document.querySelectorAll(".sidebar-nav-item")) {
-    btn.classList.toggle("active", btn.dataset.view === userState.view);
+    btn.classList.toggle(
+      "active",
+      btn.dataset.view === "library"
+        ? (view === "library" || view.startsWith("plugin:"))
+        : btn.dataset.view === view,
+    );
   }
 }
 
-function focusTool(id) {
-  if (userState.view !== "library") setView("library");
-  // After (possible) re-render
-  requestAnimationFrame(() => {
-    if (isHidden(id)) {
-      setHidden(id, false);
-    }
-    const card = document.getElementById(`tool-card-${id}`);
-    if (!card) return;
-    card.scrollIntoView({ behavior: "smooth", block: "center" });
-    card.classList.remove("pulse");
-    void card.offsetWidth; // restart animation
-    card.classList.add("pulse");
-  });
-}
-
-// -------------------- Top-level render --------------------
+// ============================================================================
+// Top-level render
+// ============================================================================
 
 function renderAll() {
   renderSidebar();
-  if (userState.view === "settings") renderSettings();
+  const view = currentView();
+  if (view === "settings") renderSettings();
+  else if (view.startsWith("plugin:")) renderPluginPage(view.slice("plugin:".length));
   else renderLibrary();
 }
 
-// -------------------- Tauri event wiring --------------------
+// ============================================================================
+// Tauri event wiring
+// ============================================================================
 
 listen("clipboardtyper:state", (event) => {
   ct = event.payload;
@@ -429,16 +556,15 @@ listen("clipboardtyper:state", (event) => {
 
 listen("clipboardtyper:typed", (event) => {
   const { chars, error } = event.payload;
-  if (error) log(`Typing failed: ${error}`, "error");
-  else log(`Typed ${chars} char${chars === 1 ? "" : "s"}.`, "ok");
+  if (error) logTo("clipboardtyper", `Typing failed: ${error}`, "error");
+  else logTo("clipboardtyper", `Typed ${chars} char${chars === 1 ? "" : "s"}.`, "ok");
 });
 
-// -------------------- Bootstrap --------------------
+// ============================================================================
+// Bootstrap
+// ============================================================================
 
 window.addEventListener("DOMContentLoaded", async () => {
-  document.getElementById("clear-log").addEventListener("click", () => {
-    document.getElementById("log-list").replaceChildren();
-  });
   document.getElementById("gh-link").addEventListener("click", (e) => {
     e.preventDefault();
     openExternal("https://github.com/stier1ba");
@@ -452,7 +578,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     ct = s;
     ctPending = { ...s.settings };
   } catch (err) {
-    log(`Could not read ClipboardTyper state: ${err}`, "error");
+    logTo("clipboardtyper", `Could not read state: ${err}`, "error");
   }
   renderAll();
 });
