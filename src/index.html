@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="stylesheet" href="styles.css" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MicroTools</title>
+    <script type="module" src="/main.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <div class="brand-mark"></div>
+        <div>
+          <h1>MicroTools</h1>
+          <p class="tagline">A hub for little Windows utilities.</p>
+        </div>
+      </div>
+      <div class="topbar-actions">
+        <span id="python-badge" class="pill pill-muted">Python: checking&hellip;</span>
+      </div>
+    </header>
+
+    <main class="container">
+      <section class="tool-grid" id="tool-grid">
+        <!-- Tool cards injected here -->
+      </section>
+
+      <section id="log-panel" class="log-panel">
+        <header>
+          <h2>Activity</h2>
+          <button id="clear-log" class="btn-ghost">Clear</button>
+        </header>
+        <ol id="log-list"></ol>
+      </section>
+    </main>
+
+    <footer class="footer">
+      <span>by <a id="gh-link" href="#">stier1ba</a></span>
+      <span class="dot">&middot;</span>
+      <span>v0.1.0</span>
+    </footer>
+  </body>
+</html>
