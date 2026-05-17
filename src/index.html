@@ -8,32 +8,53 @@
     <script type="module" src="/main.js" defer></script>
   </head>
   <body>
-    <header class="topbar">
-      <div class="brand">
-        <div class="brand-mark"></div>
-        <div>
-          <h1>MicroTools</h1>
-          <p class="tagline">A hub for little Windows utilities.</p>
+    <div class="app">
+      <aside class="sidebar">
+        <div class="sidebar-brand">
+          <div class="brand-mark"></div>
+          <div>
+            <h1>MicroTools</h1>
+            <p class="tagline">Little Windows utilities.</p>
+          </div>
         </div>
-      </div>
-    </header>
 
-    <main class="container">
-      <section class="tool-grid" id="tool-grid"></section>
+        <div class="sidebar-section">
+          <h2 class="sidebar-heading"><span>⭐</span> Favorites</h2>
+          <ul class="sidebar-list" id="sidebar-favorites">
+            <li class="sidebar-empty">No favorites yet. Tap the star on a tool.</li>
+          </ul>
+        </div>
 
-      <section class="log-panel">
-        <header>
-          <h2>Activity</h2>
-          <button id="clear-log" class="btn-ghost">Clear</button>
-        </header>
-        <ol id="log-list"></ol>
-      </section>
-    </main>
+        <div class="sidebar-spacer"></div>
 
-    <footer class="footer">
-      <span>by <a id="gh-link" href="#">stier1ba</a></span>
-      <span class="dot">&middot;</span>
-      <span>v0.2.0</span>
-    </footer>
+        <nav class="sidebar-nav">
+          <button class="sidebar-nav-item" data-view="library">
+            <span>📚</span> Library
+          </button>
+          <button class="sidebar-nav-item" data-view="settings">
+            <span>⚙️</span> Settings
+          </button>
+        </nav>
+      </aside>
+
+      <main class="content">
+        <!-- View root: filled in by main.js -->
+        <div id="view-root"></div>
+
+        <section class="log-panel">
+          <header>
+            <h2>Activity</h2>
+            <button id="clear-log" class="btn-ghost">Clear</button>
+          </header>
+          <ol id="log-list"></ol>
+        </section>
+
+        <footer class="footer">
+          <span>by <a id="gh-link" href="#">stier1ba</a></span>
+          <span class="dot">&middot;</span>
+          <span id="version-label">v0.3.0</span>
+        </footer>
+      </main>
+    </div>
   </body>
 </html>
