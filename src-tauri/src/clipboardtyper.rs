@@ -40,6 +40,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 // ---------- Global state ----------
 
 static RUNNING: AtomicBool = AtomicBool::new(false);
+static STARTING: AtomicBool = AtomicBool::new(false);
 static ARMED: AtomicBool = AtomicBool::new(false);
 static TYPING: AtomicBool = AtomicBool::new(false);
 static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
@@ -109,6 +110,21 @@ pub fn clipboardtyper_start(app: AppHandle) -> Result<State, String> {
     if RUNNING.load(Ordering::Relaxed) {
         return Ok(current_state());
     }
+    if STARTING
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("ClipboardTyper is already starting.".into());
+    }
+
+    struct StartGuard;
+    impl Drop for StartGuard {
+        fn drop(&mut self) {
+            STARTING.store(false, Ordering::Release);
+        }
+    }
+    let _guard = StartGuard;
+
     *APP_HANDLE.lock().unwrap() = Some(app);
 
     let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
@@ -127,7 +143,10 @@ pub fn clipboardtyper_start(app: AppHandle) -> Result<State, String> {
             Ok(current_state())
         }
         Ok(Err(e)) => Err(e),
-        Err(_) => Err("hook thread did not respond in time".into()),
+        Err(_) => {
+            request_hook_thread_quit();
+            Err("hook thread did not respond in time".into())
+        }
     }
 }
 
@@ -136,12 +155,7 @@ pub fn clipboardtyper_stop() -> Result<State, String> {
     if !RUNNING.load(Ordering::Relaxed) {
         return Ok(current_state());
     }
-    let tid = HOOK_THREAD_ID.load(Ordering::Relaxed);
-    if tid != 0 {
-        unsafe {
-            let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
-        }
-    }
+    request_hook_thread_quit();
     // Give the hook thread a moment to exit cleanly.
     let deadline = std::time::Instant::now() + Duration::from_millis(800);
     while RUNNING.load(Ordering::Relaxed) && std::time::Instant::now() < deadline {
@@ -173,6 +187,15 @@ pub fn clipboardtyper_get_state() -> State {
     current_state()
 }
 
+fn request_hook_thread_quit() {
+    let tid = HOOK_THREAD_ID.load(Ordering::Relaxed);
+    if tid != 0 {
+        unsafe {
+            let _ = PostThreadMessageW(tid, WM_QUIT, WPARAM(0), LPARAM(0));
+        }
+    }
+}
+
 // ---------- Hook thread ----------
 
 fn hook_thread_main(install_result: std::sync::mpsc::Sender<Result<(), String>>) {
@@ -188,16 +211,16 @@ fn hook_thread_main(install_result: std::sync::mpsc::Sender<Result<(), String>>)
     };
     let h_instance: HINSTANCE = HINSTANCE(h_mod.0);
 
-    let hook_id = match unsafe {
-        SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), Some(h_instance), 0)
-    } {
-        Ok(h) => h,
-        Err(e) => {
-            let _ = install_result.send(Err(format!("SetWindowsHookExW failed: {e}")));
-            HOOK_THREAD_ID.store(0, Ordering::Relaxed);
-            return;
-        }
-    };
+    let hook_id =
+        match unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), Some(h_instance), 0) }
+        {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = install_result.send(Err(format!("SetWindowsHookExW failed: {e}")));
+                HOOK_THREAD_ID.store(0, Ordering::Relaxed);
+                return;
+            }
+        };
     let _ = install_result.send(Ok(()));
 
     // Standard Win32 message pump. WM_QUIT (posted by `stop`) ends the loop.
@@ -304,11 +327,7 @@ fn type_char(ch: char, modifier_hold: Duration) -> Result<(), String> {
                         return send_unicode(unit);
                     }
                     if needs_shift {
-                        send_vk_down(VK_SHIFT)?;
-                        thread::sleep(modifier_hold);
-                        send_vk_press(vk)?;
-                        thread::sleep(modifier_hold);
-                        send_vk_up(VK_SHIFT)?;
+                        with_vk_held(VK_SHIFT, modifier_hold, || send_vk_press(vk))?;
                     } else {
                         send_vk_press(vk)?;
                     }
@@ -333,6 +352,25 @@ fn send_vk_down(vk: VIRTUAL_KEY) -> Result<(), String> {
 
 fn send_vk_up(vk: VIRTUAL_KEY) -> Result<(), String> {
     send_input(&mut [keyboard_input(vk, 0, KEYEVENTF_KEYUP)])
+}
+
+fn with_vk_held<F>(vk: VIRTUAL_KEY, hold: Duration, f: F) -> Result<(), String>
+where
+    F: FnOnce() -> Result<(), String>,
+{
+    send_vk_down(vk)?;
+    thread::sleep(hold);
+    let body_result = f();
+    thread::sleep(hold);
+    let release_result = send_vk_up(vk);
+
+    match (body_result, release_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+        (Err(body), Err(release)) => Err(format!(
+            "{body}; additionally failed to release modifier key: {release}"
+        )),
+    }
 }
 
 fn send_vk_press(vk: VIRTUAL_KEY) -> Result<(), String> {
@@ -371,10 +409,7 @@ fn keyboard_input(vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT
 fn send_input(inputs: &mut [INPUT]) -> Result<(), String> {
     let sent = unsafe { SendInput(inputs, std::mem::size_of::<INPUT>() as i32) };
     if sent as usize != inputs.len() {
-        Err(format!(
-            "SendInput sent {sent} of {} events",
-            inputs.len()
-        ))
+        Err(format!("SendInput sent {sent} of {} events", inputs.len()))
     } else {
         Ok(())
     }

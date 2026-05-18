@@ -4,7 +4,7 @@ const opener = window.__TAURI__.opener;
 const updater = window.__TAURI__.updater;
 const tauriProcess = window.__TAURI__.process;
 
-const APP_VERSION = "0.5.0";
+const APP_VERSION = "0.5.1";
 
 // ============================================================================
 // Tool catalog
@@ -17,10 +17,11 @@ const TOOLS = [
     emoji: "⌨️",
     tagline: "Middle-click your mouse to auto-type your clipboard.",
     description:
-      "Useful for password fields, remote-desktop login screens, VMs, and " +
-      "anywhere Ctrl+V is blocked. ClipboardTyper installs a low-level mouse " +
-      "hook while enabled; middle-clicks are intercepted and your clipboard " +
-      "contents are typed at the focused field as real keystrokes.",
+      "Useful for local password fields, some remote-desktop login screens, " +
+      "VMs, and anywhere Ctrl+V is blocked. ClipboardTyper installs a low-level " +
+      "mouse hook while enabled; middle-clicks are intercepted and your clipboard " +
+      "contents are sent with Windows SendInput. Some remote tools, including " +
+      "DeskIn in certain modes, may ignore or refuse to forward injected input.",
     repo: "https://github.com/stier1ba/ClipboardTyper",
     renderStatusPill: ctStatusPill,
     renderPage: renderClipboardTyperPage,
@@ -269,7 +270,7 @@ function renderClipboardTyperPage(tool) {
       el("p", { class: "muted small" },
         ct.running
           ? (ct.armed
-              ? "Middle-click anywhere — the clipboard text will be typed."
+              ? "Middle-click anywhere - clipboard text will be sent to the focused local window."
               : "Hook installed but disarmed. Toggle Armed to react to middle-clicks.")
           : "Click Enable to install the mouse hook.",
       ),
@@ -281,8 +282,9 @@ function renderClipboardTyperPage(tool) {
       ctSlider("modifier_hold_ms", "Modifier hold", 0, 200, 5, "ms"),
       ctSlider("start_delay_ms", "Start delay", 0, 500, 10, "ms"),
       el("p", { class: "muted small" },
-        "Modifier hold matters for remote-desktop tools like DeskIn — raise it ",
-        "if shifted characters drop on the wire.",
+        "Modifier hold can help when a remote tool forwards injected input but ",
+        "drops shifted characters. If DeskIn receives nothing at all, it is likely ",
+        "blocking injected input before timing matters.",
       ),
     ),
   );
@@ -661,7 +663,7 @@ listen("clipboardtyper:state", (event) => {
 listen("clipboardtyper:typed", (event) => {
   const { chars, error } = event.payload;
   if (error) logTo("clipboardtyper", `Typing failed: ${error}`, "error");
-  else logTo("clipboardtyper", `Typed ${chars} char${chars === 1 ? "" : "s"}.`, "ok");
+  else logTo("clipboardtyper", `Sent ${chars} char${chars === 1 ? "" : "s"} locally.`, "ok");
 });
 
 // ============================================================================

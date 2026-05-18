@@ -12,7 +12,7 @@ The app **auto-updates** through the Tauri updater plugin — release a new tag 
 
 | Tool | What it does |
 | --- | --- |
-| **ClipboardTyper** | Middle-click anywhere to auto-type whatever's on your clipboard. Useful for RDP/DeskIn login screens, password fields, VMs. Live tunables for type delay, modifier hold (matters for remote desktop), and start delay. |
+| **ClipboardTyper** | Middle-click anywhere to send clipboard text through Windows `SendInput`. Useful for local password fields, some RDP/VM screens, and places where Ctrl+V is blocked. Some remote tools, including DeskIn in certain modes, may ignore injected input before timing settings can help. |
 | _more soon_ | |
 
 ## Run it (dev)
@@ -29,7 +29,7 @@ pnpm install
 pnpm tauri dev
 ```
 
-The hub window opens. **Enable** ClipboardTyper from its card; middle-click anywhere to auto-type your clipboard. **Disable** restores native middle-click. Sliders inside the card live-tune timing — useful if a remote-desktop client drops Shift on shifted characters (raise *Modifier hold*).
+The hub window opens. **Enable** ClipboardTyper from its card; middle-click anywhere to send your clipboard text to the focused local window. **Disable** restores native middle-click. Sliders inside the card live-tune timing, which can help if a remote-desktop client forwards injected input but drops Shift on shifted characters. If a tool like DeskIn receives nothing at all, it is likely blocking injected input rather than needing a slower delay.
 
 ## Build a Windows installer
 
