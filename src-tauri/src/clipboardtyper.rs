@@ -9,10 +9,11 @@
 //! that would otherwise auto-scroll) and kicks the actual typing off on a
 //! detached thread so the hook callback returns quickly.
 //!
-//! Typing goes through `SendInput`. We hold `VK_SHIFT` explicitly with a
-//! configurable delay around each shifted keystroke -- remote-desktop tools
-//! like DeskIn drop the modifier when shift+key fire back-to-back, which
-//! is why an earlier Python version lost uppercase letters.
+//! Typing goes through `SendInput`, using scan-code events for ordinary mapped
+//! keys because remote-desktop clients are more likely to forward those than
+//! virtual-key-only events. We hold `VK_SHIFT` explicitly with a configurable
+//! delay around each shifted keystroke -- remote-desktop tools can drop the
+//! modifier when shift+key fire back-to-back.
 
 #![cfg(windows)]
 
@@ -29,8 +30,9 @@ use windows::Win32::Foundation::{HINSTANCE, HMODULE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    SendInput, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYBD_EVENT_FLAGS,
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, VIRTUAL_KEY, VK_RETURN, VK_SHIFT, VK_TAB,
+    MapVirtualKeyW, SendInput, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
+    VIRTUAL_KEY, VK_RETURN, VK_SHIFT, VK_TAB,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG,
@@ -347,11 +349,11 @@ fn type_char(ch: char, modifier_hold: Duration) -> Result<(), String> {
 // ---------- SendInput helpers ----------
 
 fn send_vk_down(vk: VIRTUAL_KEY) -> Result<(), String> {
-    send_input(&mut [keyboard_input(vk, 0, KEYBD_EVENT_FLAGS(0))])
+    send_scan(vk, false)
 }
 
 fn send_vk_up(vk: VIRTUAL_KEY) -> Result<(), String> {
-    send_input(&mut [keyboard_input(vk, 0, KEYEVENTF_KEYUP)])
+    send_scan(vk, true)
 }
 
 fn with_vk_held<F>(vk: VIRTUAL_KEY, hold: Duration, f: F) -> Result<(), String>
@@ -374,10 +376,24 @@ where
 }
 
 fn send_vk_press(vk: VIRTUAL_KEY) -> Result<(), String> {
-    send_input(&mut [
-        keyboard_input(vk, 0, KEYBD_EVENT_FLAGS(0)),
-        keyboard_input(vk, 0, KEYEVENTF_KEYUP),
-    ])
+    send_input(&mut [scan_input(vk, false)?, scan_input(vk, true)?])
+}
+
+fn send_scan(vk: VIRTUAL_KEY, key_up: bool) -> Result<(), String> {
+    send_input(&mut [scan_input(vk, key_up)?])
+}
+
+fn scan_input(vk: VIRTUAL_KEY, key_up: bool) -> Result<INPUT, String> {
+    let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) };
+    if scan == 0 {
+        return Err(format!("could not map virtual key {} to scan code", vk.0));
+    }
+
+    let mut flags = KEYEVENTF_SCANCODE;
+    if key_up {
+        flags = KEYBD_EVENT_FLAGS(flags.0 | KEYEVENTF_KEYUP.0);
+    }
+    Ok(keyboard_input(VIRTUAL_KEY(0), scan as u16, flags))
 }
 
 fn send_unicode(unit: u16) -> Result<(), String> {

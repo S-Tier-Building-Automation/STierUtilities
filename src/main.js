@@ -4,7 +4,7 @@ const opener = window.__TAURI__.opener;
 const updater = window.__TAURI__.updater;
 const tauriProcess = window.__TAURI__.process;
 
-const APP_VERSION = "0.5.1";
+const APP_VERSION = "0.5.2";
 
 // ============================================================================
 // Tool catalog
@@ -20,7 +20,7 @@ const TOOLS = [
       "Useful for local password fields, some remote-desktop login screens, " +
       "VMs, and anywhere Ctrl+V is blocked. ClipboardTyper installs a low-level " +
       "mouse hook while enabled; middle-clicks are intercepted and your clipboard " +
-      "contents are sent with Windows SendInput. Some remote tools, including " +
+      "contents are sent with Windows SendInput scan codes. Some remote tools, including " +
       "DeskIn in certain modes, may ignore or refuse to forward injected input.",
     repo: "https://github.com/stier1ba/ClipboardTyper",
     renderStatusPill: ctStatusPill,

@@ -12,7 +12,7 @@ The app **auto-updates** through the Tauri updater plugin — release a new tag 
 
 | Tool | What it does |
 | --- | --- |
-| **ClipboardTyper** | Middle-click anywhere to send clipboard text through Windows `SendInput`. Useful for local password fields, some RDP/VM screens, and places where Ctrl+V is blocked. Some remote tools, including DeskIn in certain modes, may ignore injected input before timing settings can help. |
+| **ClipboardTyper** | Middle-click anywhere to send clipboard text through Windows `SendInput` scan codes. Useful for local password fields, some RDP/VM screens, and places where Ctrl+V is blocked. Some remote tools, including DeskIn in certain modes, may ignore injected input before timing settings can help. |
 | _more soon_ | |
 
 ## Run it (dev)
