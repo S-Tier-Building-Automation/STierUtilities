@@ -444,3 +444,88 @@ a:hover { text-decoration: underline; }
   margin-top: auto;
 }
 .footer .dot { opacity: 0.5; }
+
+/* ===== HEIC & MOV ===== */
+
+.hm-file-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.hm-file-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 10px;
+  align-items: center;
+  padding: 10px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  border: 1px solid transparent;
+}
+
+.hm-file-row:hover { background: var(--bg-elev-2); }
+.hm-file-active {
+  background: rgba(99, 102, 241, 0.12);
+  border-color: rgba(99, 102, 241, 0.35);
+}
+
+.hm-file-name {
+  font-size: 13.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.hm-file-meta { white-space: nowrap; }
+.hm-file-remove { padding: 2px 8px; min-width: 0; }
+.hm-file-empty { padding: 12px; }
+
+.hm-preview-frame {
+  min-height: 220px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--bg);
+  border: 1px dashed var(--border);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+.hm-preview-media {
+  max-width: 100%;
+  max-height: 360px;
+  object-fit: contain;
+}
+
+.hm-preview-empty { padding: 24px; text-align: center; }
+
+.hm-convert-options {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px 24px;
+  margin-bottom: 12px;
+}
+
+.hm-option {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.hm-option select {
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+}
+
+.hm-output-line { line-height: 1.6; }
+.hm-output-path { word-break: break-all; }
+.hm-pick-dir { margin-left: 8px; }

@@ -58,6 +58,12 @@ git push origin v0.5.1
 
 The Win32 plumbing in `clipboardtyper.rs` (low-level hook on a dedicated thread, `SendInput` with explicit modifier timing) is a reasonable template for keyboard/mouse-driven tools.
 
+### HEIC & MOV (FFmpeg sidecar)
+
+Release builds download FFmpeg automatically in CI (`scripts/fetch-ffmpeg.ps1`). For local dev on Windows, run that script once before `pnpm tauri dev` so `src-tauri/binaries/ffmpeg-<target>.exe` and `ffprobe-<target>.exe` exist.
+
+The bundled FFmpeg build is GPL-licensed (see [FFmpeg license](https://ffmpeg.org/legal.html)). Source for the prebuilt binaries is [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds).
+
 ## License
 
 MIT
