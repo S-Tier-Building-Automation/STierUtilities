@@ -4,7 +4,7 @@ const opener = window.__TAURI__.opener;
 const updater = window.__TAURI__.updater;
 const tauriProcess = window.__TAURI__.process;
 
-const APP_VERSION = "0.5.3";
+const APP_VERSION = "0.5.4";
 
 // ============================================================================
 // Tool catalog

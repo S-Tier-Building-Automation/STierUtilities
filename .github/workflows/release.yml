@@ -12,6 +12,7 @@ permissions:
 jobs:
   publish:
     runs-on: windows-latest
+    timeout-minutes: 240
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -58,3 +59,4 @@ jobs:
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
+          retryAttempts: 3
