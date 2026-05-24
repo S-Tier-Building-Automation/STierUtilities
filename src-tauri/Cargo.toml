@@ -1,6 +1,6 @@
 [package]
 name = "s_tier_utilities"
-version = "0.5.2"
+version = "0.5.3"
 description = "S-Tier Utilities — a hub for small Windows utilities."
 authors = ["stier1ba"]
 edition = "2021"
