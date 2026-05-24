@@ -13,7 +13,7 @@ The app **auto-updates** through the Tauri updater plugin — release a new tag 
 | Tool | What it does |
 | --- | --- |
 | **ClipboardTyper** | Middle-click anywhere to send clipboard text through Windows `SendInput` scan codes. Useful for local password fields, some RDP/VM screens, and places where Ctrl+V is blocked. Some remote tools, including DeskIn in certain modes, may ignore injected input before timing settings can help. |
-| _more soon_ | |
+| **HEIC & MOV** | Preview and convert iPhone HEIC/HEIF photos and MOV videos on Windows. Images export as JPEG or PNG; videos as MP4. Uses a bundled FFmpeg sidecar (no separate install). |
 
 ## Run it (dev)
 
@@ -57,12 +57,6 @@ git push origin v0.5.1
 3. Render a card and wire the buttons/sliders in `src/main.js`.
 
 The Win32 plumbing in `clipboardtyper.rs` (low-level hook on a dedicated thread, `SendInput` with explicit modifier timing) is a reasonable template for keyboard/mouse-driven tools.
-
-### HEIC & MOV (FFmpeg sidecar)
-
-Release builds download FFmpeg automatically in CI (`scripts/fetch-ffmpeg.ps1`). For local dev on Windows, run that script once before `pnpm tauri dev` so `src-tauri/binaries/ffmpeg-<target>.exe` and `ffprobe-<target>.exe` exist.
-
-The bundled FFmpeg build is GPL-licensed (see [FFmpeg license](https://ffmpeg.org/legal.html)). Source for the prebuilt binaries is [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds).
 
 ## License
 
