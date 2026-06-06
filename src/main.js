@@ -47,9 +47,8 @@ const TOOLS = [
     description:
       "Save reusable IPv4 + DNS profiles for your network adapters and see at a " +
       "glance whether Windows currently matches one (\"drift\"). Capture the live " +
-      "settings of any adapter into a new profile. Applying a profile changes " +
-      "Windows network settings and needs administrator rights — that's coming in " +
-      "a later update; for now this view is read-only.",
+      "settings of any adapter into a new profile, then apply a profile to switch " +
+      "an adapter's IPv4/DNS settings. Applying prompts for administrator approval.",
     repo: "https://github.com/S-Tier-Building-Automation/STierUtilities",
     renderStatusPill: nmStatusPill,
     renderPage: renderNetworkManagerPage,
@@ -915,6 +914,57 @@ async function nmOpenDir() {
   }
 }
 
+async function nmApply() {
+  const sel = nmSelected();
+  if (!sel || nm.busy) return;
+  if (!sel.adapterName) {
+    logTo("networkmanager", "Pick a target adapter before applying.", "warn");
+    return;
+  }
+  const proceed = confirm(
+    `Apply "${sel.name}" to ${sel.adapterName}?\n\n` +
+    `This changes Windows IPv4/DNS settings and will prompt for administrator approval.`,
+  );
+  if (!proceed) return;
+
+  nm.busy = true;
+  nm.busyLabel = "Applying";
+  renderAll();
+  try {
+    const outcome = await invoke("networkmanager_apply_profile", { profile: sel });
+    for (const s of outcome.steps) {
+      logTo("networkmanager", `${s.step}: ${s.detail}`, s.ok ? "ok" : "error");
+    }
+    if (!outcome.ok) {
+      logTo("networkmanager", "Apply did not complete cleanly — see the steps above.", "error");
+      return;
+    }
+    sel.lastAppliedAt = new Date().toISOString();
+    nmSaveNow();
+    logTo("networkmanager", `Applied "${sel.name}".`, "ok");
+
+    // Give Windows a moment to settle, then re-read state and re-evaluate drift.
+    nm.busyLabel = "Verifying";
+    renderAll();
+    await new Promise((r) => setTimeout(r, 1200));
+    try {
+      nm.stateByAdapter[sel.adapterName] = await invoke("networkmanager_read_state", { name: sel.adapterName });
+    } catch (err) {
+      logTo("networkmanager", `Could not re-read ${sel.adapterName}: ${err}`, "warn");
+    }
+    await nmRecomputeMatch(sel);
+    const m = nmMatch(sel);
+    if (m.isMatch) logTo("networkmanager", "Applied and active.", "ok");
+    else logTo("networkmanager", `Applied, but Windows doesn't match yet: ${m.detail}`, "warn");
+  } catch (err) {
+    logTo("networkmanager", `${err}`, "error");
+  } finally {
+    nm.busy = false;
+    nm.busyLabel = "";
+    renderAll();
+  }
+}
+
 // ---- render ----
 
 function nmProfileRow(p) {
@@ -1003,6 +1053,12 @@ function nmEditorContent(sel) {
   const header = el("div", { class: "nm-editor-head" },
     el("h3", { id: "nm-editor-title", class: "nm-editor-title" }, sel.name || "(unnamed)"),
     el("div", { class: "nm-editor-actions" },
+      el("button", {
+        class: "btn btn-primary nm-apply-btn",
+        disabled: nm.busy || !sel.adapterName ? "disabled" : undefined,
+        title: "Apply this profile to Windows (prompts for admin)",
+        onclick: nmApply,
+      }, "Apply"),
       el("button", { class: "btn-ghost", disabled: nm.busy ? "disabled" : undefined, onclick: nmDuplicate }, "Duplicate"),
       el("button", { class: "btn-ghost nm-danger", disabled: nm.busy ? "disabled" : undefined, onclick: nmDelete }, "Delete"),
     ),
@@ -1050,7 +1106,7 @@ function nmEditorContent(sel) {
       ),
     ),
     el("p", { class: "muted small nm-readonly-note" },
-      "Applying a profile changes Windows settings and needs administrator rights — coming in a later update. Read-only for now · ",
+      "Apply changes Windows IPv4/DNS for the target adapter and prompts for administrator approval. · ",
       el("a", { href: "#", onclick: (e) => { e.preventDefault(); nmOpenDir(); } }, "open profiles folder"),
     ),
   ];

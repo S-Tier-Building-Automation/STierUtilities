@@ -35,6 +35,7 @@ pub fn run() {
         networkmanager::networkmanager_save_profiles,
         networkmanager::networkmanager_profiles_path,
         networkmanager::networkmanager_open_profiles_dir,
+        networkmanager::networkmanager_apply_profile,
     ]);
 
     builder
