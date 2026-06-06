@@ -39,6 +39,21 @@ const TOOLS = [
     renderStatusPill: hmStatusPill,
     renderPage: renderHeicMovPage,
   },
+  {
+    id: "networkmanager",
+    name: "Network Manager",
+    emoji: "🌐",
+    tagline: "Save network profiles and see which one Windows is using.",
+    description:
+      "Save reusable IPv4 + DNS profiles for your network adapters and see at a " +
+      "glance whether Windows currently matches one (\"drift\"). Capture the live " +
+      "settings of any adapter into a new profile. Applying a profile changes " +
+      "Windows network settings and needs administrator rights — that's coming in " +
+      "a later update; for now this view is read-only.",
+    repo: "https://github.com/S-Tier-Building-Automation/STierUtilities",
+    renderStatusPill: nmStatusPill,
+    renderPage: renderNetworkManagerPage,
+  },
 ];
 
 function toolById(id) { return TOOLS.find((t) => t.id === id); }
@@ -631,6 +646,475 @@ function renderHeicMovPage() {
 
 
 // ============================================================================
+// Network Manager (status pill + page)
+// ============================================================================
+
+let nm = {
+  adapters: [],            // NetworkAdapterInfo[]
+  profiles: [],            // NetworkProfile[]
+  selectedId: null,
+  stateByAdapter: {},      // adapterName -> AdapterNetworkState
+  matchById: {},           // profileId -> ProfileMatchResult
+  busy: false,
+  busyLabel: "",
+  loaded: false,           // adapters/state read at least once this session
+};
+
+function nmNewId() {
+  return (crypto?.randomUUID?.()) || `p${Date.now()}${Math.random().toString(16).slice(2)}`;
+}
+
+function nmBlankProfile() {
+  return {
+    id: nmNewId(),
+    name: "New profile",
+    adapterName: "",
+    ipv4Mode: "dhcp",
+    ipAddress: "",
+    subnetMask: "255.255.255.0",
+    gateway: "",
+    dnsMode: "nochange",
+    primaryDns: "",
+    secondaryDns: "",
+    notes: "",
+    lastAppliedAt: null,
+  };
+}
+
+function nmStatusPill() {
+  if (nm.busy) return { label: nm.busyLabel || "Working", cls: "pill-running" };
+  const n = nm.profiles.length;
+  if (n === 0) return { label: "No profiles", cls: "pill-idle" };
+  const active = nm.profiles.filter((p) => nm.matchById[p.id]?.isMatch).length;
+  return active > 0
+    ? { label: `${active}/${n} active`, cls: "pill-running" }
+    : { label: `${n} profile${n === 1 ? "" : "s"}`, cls: "pill-muted" };
+}
+
+function nmSelected() { return nm.profiles.find((p) => p.id === nm.selectedId) || null; }
+
+function nmMatch(p) {
+  return nm.matchById[p.id] || { isMatch: false, status: "Needs refresh", detail: "Refresh adapters to evaluate." };
+}
+
+function nmUniqueName(base) {
+  const taken = new Set(nm.profiles.map((p) => p.name.toLowerCase()));
+  if (!taken.has(base.toLowerCase())) return base;
+  let i = 2;
+  while (taken.has(`${base} ${i}`.toLowerCase())) i += 1;
+  return `${base} ${i}`;
+}
+
+function nmIpv4Summary(s) {
+  if (!s) return "Unavailable";
+  if (s.ipv4Mode === "dhcp") return s.ipAddress ? `DHCP (${s.ipAddress})` : "DHCP";
+  return s.ipAddress ? `${s.ipAddress} / ${s.subnetMask || "?"}` : "none";
+}
+
+function nmDnsSummary(s) {
+  if (!s) return "Unavailable";
+  const list = (s.dnsServers || []).join(", ");
+  if (s.dnsMode === "manual") return list || "none";
+  return list ? `Automatic (${list})` : "Automatic";
+}
+
+// ---- data flow ----
+
+let nmSaveTimer = null;
+function nmSaveSoon() {
+  if (nmSaveTimer) clearTimeout(nmSaveTimer);
+  nmSaveTimer = setTimeout(nmSaveNow, 250);
+}
+async function nmSaveNow() {
+  try {
+    await invoke("networkmanager_save_profiles", { profiles: nm.profiles });
+  } catch (err) {
+    logTo("networkmanager", `Could not save profiles: ${err}`, "error");
+  }
+}
+
+async function nmLoadProfiles() {
+  try {
+    nm.profiles = await invoke("networkmanager_load_profiles");
+    if (nm.profiles.length && !nm.selectedId) nm.selectedId = nm.profiles[0].id;
+  } catch (err) {
+    logTo("networkmanager", `Could not load profiles: ${err}`, "error");
+  }
+}
+
+async function nmRecomputeMatch(p) {
+  const state = nm.stateByAdapter[p.adapterName];
+  if (!state) {
+    nm.matchById[p.id] = {
+      isMatch: false,
+      status: p.adapterName ? "No adapter" : "Needs setup",
+      detail: p.adapterName
+        ? `No live snapshot for ${p.adapterName}. Refresh adapters.`
+        : "Pick a target adapter for this profile.",
+    };
+    return;
+  }
+  try {
+    nm.matchById[p.id] = await invoke("networkmanager_compare", { profile: p, state });
+  } catch (err) {
+    nm.matchById[p.id] = { isMatch: false, status: "Error", detail: String(err) };
+  }
+}
+
+async function nmRecomputeAll() { await Promise.all(nm.profiles.map(nmRecomputeMatch)); }
+
+async function nmRefresh() {
+  nm.busy = true;
+  nm.busyLabel = "Reading adapters";
+  renderAll();
+  try {
+    nm.adapters = await invoke("networkmanager_list_adapters");
+    nm.stateByAdapter = {};
+    for (const a of nm.adapters) {
+      if (a.status === "Not Present") continue;
+      try {
+        nm.stateByAdapter[a.name] = await invoke("networkmanager_read_state", { name: a.name });
+      } catch (err) {
+        logTo("networkmanager", `Could not read ${a.name}: ${err}`, "warn");
+      }
+    }
+    await nmRecomputeAll();
+    nm.loaded = true;
+    logTo("networkmanager", `Read ${nm.adapters.length} adapter${nm.adapters.length === 1 ? "" : "s"}.`, "ok");
+  } catch (err) {
+    logTo("networkmanager", `Refresh failed: ${err}`, "error");
+  } finally {
+    nm.busy = false;
+    nm.busyLabel = "";
+    renderAll();
+  }
+}
+
+function nmEnsureLoaded() {
+  if (!nm.loaded && !nm.busy) nmRefresh();
+}
+
+function nmDefaultAdapter() {
+  const sel = nmSelected();
+  if (sel?.adapterName) return sel.adapterName;
+  const up = nm.adapters.find((a) => a.status === "Up");
+  return up?.name || nm.adapters[0]?.name || "";
+}
+
+async function nmNew() {
+  const p = nmBlankProfile();
+  p.name = nmUniqueName("New profile");
+  p.adapterName = nmDefaultAdapter();
+  nm.profiles.push(p);
+  nm.selectedId = p.id;
+  await nmRecomputeMatch(p);
+  nmSaveSoon();
+  logTo("networkmanager", `Created "${p.name}".`, "info");
+  renderAll();
+}
+
+async function nmDuplicate() {
+  const sel = nmSelected();
+  if (!sel) return;
+  const p = { ...sel, id: nmNewId(), name: nmUniqueName(`${sel.name} copy`), lastAppliedAt: null };
+  nm.profiles.push(p);
+  nm.selectedId = p.id;
+  await nmRecomputeMatch(p);
+  nmSaveSoon();
+  renderAll();
+}
+
+function nmDelete() {
+  const sel = nmSelected();
+  if (!sel) return;
+  if (!confirm(`Delete profile "${sel.name}"?`)) return;
+  const idx = nm.profiles.findIndex((p) => p.id === sel.id);
+  nm.profiles = nm.profiles.filter((p) => p.id !== sel.id);
+  delete nm.matchById[sel.id];
+  const next = nm.profiles[idx] || nm.profiles[idx - 1] || null;
+  nm.selectedId = next?.id || null;
+  nmSaveSoon();
+  logTo("networkmanager", `Deleted "${sel.name}".`, "warn");
+  renderAll();
+}
+
+function nmSelect(id) {
+  if (nm.selectedId === id) return;
+  nm.selectedId = id;
+  renderAll();
+}
+
+let nmFieldTimer = null;
+function nmSetText(key, value) {
+  const sel = nmSelected();
+  if (!sel) return;
+  sel[key] = value;
+  nmSaveSoon();
+  if (nmFieldTimer) clearTimeout(nmFieldTimer);
+  nmFieldTimer = setTimeout(async () => {
+    await nmRecomputeMatch(sel);
+    nmRefreshLiveBits();
+  }, 250);
+}
+
+// Update only the drift banner + profile list in place, so editing a text field
+// never steals focus from the input being typed into.
+function nmRefreshLiveBits() {
+  if (currentPluginId() !== "networkmanager") return;
+  const list = document.getElementById("nm-profile-list");
+  if (list && nm.profiles.length) list.replaceChildren(...nm.profiles.map(nmProfileRow));
+  const drift = document.getElementById("nm-drift");
+  const sel = nmSelected();
+  if (drift && sel) drift.replaceWith(nmDriftBanner(sel));
+}
+
+async function nmSetChoice(key, value) {
+  const sel = nmSelected();
+  if (!sel) return;
+  sel[key] = value;
+  nmSaveSoon();
+  await nmRecomputeMatch(sel);
+  renderAll();
+}
+
+async function nmCapture() {
+  const adapterName = nmDefaultAdapter();
+  if (!adapterName) {
+    logTo("networkmanager", "No adapter available to capture.", "warn");
+    return;
+  }
+  nm.busy = true;
+  nm.busyLabel = "Capturing";
+  renderAll();
+  try {
+    const p = await invoke("networkmanager_capture_profile", { name: adapterName });
+    p.id = nmNewId();
+    p.name = nmUniqueName(p.name);
+    nm.profiles.push(p);
+    nm.selectedId = p.id;
+    await nmRecomputeMatch(p);
+    nmSaveNow();
+    logTo("networkmanager", `Captured "${p.name}" from ${adapterName}.`, "ok");
+  } catch (err) {
+    logTo("networkmanager", `Capture failed: ${err}`, "error");
+  } finally {
+    nm.busy = false;
+    nm.busyLabel = "";
+    renderAll();
+  }
+}
+
+async function nmOpenDir() {
+  try {
+    await invoke("networkmanager_open_profiles_dir");
+  } catch (err) {
+    logTo("networkmanager", `Could not open folder: ${err}`, "error");
+  }
+}
+
+// ---- render ----
+
+function nmProfileRow(p) {
+  const m = nmMatch(p);
+  const active = p.id === nm.selectedId;
+  return el("li", {
+    class: `nm-profile-row ${active ? "nm-profile-active" : ""}`,
+    onclick: () => nmSelect(p.id),
+  },
+    el("div", { class: "nm-profile-main" },
+      el("span", { class: "nm-profile-name" }, p.name || "(unnamed)"),
+      el("span", { class: `pill ${m.isMatch ? "pill-running" : "pill-idle"}` },
+        m.isMatch ? "Active" : (m.status || "Not active")),
+    ),
+    el("span", { class: "nm-profile-sub muted small" }, p.adapterName ? `→ ${p.adapterName}` : "No adapter"),
+    m.detail ? el("span", { class: "nm-profile-detail muted small" }, m.detail) : null,
+  );
+}
+
+function nmDriftBanner(p) {
+  const m = nmMatch(p);
+  const state = nm.stateByAdapter[p.adapterName];
+  const snapshot = state
+    ? `${state.adapterName}: IPv4 ${nmIpv4Summary(state)} · gateway ${state.gateway || "none"} · DNS ${nmDnsSummary(state)}`
+    : "No live snapshot yet — use Refresh adapters.";
+  return el("div", { id: "nm-drift", class: `nm-drift ${m.isMatch ? "nm-drift-active" : ""}` },
+    el("div", { class: "nm-drift-status" }, m.isMatch ? "✓ Active" : (m.status || "Not active")),
+    m.detail ? el("div", { class: "muted small" }, m.detail) : null,
+    el("div", { class: "muted small nm-drift-snapshot" }, snapshot),
+  );
+}
+
+function nmTextField(label, key, opts = {}) {
+  const sel = nmSelected();
+  const input = el("input", {
+    class: "nm-input",
+    type: "text",
+    placeholder: opts.placeholder || "",
+    disabled: opts.disabled ? "disabled" : undefined,
+    oninput: (e) => nmSetText(key, e.target.value),
+  });
+  input.value = sel[key] || "";
+  return el("label", { class: `nm-field ${opts.disabled ? "nm-field-dim" : ""}` },
+    el("span", { class: "nm-field-label" }, label),
+    input,
+  );
+}
+
+function nmSeg(label, key, options) {
+  const sel = nmSelected();
+  return el("div", { class: "nm-seg-row" },
+    el("span", { class: "nm-field-label" }, label),
+    el("div", { class: "nm-seg" },
+      ...options.map((opt) => el("button", {
+        class: `nm-seg-btn ${sel[key] === opt.value ? "nm-seg-on" : ""}`,
+        onclick: () => nmSetChoice(key, opt.value),
+      }, opt.label)),
+    ),
+  );
+}
+
+function nmEditorSections(sel) {
+  const usesStatic = sel.ipv4Mode === "static";
+  const usesManual = sel.dnsMode === "manual";
+
+  const adapterSelect = el("select", {
+    class: "nm-input",
+    onchange: (e) => nmSetChoice("adapterName", e.target.value),
+  },
+    el("option", { value: "" }, "— choose adapter —"),
+    ...nm.adapters.map((a) => el("option", {
+      value: a.name,
+      selected: a.name === sel.adapterName ? "selected" : undefined,
+    }, a.description ? `${a.name} — ${a.description}` : a.name)),
+    (sel.adapterName && !nm.adapters.some((a) => a.name === sel.adapterName))
+      ? el("option", { value: sel.adapterName, selected: "selected" }, `${sel.adapterName} (not found)`)
+      : null,
+  );
+
+  const notes = el("textarea", {
+    class: "nm-input nm-textarea",
+    oninput: (e) => nmSetText("notes", e.target.value),
+  });
+  notes.value = sel.notes || "";
+
+  return [
+    el("section", { class: "plugin-section" },
+      el("h3", {}, "Profile"),
+      el("div", { class: "nm-grid-2" },
+        nmTextField("Name", "name"),
+        el("label", { class: "nm-field" },
+          el("span", { class: "nm-field-label" }, "Target adapter"),
+          adapterSelect,
+        ),
+      ),
+      nmDriftBanner(sel),
+      el("label", { class: "nm-field" },
+        el("span", { class: "nm-field-label" }, "Notes"),
+        notes,
+      ),
+    ),
+    el("section", { class: "plugin-section" },
+      el("h3", {}, "IPv4"),
+      nmSeg("Mode", "ipv4Mode", [
+        { value: "dhcp", label: "DHCP" },
+        { value: "static", label: "Static" },
+      ]),
+      el("div", { class: "nm-grid-2" },
+        nmTextField("IP address", "ipAddress", { disabled: !usesStatic, placeholder: "192.168.1.50" }),
+        nmTextField("Subnet mask", "subnetMask", { disabled: !usesStatic, placeholder: "255.255.255.0" }),
+      ),
+      nmTextField("Gateway", "gateway", { disabled: !usesStatic, placeholder: "192.168.1.1 (optional)" }),
+    ),
+    el("section", { class: "plugin-section" },
+      el("h3", {}, "DNS"),
+      nmSeg("Mode", "dnsMode", [
+        { value: "automatic", label: "Automatic" },
+        { value: "manual", label: "Manual" },
+        { value: "nochange", label: "No change" },
+      ]),
+      el("div", { class: "nm-grid-2" },
+        nmTextField("Primary DNS", "primaryDns", { disabled: !usesManual, placeholder: "8.8.8.8" }),
+        nmTextField("Alternate DNS", "secondaryDns", { disabled: !usesManual, placeholder: "8.8.4.4 (optional)" }),
+      ),
+    ),
+  ];
+}
+
+function renderNetworkManagerPage() {
+  nmEnsureLoaded();
+  const sel = nmSelected();
+
+  const newBtn = el("button", { class: "btn btn-primary", disabled: nm.busy ? "disabled" : undefined, onclick: nmNew }, "New");
+  const dupBtn = el("button", { class: "btn-ghost", disabled: nm.busy || !sel ? "disabled" : undefined, onclick: nmDuplicate }, "Duplicate");
+  const delBtn = el("button", { class: "btn-ghost nm-danger", disabled: nm.busy || !sel ? "disabled" : undefined, onclick: nmDelete }, "Delete");
+  const refreshBtn = el("button", { class: "btn-ghost", disabled: nm.busy ? "disabled" : undefined, onclick: nmRefresh }, nm.busy ? "Reading…" : "Refresh adapters");
+  const captureBtn = el("button", { class: "btn-ghost", disabled: nm.busy || nm.adapters.length === 0 ? "disabled" : undefined, onclick: nmCapture }, "Capture current");
+
+  const list = el("ul", { id: "nm-profile-list", class: "nm-profile-list" });
+  if (nm.profiles.length === 0) {
+    list.appendChild(el("li", { class: "muted small nm-profile-empty" },
+      "No profiles yet. Create one, or capture an adapter's current settings below."));
+  } else {
+    for (const p of nm.profiles) list.appendChild(nmProfileRow(p));
+  }
+
+  const nicList = el("div", { class: "nm-nic-list" });
+  const present = nm.adapters.filter((a) => a.status !== "Not Present");
+  if (present.length === 0) {
+    nicList.appendChild(el("p", { class: "muted small" }, nm.loaded ? "No adapters found." : "Reading adapters…"));
+  } else {
+    for (const a of present) {
+      const st = nm.stateByAdapter[a.name];
+      const matching = nm.profiles
+        .filter((p) => p.adapterName === a.name && nm.matchById[p.id]?.isMatch)
+        .map((p) => p.name);
+      nicList.appendChild(el("div", { class: "nm-nic-row" },
+        el("div", { class: "nm-nic-head" },
+          el("span", { class: "nm-nic-name" }, a.name),
+          el("span", { class: "muted small" }, a.status),
+        ),
+        el("div", { class: "muted small" }, a.description),
+        el("div", { class: "muted small" }, `IPv4 ${nmIpv4Summary(st)} · Gateway ${st?.gateway || "none"} · DNS ${nmDnsSummary(st)}`),
+        el("div", { class: `small ${matching.length ? "nm-nic-active" : "muted"}` },
+          matching.length ? `Active profile: ${matching.join(", ")}` : "No matching profile"),
+      ));
+    }
+  }
+
+  return el("div", { class: "plugin-controls" },
+    el("section", { class: "plugin-section" },
+      el("div", { class: "section-head" },
+        el("h3", {}, "Profiles"),
+        el("div", { class: "action-row nm-actions" }, newBtn, dupBtn, delBtn),
+      ),
+      list,
+    ),
+    ...(sel
+      ? nmEditorSections(sel)
+      : [el("section", { class: "plugin-section" },
+          el("p", { class: "muted small" }, "Select a profile to edit, or create a new one."))]),
+    el("section", { class: "plugin-section" },
+      el("div", { class: "section-head" },
+        el("h3", {}, "Windows adapters"),
+        el("div", { class: "action-row nm-actions" }, refreshBtn, captureBtn),
+      ),
+      nicList,
+    ),
+    el("section", { class: "plugin-section" },
+      el("p", { class: "muted small" },
+        "Applying a profile changes Windows network settings and needs administrator rights — ",
+        "that's coming in a later update. For now this view is read-only.",
+      ),
+      el("p", { class: "muted small nm-path-row" },
+        "Profiles are saved locally · ",
+        el("a", { href: "#", onclick: (e) => { e.preventDefault(); nmOpenDir(); } }, "open folder"),
+      ),
+    ),
+  );
+}
+
+
+// ============================================================================
 // Library card (compact)
 // ============================================================================
 
@@ -1026,6 +1510,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   } catch (err) {
     logTo("clipboardtyper", `Could not read state: ${err}`, "error");
   }
+
+  // Load saved network profiles up front so the library card shows a count.
+  // Live adapter state is read lazily when the Network Manager page opens.
+  nmLoadProfiles().then(renderAll);
+
   renderAll();
 
   // Background update check on launch. Runs silently — only surfaces a
