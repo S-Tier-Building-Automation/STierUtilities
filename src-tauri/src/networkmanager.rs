@@ -669,10 +669,37 @@ try {
 } catch {
   $results += [pscustomobject]@{ step='Apply'; ok=$false; detail=$_.Exception.Message }
 }
-$json = (,$results | ConvertTo-Json -Depth 4)
-[System.IO.File]::WriteAllText($ResultPath, $json)
+# Emit a bare JSON array explicitly. `,$results | ConvertTo-Json` renders a
+# {"value":[...],"Count":N} wrapper on Windows PowerShell 5.1, so build the array
+# by hand from each element to get a stable shape regardless of element count.
+$items = @($results | ForEach-Object { $_ | ConvertTo-Json -Depth 4 -Compress })
+[System.IO.File]::WriteAllText($ResultPath, ('[' + ($items -join ',') + ']'))
 if (@($results | Where-Object { -not $_.ok }).Count -gt 0) { exit 1 } else { exit 0 }
 "#;
+
+/// PowerShell's `ConvertTo-Json` renders collections inconsistently across
+/// versions — a bare array, a single bare object, or a `{"value":[...],"Count":N}`
+/// wrapper. Accept all three so the results file always parses.
+fn parse_apply_steps(raw: &str) -> Vec<ApplyStep> {
+    let s = raw.trim_start_matches('\u{feff}').trim();
+    if s.is_empty() {
+        return Vec::new();
+    }
+    if let Ok(v) = serde_json::from_str::<Vec<ApplyStep>>(s) {
+        return v;
+    }
+    #[derive(Deserialize)]
+    struct Wrapper {
+        value: Vec<ApplyStep>,
+    }
+    if let Ok(w) = serde_json::from_str::<Wrapper>(s) {
+        return w.value;
+    }
+    if let Ok(one) = serde_json::from_str::<ApplyStep>(s) {
+        return vec![one];
+    }
+    Vec::new()
+}
 
 fn unique_stamp() -> String {
     let nanos = SystemTime::now()
@@ -748,11 +775,10 @@ fn apply_blocking(app: &AppHandle, profile: &NetworkProfile) -> Result<ApplyOutc
 
     let run = run_elevated_apply(&script_path, &plan_path, &result_path);
 
-    // Read results regardless of exit code (best effort). Strip a possible BOM.
+    // Read results regardless of exit code (best effort).
     let steps: Vec<ApplyStep> = std::fs::read_to_string(&result_path)
         .ok()
-        .map(|s| s.trim_start_matches('\u{feff}').to_string())
-        .and_then(|s| serde_json::from_str(&s).ok())
+        .map(|s| parse_apply_steps(&s))
         .unwrap_or_default();
 
     // Best-effort cleanup of the temp files.
@@ -784,4 +810,52 @@ pub async fn networkmanager_apply_profile(
     tauri::async_runtime::spawn_blocking(move || apply_blocking(&app2, &profile))
         .await
         .map_err(|e| format!("apply task panicked: {e}"))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_steps_bare_array() {
+        let steps = parse_apply_steps(r#"[{"step":"IPv4","ok":true,"detail":"ok"}]"#);
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].step, "IPv4");
+        assert!(steps[0].ok);
+    }
+
+    #[test]
+    fn parse_steps_powershell_value_count_wrapper() {
+        // Windows PowerShell 5.1 `,$arr | ConvertTo-Json` shape.
+        let steps = parse_apply_steps(
+            r#"{"value":[{"step":"IPv4","ok":false,"detail":"x"},{"step":"DNS","ok":true,"detail":"y"}],"Count":2}"#,
+        );
+        assert_eq!(steps.len(), 2);
+        assert!(!steps[0].ok);
+        assert!(steps[1].ok);
+    }
+
+    #[test]
+    fn parse_steps_single_object_and_bom() {
+        let steps = parse_apply_steps("\u{feff}{\"step\":\"Apply\",\"ok\":false,\"detail\":\"boom\"}");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].step, "Apply");
+        assert!(!steps[0].ok);
+    }
+
+    #[test]
+    fn parse_steps_empty_or_garbage() {
+        assert!(parse_apply_steps("").is_empty());
+        assert!(parse_apply_steps("not json").is_empty());
+        assert!(parse_apply_steps("[]").is_empty());
+    }
+
+    #[test]
+    fn prefix_to_mask_known_values() {
+        assert_eq!(prefix_to_mask(24), "255.255.255.0");
+        assert_eq!(prefix_to_mask(21), "255.255.248.0");
+        assert_eq!(prefix_to_mask(22), "255.255.252.0");
+        assert_eq!(prefix_to_mask(0), "0.0.0.0");
+        assert_eq!(prefix_to_mask(32), "255.255.255.255");
+    }
 }
