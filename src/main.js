@@ -930,35 +930,45 @@ async function nmApply() {
   nm.busy = true;
   nm.busyLabel = "Applying";
   renderAll();
+  let attempted = false;
+  let hadStepIssue = false;
   try {
     const outcome = await invoke("networkmanager_apply_profile", { profile: sel });
+    attempted = true;
+    hadStepIssue = !outcome.ok;
     for (const s of outcome.steps) {
       logTo("networkmanager", `${s.step}: ${s.detail}`, s.ok ? "ok" : "error");
     }
-    if (!outcome.ok) {
-      logTo("networkmanager", "Apply did not complete cleanly — see the steps above.", "error");
-      return;
-    }
-    sel.lastAppliedAt = new Date().toISOString();
-    nmSaveNow();
-    logTo("networkmanager", `Applied "${sel.name}".`, "ok");
-
-    // Give Windows a moment to settle, then re-read state and re-evaluate drift.
-    nm.busyLabel = "Verifying";
-    renderAll();
-    await new Promise((r) => setTimeout(r, 1200));
-    try {
-      nm.stateByAdapter[sel.adapterName] = await invoke("networkmanager_read_state", { name: sel.adapterName });
-    } catch (err) {
-      logTo("networkmanager", `Could not re-read ${sel.adapterName}: ${err}`, "warn");
-    }
-    await nmRecomputeMatch(sel);
-    const m = nmMatch(sel);
-    if (m.isMatch) logTo("networkmanager", "Applied and active.", "ok");
-    else logTo("networkmanager", `Applied, but Windows doesn't match yet: ${m.detail}`, "warn");
   } catch (err) {
     logTo("networkmanager", `${err}`, "error");
   } finally {
+    // The authoritative "did it work?" signal is the re-read state, NOT the step
+    // exit codes — netsh can apply a change and still return non-zero. So always
+    // re-read and let the resulting drift decide success. (Skipping this on a
+    // non-clean result is what made a landed change look like it "didn't work".)
+    if (attempted && sel.adapterName) {
+      nm.busyLabel = "Verifying";
+      renderAll();
+      await new Promise((r) => setTimeout(r, 1000));
+      try {
+        nm.stateByAdapter[sel.adapterName] = await invoke("networkmanager_read_state", { name: sel.adapterName });
+      } catch (err) {
+        logTo("networkmanager", `Could not re-read ${sel.adapterName}: ${err}`, "warn");
+      }
+      await nmRecomputeMatch(sel);
+      const m = nmMatch(sel);
+      if (m.isMatch) {
+        sel.lastAppliedAt = new Date().toISOString();
+        nmSaveNow();
+        logTo("networkmanager", `Applied "${sel.name}" — Windows now matches.`, "ok");
+      } else {
+        logTo(
+          "networkmanager",
+          `Applied, but Windows doesn't match yet: ${m.detail}`,
+          hadStepIssue ? "error" : "warn",
+        );
+      }
+    }
     nm.busy = false;
     nm.busyLabel = "";
     renderAll();
