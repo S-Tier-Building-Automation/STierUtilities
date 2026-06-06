@@ -21,8 +21,9 @@
 
 use std::net::Ipv4Addr;
 use std::os::windows::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -594,4 +595,193 @@ pub fn networkmanager_open_profiles_dir(app: AppHandle) -> Result<(), String> {
     app.opener()
         .open_path(dir.to_string_lossy().to_string(), None::<&str>)
         .map_err(|e| format!("could not open folder: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Apply (elevated) — changing IPv4/DNS requires administrator rights.
+//
+// The hub runs un-elevated, so apply launches a ONE-SHOT elevated PowerShell
+// worker (a single UAC prompt) that runs every step itself and writes a results
+// JSON the parent reads back. stdout/stderr cannot cross the elevation boundary,
+// so the results file is the only channel. The parent stays asInvoker.
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyPlan {
+    adapter_name: String,
+    ipv4_mode: Ipv4Mode,
+    ip_address: String,
+    subnet_mask: String,
+    gateway: String,
+    dns_mode: DnsMode,
+    dns_servers: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyStep {
+    pub step: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ApplyOutcome {
+    pub ok: bool,
+    pub steps: Vec<ApplyStep>,
+}
+
+/// The elevated worker. Reads a plan JSON, applies IPv4 then (unless NoChange)
+/// DNS, and writes a per-step results JSON via .NET WriteAllText (no BOM, so the
+/// parent's serde_json parse stays clean). Exits 0 only if every step succeeded.
+const APPLY_SCRIPT: &str = r#"param([Parameter(Mandatory=$true)][string]$PlanPath,[Parameter(Mandatory=$true)][string]$ResultPath)
+$ErrorActionPreference = 'Continue'
+$results = @()
+try {
+  $plan = Get-Content -Raw -LiteralPath $PlanPath | ConvertFrom-Json
+  $alias = [string]$plan.adapterName
+  if ($plan.ipv4Mode -eq 'dhcp') {
+    $na = @('interface','ipv4','set','address',"name=$alias",'source=dhcp')
+  } else {
+    $gw = if ([string]::IsNullOrWhiteSpace([string]$plan.gateway)) { 'none' } else { [string]$plan.gateway }
+    $na = @('interface','ipv4','set','address',"name=$alias",'source=static',"address=$($plan.ipAddress)","mask=$($plan.subnetMask)","gateway=$gw")
+  }
+  $out = (& netsh.exe @na 2>&1 | Out-String).Trim()
+  $ipok = ($LASTEXITCODE -eq 0)
+  $detail = if ($out) { $out } else { "IPv4 set to $($plan.ipv4Mode)" }
+  $results += [pscustomobject]@{ step='IPv4'; ok=$ipok; detail=$detail }
+  if ($ipok -and $plan.dnsMode -ne 'nochange') {
+    try {
+      if ($plan.dnsMode -eq 'automatic') {
+        Set-DnsClientServerAddress -InterfaceAlias $alias -ResetServerAddresses -ErrorAction Stop
+        $results += [pscustomobject]@{ step='DNS'; ok=$true; detail='DNS reset to automatic' }
+      } else {
+        $servers = @($plan.dnsServers)
+        Set-DnsClientServerAddress -InterfaceAlias $alias -ServerAddresses $servers -ErrorAction Stop
+        $results += [pscustomobject]@{ step='DNS'; ok=$true; detail=('DNS set to ' + ($servers -join ', ')) }
+      }
+    } catch {
+      $results += [pscustomobject]@{ step='DNS'; ok=$false; detail=$_.Exception.Message }
+    }
+  }
+} catch {
+  $results += [pscustomobject]@{ step='Apply'; ok=$false; detail=$_.Exception.Message }
+}
+$json = (,$results | ConvertTo-Json -Depth 4)
+[System.IO.File]::WriteAllText($ResultPath, $json)
+if (@($results | Where-Object { -not $_.ok }).Count -gt 0) { exit 1 } else { exit 0 }
+"#;
+
+fn unique_stamp() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{}-{}", std::process::id(), nanos)
+}
+
+/// Launches the elevated worker once (one UAC prompt) via `Start-Process -Verb
+/// RunAs` from an un-elevated PowerShell, waits, and returns its exit code.
+/// Returns a distinct error when the user declines the UAC prompt.
+fn run_elevated_apply(script: &Path, plan: &Path, result: &Path) -> Result<i32, String> {
+    let q = |p: &Path| p.to_string_lossy().replace('\'', "''");
+    let inner = format!(
+        "@('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','{}','-PlanPath','{}','-ResultPath','{}')",
+        q(script),
+        q(plan),
+        q(result)
+    );
+    let outer = format!(
+        "$ErrorActionPreference='Stop'; try {{ $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -PassThru -Wait -ArgumentList {inner}; exit $p.ExitCode }} catch {{ if (\"$($_.Exception.Message)\" -match 'cancel') {{ exit 1223 }} else {{ [Console]::Error.WriteLine($_.Exception.Message); exit 2 }} }}"
+    );
+    let output = Command::new("powershell.exe")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &outer])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("failed to launch elevation: {e}"))?;
+    let code = output.status.code().unwrap_or(-1);
+    if code == 1223 {
+        return Err("Elevation was cancelled — the profile was not applied.".into());
+    }
+    if code == 2 {
+        let err = String::from_utf8_lossy(&output.stderr);
+        let msg = err.trim();
+        return Err(if msg.is_empty() {
+            "Could not request administrator elevation.".into()
+        } else {
+            format!("Could not elevate: {msg}")
+        });
+    }
+    Ok(code)
+}
+
+fn apply_blocking(app: &AppHandle, profile: &NetworkProfile) -> Result<ApplyOutcome, String> {
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|e| format!("could not resolve cache dir: {e}"))?
+        .join("networkmanager");
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create work dir: {e}"))?;
+
+    let stamp = unique_stamp();
+    let plan_path = dir.join(format!("apply-plan-{stamp}.json"));
+    let result_path = dir.join(format!("apply-result-{stamp}.json"));
+    let script_path = dir.join(format!("apply-{stamp}.ps1"));
+
+    let plan = ApplyPlan {
+        adapter_name: profile.adapter_name.clone(),
+        ipv4_mode: profile.ipv4_mode,
+        ip_address: profile.ip_address.trim().to_string(),
+        subnet_mask: profile.subnet_mask.trim().to_string(),
+        gateway: profile.gateway.trim().to_string(),
+        dns_mode: profile.dns_mode,
+        dns_servers: expected_dns(profile),
+    };
+    std::fs::write(
+        &plan_path,
+        serde_json::to_string(&plan).map_err(|e| format!("could not serialize plan: {e}"))?,
+    )
+    .map_err(|e| format!("could not write plan: {e}"))?;
+    std::fs::write(&script_path, APPLY_SCRIPT).map_err(|e| format!("could not write apply script: {e}"))?;
+
+    let run = run_elevated_apply(&script_path, &plan_path, &result_path);
+
+    // Read results regardless of exit code (best effort). Strip a possible BOM.
+    let steps: Vec<ApplyStep> = std::fs::read_to_string(&result_path)
+        .ok()
+        .map(|s| s.trim_start_matches('\u{feff}').to_string())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+
+    // Best-effort cleanup of the temp files.
+    let _ = std::fs::remove_file(&plan_path);
+    let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&result_path);
+
+    match run {
+        Err(e) => Err(e),
+        Ok(code) => {
+            if steps.is_empty() {
+                return Err(format!(
+                    "Apply finished (exit {code}) but reported no results — the elevated step may not have run."
+                ));
+            }
+            let ok = code == 0 && steps.iter().all(|s| s.ok);
+            Ok(ApplyOutcome { ok, steps })
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn networkmanager_apply_profile(
+    app: AppHandle,
+    profile: NetworkProfile,
+) -> Result<ApplyOutcome, String> {
+    validate_profile(&profile)?;
+    let app2 = app.clone();
+    tauri::async_runtime::spawn_blocking(move || apply_blocking(&app2, &profile))
+        .await
+        .map_err(|e| format!("apply task panicked: {e}"))?
 }
