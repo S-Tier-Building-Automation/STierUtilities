@@ -658,6 +658,7 @@ let nm = {
   busy: false,
   busyLabel: "",
   loaded: false,           // adapters/state read at least once this session
+  tab: "profiles",         // "profiles" | "adapters"
 };
 
 function nmNewId() {
@@ -861,11 +862,13 @@ function nmSetText(key, value) {
 // never steals focus from the input being typed into.
 function nmRefreshLiveBits() {
   if (currentPluginId() !== "networkmanager") return;
+  const sel = nmSelected();
   const list = document.getElementById("nm-profile-list");
   if (list && nm.profiles.length) list.replaceChildren(...nm.profiles.map(nmProfileRow));
   const drift = document.getElementById("nm-drift");
-  const sel = nmSelected();
   if (drift && sel) drift.replaceWith(nmDriftBanner(sel));
+  const title = document.getElementById("nm-editor-title");
+  if (title && sel) title.textContent = sel.name || "(unnamed)";
 }
 
 async function nmSetChoice(key, value) {
@@ -877,8 +880,7 @@ async function nmSetChoice(key, value) {
   renderAll();
 }
 
-async function nmCapture() {
-  const adapterName = nmDefaultAdapter();
+async function nmCaptureAdapter(adapterName) {
   if (!adapterName) {
     logTo("networkmanager", "No adapter available to capture.", "warn");
     return;
@@ -892,6 +894,7 @@ async function nmCapture() {
     p.name = nmUniqueName(p.name);
     nm.profiles.push(p);
     nm.selectedId = p.id;
+    nm.tab = "profiles";   // jump to the editor so the user sees the result
     await nmRecomputeMatch(p);
     nmSaveNow();
     logTo("networkmanager", `Captured "${p.name}" from ${adapterName}.`, "ok");
@@ -973,7 +976,7 @@ function nmSeg(label, key, options) {
   );
 }
 
-function nmEditorSections(sel) {
+function nmEditorContent(sel) {
   const usesStatic = sel.ipv4Mode === "static";
   const usesManual = sel.dnsMode === "manual";
 
@@ -997,7 +1000,16 @@ function nmEditorSections(sel) {
   });
   notes.value = sel.notes || "";
 
+  const header = el("div", { class: "nm-editor-head" },
+    el("h3", { id: "nm-editor-title", class: "nm-editor-title" }, sel.name || "(unnamed)"),
+    el("div", { class: "nm-editor-actions" },
+      el("button", { class: "btn-ghost", disabled: nm.busy ? "disabled" : undefined, onclick: nmDuplicate }, "Duplicate"),
+      el("button", { class: "btn-ghost nm-danger", disabled: nm.busy ? "disabled" : undefined, onclick: nmDelete }, "Delete"),
+    ),
+  );
+
   return [
+    header,
     el("section", { class: "plugin-section" },
       el("h3", {}, "Profile"),
       el("div", { class: "nm-grid-2" },
@@ -1037,26 +1049,63 @@ function nmEditorSections(sel) {
         nmTextField("Alternate DNS", "secondaryDns", { disabled: !usesManual, placeholder: "8.8.4.4 (optional)" }),
       ),
     ),
+    el("p", { class: "muted small nm-readonly-note" },
+      "Applying a profile changes Windows settings and needs administrator rights — coming in a later update. Read-only for now · ",
+      el("a", { href: "#", onclick: (e) => { e.preventDefault(); nmOpenDir(); } }, "open profiles folder"),
+    ),
   ];
 }
 
-function renderNetworkManagerPage() {
-  nmEnsureLoaded();
-  const sel = nmSelected();
+function nmTabBar() {
+  const tab = (id, label) => el("button", {
+    class: `nm-tab ${nm.tab === id ? "nm-tab-active" : ""}`,
+    onclick: () => { nm.tab = id; renderAll(); },
+  }, label);
+  return el("div", { class: "nm-tabs" },
+    tab("profiles", "Profiles"),
+    tab("adapters", "Adapters"),
+  );
+}
 
-  const newBtn = el("button", { class: "btn btn-primary", disabled: nm.busy ? "disabled" : undefined, onclick: nmNew }, "New");
-  const dupBtn = el("button", { class: "btn-ghost", disabled: nm.busy || !sel ? "disabled" : undefined, onclick: nmDuplicate }, "Duplicate");
-  const delBtn = el("button", { class: "btn-ghost nm-danger", disabled: nm.busy || !sel ? "disabled" : undefined, onclick: nmDelete }, "Delete");
-  const refreshBtn = el("button", { class: "btn-ghost", disabled: nm.busy ? "disabled" : undefined, onclick: nmRefresh }, nm.busy ? "Reading…" : "Refresh adapters");
-  const captureBtn = el("button", { class: "btn-ghost", disabled: nm.busy || nm.adapters.length === 0 ? "disabled" : undefined, onclick: nmCapture }, "Capture current");
+function nmProfilesTab() {
+  const sel = nmSelected();
 
   const list = el("ul", { id: "nm-profile-list", class: "nm-profile-list" });
   if (nm.profiles.length === 0) {
-    list.appendChild(el("li", { class: "muted small nm-profile-empty" },
-      "No profiles yet. Create one, or capture an adapter's current settings below."));
+    list.appendChild(el("li", { class: "muted small nm-profile-empty" }, "No profiles yet."));
   } else {
     for (const p of nm.profiles) list.appendChild(nmProfileRow(p));
   }
+
+  const listPane = el("div", { class: "nm-list-pane" },
+    el("div", { class: "nm-pane-head" }, el("h3", {}, "Profiles")),
+    list,
+    el("button", {
+      class: "btn btn-primary nm-new-btn",
+      disabled: nm.busy ? "disabled" : undefined,
+      onclick: nmNew,
+    }, "+ New profile"),
+  );
+
+  const editorPane = sel
+    ? el("div", { class: "nm-editor-pane" }, ...nmEditorContent(sel))
+    : el("div", { class: "nm-editor-pane nm-editor-empty" },
+        el("div", { class: "nm-empty" },
+          el("p", { class: "nm-empty-title" }, "Select a profile to edit"),
+          el("p", { class: "muted small" },
+            "Pick one from the list, create a new one, or capture an adapter from the Adapters tab."),
+        ),
+      );
+
+  return el("div", { class: "nm-master-detail" }, listPane, editorPane);
+}
+
+function nmAdaptersTab() {
+  const refreshBtn = el("button", {
+    class: "btn-ghost",
+    disabled: nm.busy ? "disabled" : undefined,
+    onclick: nmRefresh,
+  }, nm.busy ? "Reading…" : "Refresh");
 
   const nicList = el("div", { class: "nm-nic-list" });
   const present = nm.adapters.filter((a) => a.status !== "Not Present");
@@ -1075,41 +1124,38 @@ function renderNetworkManagerPage() {
         ),
         el("div", { class: "muted small" }, a.description),
         el("div", { class: "muted small" }, `IPv4 ${nmIpv4Summary(st)} · Gateway ${st?.gateway || "none"} · DNS ${nmDnsSummary(st)}`),
-        el("div", { class: `small ${matching.length ? "nm-nic-active" : "muted"}` },
-          matching.length ? `Active profile: ${matching.join(", ")}` : "No matching profile"),
+        el("div", { class: "nm-nic-foot" },
+          el("span", { class: `small ${matching.length ? "nm-nic-active" : "muted"}` },
+            matching.length ? `Active profile: ${matching.join(", ")}` : "No matching profile"),
+          el("button", {
+            class: "btn-ghost nm-nic-save",
+            disabled: nm.busy ? "disabled" : undefined,
+            onclick: () => nmCaptureAdapter(a.name),
+          }, "Save as profile"),
+        ),
       ));
     }
   }
 
   return el("div", { class: "plugin-controls" },
     el("section", { class: "plugin-section" },
-      el("div", { class: "section-head" },
-        el("h3", {}, "Profiles"),
-        el("div", { class: "action-row nm-actions" }, newBtn, dupBtn, delBtn),
-      ),
-      list,
-    ),
-    ...(sel
-      ? nmEditorSections(sel)
-      : [el("section", { class: "plugin-section" },
-          el("p", { class: "muted small" }, "Select a profile to edit, or create a new one."))]),
-    el("section", { class: "plugin-section" },
-      el("div", { class: "section-head" },
-        el("h3", {}, "Windows adapters"),
-        el("div", { class: "action-row nm-actions" }, refreshBtn, captureBtn),
+      el("div", { class: "nm-pane-head" },
+        el("div", { class: "nm-pane-head-text" },
+          el("h3", {}, "Windows adapters"),
+          el("p", { class: "muted small nm-section-sub" }, "Your live network adapters. Save one as a reusable profile."),
+        ),
+        refreshBtn,
       ),
       nicList,
     ),
-    el("section", { class: "plugin-section" },
-      el("p", { class: "muted small" },
-        "Applying a profile changes Windows network settings and needs administrator rights — ",
-        "that's coming in a later update. For now this view is read-only.",
-      ),
-      el("p", { class: "muted small nm-path-row" },
-        "Profiles are saved locally · ",
-        el("a", { href: "#", onclick: (e) => { e.preventDefault(); nmOpenDir(); } }, "open folder"),
-      ),
-    ),
+  );
+}
+
+function renderNetworkManagerPage() {
+  nmEnsureLoaded();
+  return el("div", { class: "plugin-controls nm-root" },
+    nmTabBar(),
+    nm.tab === "adapters" ? nmAdaptersTab() : nmProfilesTab(),
   );
 }
 
