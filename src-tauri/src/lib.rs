@@ -2,6 +2,8 @@
 mod clipboardtyper;
 #[cfg(windows)]
 mod heicmov;
+#[cfg(windows)]
+mod networkmanager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -24,6 +26,15 @@ pub fn run() {
         heicmov::heicmov_make_preview,
         heicmov::heicmov_convert,
         heicmov::heicmov_open_path,
+        networkmanager::networkmanager_list_adapters,
+        networkmanager::networkmanager_read_state,
+        networkmanager::networkmanager_capture_profile,
+        networkmanager::networkmanager_compare,
+        networkmanager::networkmanager_validate,
+        networkmanager::networkmanager_load_profiles,
+        networkmanager::networkmanager_save_profiles,
+        networkmanager::networkmanager_profiles_path,
+        networkmanager::networkmanager_open_profiles_dir,
     ]);
 
     builder
