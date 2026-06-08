@@ -770,14 +770,19 @@ async function nmRefresh() {
   try {
     nm.adapters = await invoke("networkmanager_list_adapters");
     nm.stateByAdapter = {};
-    for (const a of nm.adapters) {
-      if (a.status === "Not Present") continue;
-      try {
-        nm.stateByAdapter[a.name] = await invoke("networkmanager_read_state", { name: a.name });
-      } catch (err) {
-        logTo("networkmanager", `Could not read ${a.name}: ${err}`, "warn");
-      }
-    }
+    // Read adapter states concurrently — each shells out to PowerShell (~0.5-1.5s),
+    // so a sequential loop would freeze the UI for several seconds on multi-NIC boxes.
+    await Promise.all(
+      nm.adapters
+        .filter((a) => a.status !== "Not Present")
+        .map(async (a) => {
+          try {
+            nm.stateByAdapter[a.name] = await invoke("networkmanager_read_state", { name: a.name });
+          } catch (err) {
+            logTo("networkmanager", `Could not read ${a.name}: ${err}`, "warn");
+          }
+        }),
+    );
     await nmRecomputeAll();
     nm.loaded = true;
     logTo("networkmanager", `Read ${nm.adapters.length} adapter${nm.adapters.length === 1 ? "" : "s"}.`, "ok");
@@ -921,8 +926,13 @@ async function nmApply() {
     logTo("networkmanager", "Pick a target adapter before applying.", "warn");
     return;
   }
+  // Snapshot the profile before any await. The user can still edit fields while
+  // UAC / apply / re-read is in flight, so we must verify against exactly what we
+  // sent — not against a profile that changed underneath us.
+  const applied = { ...sel };
+
   const proceed = confirm(
-    `Apply "${sel.name}" to ${sel.adapterName}?\n\n` +
+    `Apply "${applied.name}" to ${applied.adapterName}?\n\n` +
     `This changes Windows IPv4/DNS settings and will prompt for administrator approval.`,
   );
   if (!proceed) return;
@@ -933,7 +943,7 @@ async function nmApply() {
   let attempted = false;
   let hadStepIssue = false;
   try {
-    const outcome = await invoke("networkmanager_apply_profile", { profile: sel });
+    const outcome = await invoke("networkmanager_apply_profile", { profile: applied });
     attempted = true;
     hadStepIssue = !outcome.ok;
     for (const s of outcome.steps) {
@@ -944,30 +954,46 @@ async function nmApply() {
   } finally {
     // The authoritative "did it work?" signal is the re-read state, NOT the step
     // exit codes — netsh can apply a change and still return non-zero. So always
-    // re-read and let the resulting drift decide success. (Skipping this on a
-    // non-clean result is what made a landed change look like it "didn't work".)
-    if (attempted && sel.adapterName) {
+    // re-read and judge success by whether Windows matches the applied snapshot.
+    if (attempted && applied.adapterName) {
       nm.busyLabel = "Verifying";
       renderAll();
       await new Promise((r) => setTimeout(r, 1000));
+      let state = null;
       try {
-        nm.stateByAdapter[sel.adapterName] = await invoke("networkmanager_read_state", { name: sel.adapterName });
+        state = await invoke("networkmanager_read_state", { name: applied.adapterName });
+        nm.stateByAdapter[applied.adapterName] = state;
       } catch (err) {
-        logTo("networkmanager", `Could not re-read ${sel.adapterName}: ${err}`, "warn");
+        logTo("networkmanager", `Could not re-read ${applied.adapterName}: ${err}`, "warn");
       }
-      await nmRecomputeMatch(sel);
-      const m = nmMatch(sel);
-      if (m.isMatch) {
-        sel.lastAppliedAt = new Date().toISOString();
-        nmSaveNow();
-        logTo("networkmanager", `Applied "${sel.name}" — Windows now matches.`, "ok");
+      let matched = false;
+      let detail = "No live snapshot.";
+      if (state) {
+        try {
+          const m = await invoke("networkmanager_compare", { profile: applied, state });
+          matched = m.isMatch;
+          detail = m.detail;
+        } catch (err) {
+          detail = String(err);
+        }
+      }
+      if (matched) {
+        const live = nm.profiles.find((p) => p.id === applied.id);
+        if (live) {
+          live.lastAppliedAt = new Date().toISOString();
+          nmSaveNow();
+        }
+        logTo("networkmanager", `Applied "${applied.name}" — Windows now matches.`, "ok");
       } else {
         logTo(
           "networkmanager",
-          `Applied, but Windows doesn't match yet: ${m.detail}`,
+          `Applied, but Windows doesn't match yet: ${detail}`,
           hadStepIssue ? "error" : "warn",
         );
       }
+      // Keep the on-screen drift for the currently-selected profile in sync.
+      const cur = nmSelected();
+      if (cur) await nmRecomputeMatch(cur);
     }
     nm.busy = false;
     nm.busyLabel = "";
@@ -982,7 +1008,16 @@ function nmProfileRow(p) {
   const active = p.id === nm.selectedId;
   return el("li", {
     class: `nm-profile-row ${active ? "nm-profile-active" : ""}`,
+    role: "button",
+    tabindex: "0",
+    "aria-pressed": active ? "true" : "false",
     onclick: () => nmSelect(p.id),
+    onkeydown: (e) => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        nmSelect(p.id);
+      }
+    },
   },
     el("div", { class: "nm-profile-main" },
       el("span", { class: "nm-profile-name" }, p.name || "(unnamed)"),
