@@ -684,7 +684,7 @@ a:hover { text-decoration: underline; }
 }
 .nm-drift-status { font-weight: 600; font-size: 13px; color: var(--warn); }
 .nm-drift-active .nm-drift-status { color: var(--ok); }
-.nm-drift-snapshot { word-break: break-word; }
+.nm-drift-snapshot { overflow-wrap: anywhere; word-break: normal; }
 
 /* adapters list */
 .nm-nic-list { display: flex; flex-direction: column; gap: 8px; }

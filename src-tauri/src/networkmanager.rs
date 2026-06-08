@@ -298,6 +298,21 @@ fn ensure_ipv4(value: &str, field: &str) -> Result<(), String> {
     }
 }
 
+/// A valid IPv4 subnet mask is contiguous high bits (a run of 1s then 0s), so a
+/// generic dotted-quad check (which accepts e.g. 255.0.255.0) is not enough —
+/// netsh would reject those at apply time.
+fn ensure_subnet_mask(value: &str) -> Result<(), String> {
+    let addr: Ipv4Addr = value
+        .trim()
+        .parse()
+        .map_err(|_| "Subnet mask must be a valid IPv4 subnet mask.".to_string())?;
+    let bits = u32::from(addr);
+    if bits == 0 || (bits | (bits - 1)) != u32::MAX {
+        return Err("Subnet mask must be a valid IPv4 subnet mask.".into());
+    }
+    Ok(())
+}
+
 fn validate_profile(profile: &NetworkProfile) -> Result<(), String> {
     if profile.name.trim().is_empty() {
         return Err("Profile name is required.".into());
@@ -307,7 +322,7 @@ fn validate_profile(profile: &NetworkProfile) -> Result<(), String> {
     }
     if profile.ipv4_mode == Ipv4Mode::Static {
         ensure_ipv4(&profile.ip_address, "Static IP address")?;
-        ensure_ipv4(&profile.subnet_mask, "Subnet mask")?;
+        ensure_subnet_mask(&profile.subnet_mask)?;
         if !profile.gateway.trim().is_empty() {
             ensure_ipv4(&profile.gateway, "Gateway")?;
         }
@@ -469,6 +484,7 @@ pub fn networkmanager_read_state(name: String) -> Result<AdapterNetworkState, St
         r#"$ErrorActionPreference='SilentlyContinue'
 $alias='{alias}'
 $ad    = Get-NetAdapter -InterfaceAlias $alias
+if (-not $ad) {{ [Console]::Error.WriteLine("Adapter '$alias' not found"); exit 2 }}
 $ipif  = Get-NetIPInterface -InterfaceAlias $alias -AddressFamily IPv4
 $ipadr = Get-NetIPAddress -InterfaceAlias $alias -AddressFamily IPv4 | Where-Object {{ $_.PrefixOrigin -ne 'WellKnown' }} | Sort-Object @{{e={{$_.PrefixOrigin -eq 'Manual'}}}} -Descending | Select-Object -First 1
 $cfg   = Get-NetIPConfiguration -InterfaceAlias $alias
@@ -576,7 +592,19 @@ pub fn networkmanager_save_profiles(
     }
     let json =
         serde_json::to_string_pretty(&profiles).map_err(|e| format!("could not serialize profiles: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("could not write profiles: {e}"))
+    // Write to a sibling temp file and atomically replace the destination, so a
+    // crash or power loss mid-write can't truncate profiles.json and wipe every
+    // saved profile (the frontend auto-saves on edits). On Windows std::fs::rename
+    // replaces an existing file (MOVEFILE_REPLACE_EXISTING).
+    let tmp = path.with_file_name(format!(
+        "{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("profiles.json")
+    ));
+    std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("could not write profiles: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("could not replace profiles file: {e}")
+    })
 }
 
 #[tauri::command]
@@ -633,14 +661,20 @@ pub struct ApplyOutcome {
     pub steps: Vec<ApplyStep>,
 }
 
-/// The elevated worker. Reads a plan JSON, applies IPv4 then (unless NoChange)
-/// DNS, and writes a per-step results JSON via .NET WriteAllText (no BOM, so the
-/// parent's serde_json parse stays clean). Exits 0 only if every step succeeded.
-const APPLY_SCRIPT: &str = r#"param([Parameter(Mandatory=$true)][string]$PlanPath,[Parameter(Mandatory=$true)][string]$ResultPath)
-$ErrorActionPreference = 'Continue'
+/// The elevated worker, as a template. The plan is embedded as base64 (`__PLAN_B64__`)
+/// and decoded in-process, and the results path (`__RESULT_PATH__`) is embedded too,
+/// so NOTHING privileged is read from disk — the whole thing is delivered to the
+/// elevated PowerShell via `-EncodedCommand`, closing the TOCTOU window where a
+/// same-user process could swap a `.ps1`/plan file between write and elevated run.
+///
+/// Applies IPv4, then (unless NoChange) DNS — independently, since netsh can return
+/// non-zero while still applying. Writes a per-step results JSON array via .NET
+/// WriteAllText (no BOM). Base64 is alphanumeric+`/+=` so it can't break out of the
+/// surrounding single-quoted string literals.
+const APPLY_TEMPLATE: &str = r#"$ErrorActionPreference = 'Continue'
 $results = @()
 try {
-  $plan = Get-Content -Raw -LiteralPath $PlanPath | ConvertFrom-Json
+  $plan = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('__PLAN_B64__')) | ConvertFrom-Json
   $alias = [string]$plan.adapterName
   if ($plan.ipv4Mode -eq 'dhcp') {
     $na = @('interface','ipv4','set','address',"name=$alias",'source=dhcp')
@@ -652,7 +686,7 @@ try {
   $ipok = ($LASTEXITCODE -eq 0)
   $detail = if ($out) { $out } else { "IPv4 set to $($plan.ipv4Mode)" }
   $results += [pscustomobject]@{ step='IPv4'; ok=$ipok; detail=$detail }
-  if ($ipok -and $plan.dnsMode -ne 'nochange') {
+  if ($plan.dnsMode -ne 'nochange') {
     try {
       if ($plan.dnsMode -eq 'automatic') {
         Set-DnsClientServerAddress -InterfaceAlias $alias -ResetServerAddresses -ErrorAction Stop
@@ -673,9 +707,47 @@ try {
 # {"value":[...],"Count":N} wrapper on Windows PowerShell 5.1, so build the array
 # by hand from each element to get a stable shape regardless of element count.
 $items = @($results | ForEach-Object { $_ | ConvertTo-Json -Depth 4 -Compress })
-[System.IO.File]::WriteAllText($ResultPath, ('[' + ($items -join ',') + ']'))
-if (@($results | Where-Object { -not $_.ok }).Count -gt 0) { exit 1 } else { exit 0 }
+[System.IO.File]::WriteAllText('__RESULT_PATH__', ('[' + ($items -join ',') + ']'))
 "#;
+
+/// Standard base64 (no line breaks). Avoids pulling in a crate just for this.
+fn base64_encode(input: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = *chunk.get(1).unwrap_or(&0) as u32;
+        let b2 = *chunk.get(2).unwrap_or(&0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(ALPHABET[((n >> 18) & 63) as usize] as char);
+        out.push(ALPHABET[((n >> 12) & 63) as usize] as char);
+        out.push(if chunk.len() > 1 {
+            ALPHABET[((n >> 6) & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            ALPHABET[(n & 63) as usize] as char
+        } else {
+            '='
+        });
+    }
+    out
+}
+
+/// Encodes a script for PowerShell `-EncodedCommand` (base64 of UTF-16LE).
+fn encode_ps_command(script: &str) -> String {
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    base64_encode(&utf16)
+}
+
+fn build_apply_script(plan_b64: &str, result_path: &Path) -> String {
+    let result_escaped = result_path.to_string_lossy().replace('\'', "''");
+    APPLY_TEMPLATE
+        .replace("__PLAN_B64__", plan_b64)
+        .replace("__RESULT_PATH__", &result_escaped)
+}
 
 /// PowerShell's `ConvertTo-Json` renders collections inconsistently across
 /// versions — a bare array, a single bare object, or a `{"value":[...],"Count":N}`
@@ -712,16 +784,12 @@ fn unique_stamp() -> String {
 /// Launches the elevated worker once (one UAC prompt) via `Start-Process -Verb
 /// RunAs` from an un-elevated PowerShell, waits, and returns its exit code.
 /// Returns a distinct error when the user declines the UAC prompt.
-fn run_elevated_apply(script: &Path, plan: &Path, result: &Path) -> Result<i32, String> {
-    let q = |p: &Path| p.to_string_lossy().replace('\'', "''");
-    let inner = format!(
-        "@('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-File','{}','-PlanPath','{}','-ResultPath','{}')",
-        q(script),
-        q(plan),
-        q(result)
-    );
+fn run_elevated_apply(encoded_command: &str) -> Result<i32, String> {
+    // The worker is delivered as a base64 -EncodedCommand (alphanumeric + / + =),
+    // so it can't break out of the single-quoted argument and nothing executable
+    // is read from disk.
     let outer = format!(
-        "$ErrorActionPreference='Stop'; try {{ $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -PassThru -Wait -ArgumentList {inner}; exit $p.ExitCode }} catch {{ if (\"$($_.Exception.Message)\" -match 'cancel') {{ exit 1223 }} else {{ [Console]::Error.WriteLine($_.Exception.Message); exit 2 }} }}"
+        "$ErrorActionPreference='Stop'; try {{ $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -PassThru -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-EncodedCommand','{encoded_command}'); exit $p.ExitCode }} catch {{ if (\"$($_.Exception.Message)\" -match 'cancel') {{ exit 1223 }} else {{ [Console]::Error.WriteLine($_.Exception.Message); exit 2 }} }}"
     );
     let output = Command::new("powershell.exe")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &outer])
@@ -753,9 +821,10 @@ fn apply_blocking(app: &AppHandle, profile: &NetworkProfile) -> Result<ApplyOutc
     std::fs::create_dir_all(&dir).map_err(|e| format!("could not create work dir: {e}"))?;
 
     let stamp = unique_stamp();
-    let plan_path = dir.join(format!("apply-plan-{stamp}.json"));
+    // The only on-disk artifact is the results file the elevated worker writes
+    // back (a write-only output channel — stdout can't cross the elevation
+    // boundary). The plan and script are passed in-memory via -EncodedCommand.
     let result_path = dir.join(format!("apply-result-{stamp}.json"));
-    let script_path = dir.join(format!("apply-{stamp}.ps1"));
 
     let plan = ApplyPlan {
         adapter_name: profile.adapter_name.clone(),
@@ -766,14 +835,11 @@ fn apply_blocking(app: &AppHandle, profile: &NetworkProfile) -> Result<ApplyOutc
         dns_mode: profile.dns_mode,
         dns_servers: expected_dns(profile),
     };
-    std::fs::write(
-        &plan_path,
-        serde_json::to_string(&plan).map_err(|e| format!("could not serialize plan: {e}"))?,
-    )
-    .map_err(|e| format!("could not write plan: {e}"))?;
-    std::fs::write(&script_path, APPLY_SCRIPT).map_err(|e| format!("could not write apply script: {e}"))?;
+    let plan_json = serde_json::to_string(&plan).map_err(|e| format!("could not serialize plan: {e}"))?;
+    let plan_b64 = base64_encode(plan_json.as_bytes());
+    let encoded = encode_ps_command(&build_apply_script(&plan_b64, &result_path));
 
-    let run = run_elevated_apply(&script_path, &plan_path, &result_path);
+    let run = run_elevated_apply(&encoded);
 
     // Read results regardless of exit code (best effort).
     let steps: Vec<ApplyStep> = std::fs::read_to_string(&result_path)
@@ -781,9 +847,6 @@ fn apply_blocking(app: &AppHandle, profile: &NetworkProfile) -> Result<ApplyOutc
         .map(|s| parse_apply_steps(&s))
         .unwrap_or_default();
 
-    // Best-effort cleanup of the temp files.
-    let _ = std::fs::remove_file(&plan_path);
-    let _ = std::fs::remove_file(&script_path);
     let _ = std::fs::remove_file(&result_path);
 
     match run {
@@ -857,5 +920,26 @@ mod tests {
         assert_eq!(prefix_to_mask(22), "255.255.252.0");
         assert_eq!(prefix_to_mask(0), "0.0.0.0");
         assert_eq!(prefix_to_mask(32), "255.255.255.255");
+    }
+
+    #[test]
+    fn base64_rfc4648_vectors() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn subnet_mask_validation() {
+        for ok in ["255.255.255.0", "255.255.252.0", "255.0.0.0", "255.255.255.255"] {
+            assert!(ensure_subnet_mask(ok).is_ok(), "{ok} should be valid");
+        }
+        for bad in ["255.0.255.0", "0.0.0.0", "255.255.255.1", "not-an-ip", "256.0.0.0"] {
+            assert!(ensure_subnet_mask(bad).is_err(), "{bad} should be invalid");
+        }
     }
 }
