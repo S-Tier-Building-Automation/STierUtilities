@@ -7,6 +7,17 @@ mod networkmanager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Self-elevation: when this exe is re-launched elevated by the Network Manager
+    // apply flow, handle the apply and exit BEFORE any window/Tauri initialization.
+    #[cfg(windows)]
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() >= 4 && args[1] == "--nm-apply-elevated" {
+            let code = networkmanager::run_elevated_worker(&args[2], &args[3]);
+            std::process::exit(code);
+        }
+    }
+
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
