@@ -313,12 +313,19 @@ fn ensure_subnet_mask(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Windows adapter aliases can contain spaces/parens/hyphens, but never control
+/// characters (newlines etc.). Rejecting those keeps crafted names out of the
+/// netsh/PowerShell argv and is a cheap belt alongside argv-level quoting.
+fn is_valid_adapter_name(name: &str) -> bool {
+    !name.trim().is_empty() && !name.chars().any(|c| c.is_control())
+}
+
 fn validate_profile(profile: &NetworkProfile) -> Result<(), String> {
     if profile.name.trim().is_empty() {
         return Err("Profile name is required.".into());
     }
-    if profile.adapter_name.trim().is_empty() {
-        return Err("Choose a network adapter for this profile.".into());
+    if !is_valid_adapter_name(&profile.adapter_name) {
+        return Err("Choose a valid network adapter for this profile.".into());
     }
     if profile.ipv4_mode == Ipv4Mode::Static {
         ensure_ipv4(&profile.ip_address, "Static IP address")?;
@@ -691,6 +698,51 @@ fn ipv4_mode_word(mode: Ipv4Mode) -> &'static str {
     }
 }
 
+/// Re-validates the decoded plan inside the elevated worker. The parent already
+/// validates, but this code runs with administrator rights, so it does not trust
+/// input crossing the privilege boundary: every value embedded into a netsh/PS
+/// command is re-checked here.
+fn validate_plan(plan: &ApplyPlan) -> Result<(), String> {
+    if !is_valid_adapter_name(&plan.adapter_name) {
+        return Err("invalid adapter name".into());
+    }
+    if plan.ipv4_mode == Ipv4Mode::Static {
+        ensure_ipv4(&plan.ip_address, "Static IP address")?;
+        ensure_subnet_mask(&plan.subnet_mask)?;
+        if !plan.gateway.trim().is_empty() {
+            ensure_ipv4(&plan.gateway, "Gateway")?;
+        }
+    }
+    if plan.dns_mode == DnsMode::Manual {
+        for server in &plan.dns_servers {
+            ensure_ipv4(server, "DNS server")?;
+        }
+    }
+    Ok(())
+}
+
+/// True only for an absolute path under the user's profile whose file name matches
+/// the expected `apply-result-*.json`. The elevated worker refuses to write anywhere
+/// else, so a tampered result-path argument can't turn an admin-level write loose
+/// on an arbitrary location.
+fn result_path_is_safe(result_path: &str) -> bool {
+    if result_path.contains("..") {
+        return false;
+    }
+    let path = Path::new(result_path);
+    if !path.is_absolute() {
+        return false;
+    }
+    let home = std::env::var("USERPROFILE").unwrap_or_default();
+    if home.is_empty() || !path.starts_with(&home) {
+        return false;
+    }
+    path.file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with("apply-result-") && n.ends_with(".json"))
+        .unwrap_or(false)
+}
+
 /// The apply steps, run inside the elevated re-launch of this exe: IPv4 via netsh,
 /// then (unless NoChange) DNS via Set-DnsClientServerAddress — independently, since
 /// netsh can return non-zero while still applying. Every child gets CREATE_NO_WINDOW,
@@ -708,6 +760,11 @@ fn elevated_apply_steps(plan_b64: &str) -> Vec<ApplyStep> {
             return steps;
         }
     };
+
+    if let Err(e) = validate_plan(&plan) {
+        steps.push(ApplyStep { step: "Apply".into(), ok: false, detail: e });
+        return steps;
+    }
 
     // ---- IPv4 (netsh) ----
     let mut args: Vec<String> = vec![
@@ -790,9 +847,19 @@ fn elevated_apply_steps(plan_b64: &str) -> Vec<ApplyStep> {
 /// starts). Runs the apply and writes the results file the un-elevated parent reads
 /// back, then returns the process exit code.
 pub fn run_elevated_worker(plan_b64: &str, result_path: &str) -> i32 {
+    // Defense in depth: never let an admin-level write escape to an arbitrary path.
+    if !result_path_is_safe(result_path) {
+        return 2;
+    }
     let steps = elevated_apply_steps(plan_b64);
     let json = serde_json::to_string(&steps).unwrap_or_else(|_| "[]".to_string());
-    let _ = std::fs::write(result_path, json);
+    // Write + flush to disk so the file is complete before the parent (which waits
+    // on this process to exit) reads it back.
+    if let Ok(mut file) = std::fs::File::create(result_path) {
+        use std::io::Write;
+        let _ = file.write_all(json.as_bytes());
+        let _ = file.sync_all();
+    }
     if !steps.is_empty() && steps.iter().all(|s| s.ok) {
         0
     } else {
@@ -930,6 +997,9 @@ fn launch_elevated_self(plan_b64: &str, result_path: &Path) -> Result<i32, Strin
         if info.hProcess.is_invalid() {
             return Err("The elevated apply process did not start.".into());
         }
+        // Blocks until the elevated worker exits. apply_blocking always runs on a
+        // spawn_blocking worker thread, never the UI thread. No early return between
+        // here and CloseHandle, so the handle can't leak.
         WaitForSingleObject(info.hProcess, INFINITE);
         let mut code: u32 = 1;
         let _ = GetExitCodeProcess(info.hProcess, &mut code);
@@ -949,7 +1019,8 @@ fn apply_blocking(app: &AppHandle, profile: &NetworkProfile) -> Result<ApplyOutc
     let stamp = unique_stamp();
     // The only on-disk artifact is the results file the elevated worker writes
     // back (a write-only output channel — stdout can't cross the elevation
-    // boundary). The plan and script are passed in-memory via -EncodedCommand.
+    // boundary). The plan travels as a base64 argv to the elevated re-launch; the
+    // result path is argv[3], validated by the worker before it writes.
     let result_path = dir.join(format!("apply-result-{stamp}.json"));
 
     let plan = ApplyPlan {
@@ -1064,6 +1135,62 @@ mod tests {
             assert_eq!(base64_decode(&base64_encode(s.as_bytes())).unwrap(), s.as_bytes());
         }
         assert!(base64_decode("not base64 ***").is_none());
+    }
+
+    #[test]
+    fn adapter_name_validation() {
+        assert!(is_valid_adapter_name("Ethernet 2"));
+        assert!(is_valid_adapter_name("Bluetooth Network Connection"));
+        assert!(!is_valid_adapter_name(""));
+        assert!(!is_valid_adapter_name("   "));
+        assert!(!is_valid_adapter_name("bad\nname"));
+        assert!(!is_valid_adapter_name("a\tb"));
+    }
+
+    fn sample_plan() -> ApplyPlan {
+        ApplyPlan {
+            adapter_name: "Ethernet 2".into(),
+            ipv4_mode: Ipv4Mode::Static,
+            ip_address: "192.168.1.10".into(),
+            subnet_mask: "255.255.255.0".into(),
+            gateway: String::new(),
+            dns_mode: DnsMode::NoChange,
+            dns_servers: vec![],
+        }
+    }
+
+    #[test]
+    fn plan_validation() {
+        assert!(validate_plan(&sample_plan()).is_ok());
+
+        let mut bad_mask = sample_plan();
+        bad_mask.subnet_mask = "255.0.255.0".into();
+        assert!(validate_plan(&bad_mask).is_err());
+
+        let mut bad_name = sample_plan();
+        bad_name.adapter_name = "bad\nname".into();
+        assert!(validate_plan(&bad_name).is_err());
+
+        let mut manual = sample_plan();
+        manual.dns_mode = DnsMode::Manual;
+        manual.dns_servers = vec!["8.8.8.8".into(), "8.8.4.4".into()];
+        assert!(validate_plan(&manual).is_ok());
+        manual.dns_servers = vec!["not-an-ip".into()];
+        assert!(validate_plan(&manual).is_err());
+    }
+
+    #[test]
+    fn result_path_safety() {
+        let home = std::env::var("USERPROFILE").unwrap_or_default();
+        assert!(!home.is_empty(), "USERPROFILE must be set on the test host");
+        let good = format!(
+            "{home}\\AppData\\Local\\com.stierbuildings.utilities\\networkmanager\\apply-result-12-34.json"
+        );
+        assert!(result_path_is_safe(&good));
+        assert!(!result_path_is_safe("C:\\Windows\\System32\\apply-result-x.json")); // outside profile
+        assert!(!result_path_is_safe(&format!("{home}\\..\\evil\\apply-result-x.json"))); // traversal
+        assert!(!result_path_is_safe(&format!("{home}\\networkmanager\\evil.txt"))); // wrong name
+        assert!(!result_path_is_safe("apply-result-x.json")); // relative
     }
 
     #[test]
