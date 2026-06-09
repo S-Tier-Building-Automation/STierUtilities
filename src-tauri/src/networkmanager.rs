@@ -313,12 +313,19 @@ fn ensure_subnet_mask(value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Windows adapter aliases can contain spaces/parens/hyphens, but never control
+/// characters (newlines etc.). Rejecting those keeps crafted names out of the
+/// netsh/PowerShell argv and is a cheap belt alongside argv-level quoting.
+fn is_valid_adapter_name(name: &str) -> bool {
+    !name.trim().is_empty() && !name.chars().any(|c| c.is_control())
+}
+
 fn validate_profile(profile: &NetworkProfile) -> Result<(), String> {
     if profile.name.trim().is_empty() {
         return Err("Profile name is required.".into());
     }
-    if profile.adapter_name.trim().is_empty() {
-        return Err("Choose a network adapter for this profile.".into());
+    if !is_valid_adapter_name(&profile.adapter_name) {
+        return Err("Choose a valid network adapter for this profile.".into());
     }
     if profile.ipv4_mode == Ipv4Mode::Static {
         ensure_ipv4(&profile.ip_address, "Static IP address")?;
@@ -628,13 +635,17 @@ pub fn networkmanager_open_profiles_dir(app: AppHandle) -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // Apply (elevated) — changing IPv4/DNS requires administrator rights.
 //
-// The hub runs un-elevated, so apply launches a ONE-SHOT elevated PowerShell
-// worker (a single UAC prompt) that runs every step itself and writes a results
-// JSON the parent reads back. stdout/stderr cannot cross the elevation boundary,
-// so the results file is the only channel. The parent stays asInvoker.
+// The hub runs un-elevated (asInvoker). To apply, it re-launches THIS executable
+// elevated via ShellExecuteEx "runas" (one UAC prompt) with a `--nm-apply-elevated`
+// flag; that flag is handled in `run()` before any window/Tauri init, so the
+// elevated instance just runs the apply and exits. Because it's the same
+// GUI-subsystem exe (release builds), nothing flashes, and the exit code comes
+// back reliably via GetExitCodeProcess. The plan is passed as a base64 argument
+// (no plan file), and the only on-disk artifact is the write-only results file the
+// elevated worker writes for the parent to read (output can't cross the boundary).
 // ---------------------------------------------------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ApplyPlan {
     adapter_name: String,
@@ -661,54 +672,220 @@ pub struct ApplyOutcome {
     pub steps: Vec<ApplyStep>,
 }
 
-/// The elevated worker, as a template. The plan is embedded as base64 (`__PLAN_B64__`)
-/// and decoded in-process, and the results path (`__RESULT_PATH__`) is embedded too,
-/// so NOTHING privileged is read from disk — the whole thing is delivered to the
-/// elevated PowerShell via `-EncodedCommand`, closing the TOCTOU window where a
-/// same-user process could swap a `.ps1`/plan file between write and elevated run.
-///
-/// Applies IPv4, then (unless NoChange) DNS — independently, since netsh can return
-/// non-zero while still applying. Writes a per-step results JSON array via .NET
-/// WriteAllText (no BOM). Base64 is alphanumeric+`/+=` so it can't break out of the
-/// surrounding single-quoted string literals.
-const APPLY_TEMPLATE: &str = r#"$ErrorActionPreference = 'Continue'
-$results = @()
-try {
-  $plan = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('__PLAN_B64__')) | ConvertFrom-Json
-  $alias = [string]$plan.adapterName
-  if ($plan.ipv4Mode -eq 'dhcp') {
-    $na = @('interface','ipv4','set','address',"name=$alias",'source=dhcp')
-  } else {
-    $gw = if ([string]::IsNullOrWhiteSpace([string]$plan.gateway)) { 'none' } else { [string]$plan.gateway }
-    $na = @('interface','ipv4','set','address',"name=$alias",'source=static',"address=$($plan.ipAddress)","mask=$($plan.subnetMask)","gateway=$gw")
-  }
-  $out = (& netsh.exe @na 2>&1 | Out-String).Trim()
-  $ipok = ($LASTEXITCODE -eq 0)
-  $detail = if ($out) { $out } else { "IPv4 set to $($plan.ipv4Mode)" }
-  $results += [pscustomobject]@{ step='IPv4'; ok=$ipok; detail=$detail }
-  if ($plan.dnsMode -ne 'nochange') {
-    try {
-      if ($plan.dnsMode -eq 'automatic') {
-        Set-DnsClientServerAddress -InterfaceAlias $alias -ResetServerAddresses -ErrorAction Stop
-        $results += [pscustomobject]@{ step='DNS'; ok=$true; detail='DNS reset to automatic' }
-      } else {
-        $servers = @($plan.dnsServers)
-        Set-DnsClientServerAddress -InterfaceAlias $alias -ServerAddresses $servers -ErrorAction Stop
-        $results += [pscustomobject]@{ step='DNS'; ok=$true; detail=('DNS set to ' + ($servers -join ', ')) }
-      }
-    } catch {
-      $results += [pscustomobject]@{ step='DNS'; ok=$false; detail=$_.Exception.Message }
+/// Runs a command with no console window and returns (success, trimmed combined output).
+fn run_capture(exe: &str, args: &[String]) -> Result<(bool, String), String> {
+    let out = Command::new(exe)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("failed to run {exe}: {e}"))?;
+    let mut text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let err = String::from_utf8_lossy(&out.stderr);
+    let err = err.trim();
+    if !err.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(err);
     }
-  }
-} catch {
-  $results += [pscustomobject]@{ step='Apply'; ok=$false; detail=$_.Exception.Message }
+    Ok((out.status.success(), text))
 }
-# Emit a bare JSON array explicitly. `,$results | ConvertTo-Json` renders a
-# {"value":[...],"Count":N} wrapper on Windows PowerShell 5.1, so build the array
-# by hand from each element to get a stable shape regardless of element count.
-$items = @($results | ForEach-Object { $_ | ConvertTo-Json -Depth 4 -Compress })
-[System.IO.File]::WriteAllText('__RESULT_PATH__', ('[' + ($items -join ',') + ']'))
-"#;
+
+fn ipv4_mode_word(mode: Ipv4Mode) -> &'static str {
+    match mode {
+        Ipv4Mode::Dhcp => "dhcp",
+        Ipv4Mode::Static => "static",
+    }
+}
+
+/// Re-validates the decoded plan inside the elevated worker. The parent already
+/// validates, but this code runs with administrator rights, so it does not trust
+/// input crossing the privilege boundary: every value embedded into a netsh/PS
+/// command is re-checked here.
+fn validate_plan(plan: &ApplyPlan) -> Result<(), String> {
+    if !is_valid_adapter_name(&plan.adapter_name) {
+        return Err("invalid adapter name".into());
+    }
+    if plan.ipv4_mode == Ipv4Mode::Static {
+        ensure_ipv4(&plan.ip_address, "Static IP address")?;
+        ensure_subnet_mask(&plan.subnet_mask)?;
+        if !plan.gateway.trim().is_empty() {
+            ensure_ipv4(&plan.gateway, "Gateway")?;
+        }
+    }
+    if plan.dns_mode == DnsMode::Manual {
+        for server in &plan.dns_servers {
+            ensure_ipv4(server, "DNS server")?;
+        }
+    }
+    Ok(())
+}
+
+/// Bundle identifier (mirrors `tauri.conf.json`); the elevated worker only ever
+/// writes inside this app's per-user cache subdir, `<identifier>/networkmanager`.
+const APP_IDENTIFIER: &str = "com.stierbuildings.utilities";
+
+/// True only for a result file the un-elevated parent legitimately created: an
+/// absolute `apply-result-*.json` whose **canonical** parent directory is this
+/// app's `<identifier>/networkmanager` cache subdir. The elevated worker re-checks
+/// this so a tampered result-path argument can't turn an admin-level write loose on
+/// an arbitrary location.
+///
+/// The check deliberately does *not* anchor on `%USERPROFILE%`: under credentialed
+/// ("over-the-shoulder") elevation the worker runs as a different admin account, so
+/// the parent's file lives under the standard user's profile, not the worker's — a
+/// profile anchor would reject every such apply. Canonicalizing the parent resolves
+/// junctions/symlinks/`..` to the real target first, so a reparse point can't
+/// redirect the write outside the cache dir.
+fn result_path_is_safe(result_path: &str) -> bool {
+    let path = Path::new(result_path);
+    if !path.is_absolute() {
+        return false;
+    }
+    let name_ok = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| n.starts_with("apply-result-") && n.ends_with(".json"))
+        .unwrap_or(false);
+    if !name_ok {
+        return false;
+    }
+    // The parent must already exist (the un-elevated parent created it). canonicalize
+    // resolves any symlink/junction/`..` to the real target before we trust it.
+    let canon = match path.parent().and_then(|p| std::fs::canonicalize(p).ok()) {
+        Some(c) => c,
+        None => return false,
+    };
+    let mut tail = canon.components().rev().filter_map(|c| match c {
+        std::path::Component::Normal(s) => s.to_str(),
+        _ => None,
+    });
+    tail.next() == Some("networkmanager") && tail.next() == Some(APP_IDENTIFIER)
+}
+
+/// The apply steps, run inside the elevated re-launch of this exe: IPv4 via netsh,
+/// then (unless NoChange) DNS via Set-DnsClientServerAddress — independently, since
+/// netsh can return non-zero while still applying. Every child gets CREATE_NO_WINDOW,
+/// and the elevated host is the same GUI-subsystem exe, so nothing flashes.
+fn elevated_apply_steps(plan_b64: &str) -> Vec<ApplyStep> {
+    let mut steps = Vec::new();
+
+    let plan: ApplyPlan = match base64_decode(plan_b64)
+        .ok_or_else(|| "could not decode apply plan".to_string())
+        .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("could not parse apply plan: {e}")))
+    {
+        Ok(p) => p,
+        Err(e) => {
+            steps.push(ApplyStep { step: "Apply".into(), ok: false, detail: e });
+            return steps;
+        }
+    };
+
+    if let Err(e) = validate_plan(&plan) {
+        steps.push(ApplyStep { step: "Apply".into(), ok: false, detail: e });
+        return steps;
+    }
+
+    // ---- IPv4 (netsh) ----
+    let mut args: Vec<String> = vec![
+        "interface".into(),
+        "ipv4".into(),
+        "set".into(),
+        "address".into(),
+        format!("name={}", plan.adapter_name),
+    ];
+    match plan.ipv4_mode {
+        Ipv4Mode::Dhcp => args.push("source=dhcp".into()),
+        Ipv4Mode::Static => {
+            let gw = if plan.gateway.trim().is_empty() {
+                "none".to_string()
+            } else {
+                plan.gateway.trim().to_string()
+            };
+            args.push("source=static".into());
+            args.push(format!("address={}", plan.ip_address.trim()));
+            args.push(format!("mask={}", plan.subnet_mask.trim()));
+            args.push(format!("gateway={gw}"));
+        }
+    }
+    match run_capture("netsh.exe", &args) {
+        Ok((ok, out)) => {
+            let detail = if out.is_empty() {
+                format!("IPv4 set to {}", ipv4_mode_word(plan.ipv4_mode))
+            } else {
+                out
+            };
+            steps.push(ApplyStep { step: "IPv4".into(), ok, detail });
+        }
+        Err(e) => steps.push(ApplyStep { step: "IPv4".into(), ok: false, detail: e }),
+    }
+
+    // ---- DNS (independent of the IPv4 result) ----
+    if plan.dns_mode != DnsMode::NoChange {
+        let alias = ps_single_quote(&plan.adapter_name);
+        let (command, success_detail) = match plan.dns_mode {
+            DnsMode::Automatic => (
+                format!("Set-DnsClientServerAddress -InterfaceAlias '{alias}' -ResetServerAddresses -ErrorAction Stop"),
+                "DNS reset to automatic".to_string(),
+            ),
+            DnsMode::Manual => {
+                let servers = plan
+                    .dns_servers
+                    .iter()
+                    .map(|s| format!("'{}'", ps_single_quote(s)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                (
+                    format!("Set-DnsClientServerAddress -InterfaceAlias '{alias}' -ServerAddresses @({servers}) -ErrorAction Stop"),
+                    format!("DNS set to {}", plan.dns_servers.join(", ")),
+                )
+            }
+            DnsMode::NoChange => unreachable!(),
+        };
+        let ps_args = vec![
+            "-NoProfile".into(),
+            "-ExecutionPolicy".into(),
+            "Bypass".into(),
+            "-Command".into(),
+            command,
+        ];
+        match run_capture("powershell.exe", &ps_args) {
+            Ok((true, _)) => steps.push(ApplyStep { step: "DNS".into(), ok: true, detail: success_detail }),
+            Ok((false, out)) => steps.push(ApplyStep {
+                step: "DNS".into(),
+                ok: false,
+                detail: if out.is_empty() { "DNS step failed".into() } else { out },
+            }),
+            Err(e) => steps.push(ApplyStep { step: "DNS".into(), ok: false, detail: e }),
+        }
+    }
+
+    steps
+}
+
+/// Entry point for the elevated re-launch (dispatched from `run()` before Tauri
+/// starts). Runs the apply and writes the results file the un-elevated parent reads
+/// back, then returns the process exit code.
+pub fn run_elevated_worker(plan_b64: &str, result_path: &str) -> i32 {
+    // Defense in depth: never let an admin-level write escape to an arbitrary path.
+    if !result_path_is_safe(result_path) {
+        return 2;
+    }
+    let steps = elevated_apply_steps(plan_b64);
+    let json = serde_json::to_string(&steps).unwrap_or_else(|_| "[]".to_string());
+    // Write + flush to disk so the file is complete before the parent (which waits
+    // on this process to exit) reads it back.
+    if let Ok(mut file) = std::fs::File::create(result_path) {
+        use std::io::Write;
+        let _ = file.write_all(json.as_bytes());
+        let _ = file.sync_all();
+    }
+    if !steps.is_empty() && steps.iter().all(|s| s.ok) {
+        0
+    } else {
+        1
+    }
+}
 
 /// Standard base64 (no line breaks). Avoids pulling in a crate just for this.
 fn base64_encode(input: &[u8]) -> String {
@@ -736,17 +913,33 @@ fn base64_encode(input: &[u8]) -> String {
     out
 }
 
-/// Encodes a script for PowerShell `-EncodedCommand` (base64 of UTF-16LE).
-fn encode_ps_command(script: &str) -> String {
-    let utf16: Vec<u8> = script.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
-    base64_encode(&utf16)
-}
-
-fn build_apply_script(plan_b64: &str, result_path: &Path) -> String {
-    let result_escaped = result_path.to_string_lossy().replace('\'', "''");
-    APPLY_TEMPLATE
-        .replace("__PLAN_B64__", plan_b64)
-        .replace("__RESULT_PATH__", &result_escaped)
+/// Standard base64 decode (ignores padding and whitespace). Returns None on invalid input.
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
+        }
+    }
+    let mut out = Vec::with_capacity(input.len() / 4 * 3);
+    let mut buf = 0u32;
+    let mut bits = 0u32;
+    for &c in input.as_bytes() {
+        if c == b'=' || c.is_ascii_whitespace() {
+            continue;
+        }
+        buf = (buf << 6) | val(c)?;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((buf >> bits) as u8);
+        }
+    }
+    Some(out)
 }
 
 /// PowerShell's `ConvertTo-Json` renders collections inconsistently across
@@ -781,35 +974,58 @@ fn unique_stamp() -> String {
     format!("{}-{}", std::process::id(), nanos)
 }
 
-/// Launches the elevated worker once (one UAC prompt) via `Start-Process -Verb
-/// RunAs` from an un-elevated PowerShell, waits, and returns its exit code.
-/// Returns a distinct error when the user declines the UAC prompt.
-fn run_elevated_apply(encoded_command: &str) -> Result<i32, String> {
-    // The worker is delivered as a base64 -EncodedCommand (alphanumeric + / + =),
-    // so it can't break out of the single-quoted argument and nothing executable
-    // is read from disk.
-    let outer = format!(
-        "$ErrorActionPreference='Stop'; try {{ $p = Start-Process -FilePath 'powershell.exe' -Verb RunAs -WindowStyle Hidden -PassThru -Wait -ArgumentList @('-NoProfile','-ExecutionPolicy','Bypass','-WindowStyle','Hidden','-EncodedCommand','{encoded_command}'); exit $p.ExitCode }} catch {{ if (\"$($_.Exception.Message)\" -match 'cancel') {{ exit 1223 }} else {{ [Console]::Error.WriteLine($_.Exception.Message); exit 2 }} }}"
+/// Re-launches THIS executable elevated (one UAC prompt) via ShellExecuteEx "runas"
+/// to run the apply worker, waits for it, and returns its exit code. Returns a
+/// distinct error when the user declines the UAC prompt. The plan travels as a
+/// base64 argument (alphanumeric + `/+=`, no quotes/spaces) and the flag is handled
+/// in `run()` before Tauri starts.
+fn launch_elevated_self(plan_b64: &str, result_path: &Path) -> Result<i32, String> {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::ERROR_CANCELLED;
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject, INFINITE};
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    let exe = std::env::current_exe().map_err(|e| format!("could not resolve current exe: {e}"))?;
+    let params = format!(
+        "--nm-apply-elevated {} \"{}\"",
+        plan_b64,
+        result_path.to_string_lossy().replace('"', "")
     );
-    let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &outer])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|e| format!("failed to launch elevation: {e}"))?;
-    let code = output.status.code().unwrap_or(-1);
-    if code == 1223 {
-        return Err("Elevation was cancelled — the profile was not applied.".into());
+
+    let exe_w = HSTRING::from(exe.to_string_lossy().as_ref());
+    let verb_w = HSTRING::from("runas");
+    let params_w = HSTRING::from(params.as_str());
+
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        lpVerb: PCWSTR(verb_w.as_ptr()),
+        lpFile: PCWSTR(exe_w.as_ptr()),
+        lpParameters: PCWSTR(params_w.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+
+    unsafe {
+        if let Err(e) = ShellExecuteExW(&mut info) {
+            if e.code() == ERROR_CANCELLED.to_hresult() {
+                return Err("Elevation was cancelled — the profile was not applied.".into());
+            }
+            return Err(format!("Could not request administrator elevation: {e}"));
+        }
+        if info.hProcess.is_invalid() {
+            return Err("The elevated apply process did not start.".into());
+        }
+        // Blocks until the elevated worker exits. apply_blocking always runs on a
+        // spawn_blocking worker thread, never the UI thread. No early return between
+        // here and CloseHandle, so the handle can't leak.
+        WaitForSingleObject(info.hProcess, INFINITE);
+        let mut code: u32 = 1;
+        let _ = GetExitCodeProcess(info.hProcess, &mut code);
+        let _ = windows::Win32::Foundation::CloseHandle(info.hProcess);
+        Ok(code as i32)
     }
-    if code == 2 {
-        let err = String::from_utf8_lossy(&output.stderr);
-        let msg = err.trim();
-        return Err(if msg.is_empty() {
-            "Could not request administrator elevation.".into()
-        } else {
-            format!("Could not elevate: {msg}")
-        });
-    }
-    Ok(code)
 }
 
 fn apply_blocking(app: &AppHandle, profile: &NetworkProfile) -> Result<ApplyOutcome, String> {
@@ -823,7 +1039,8 @@ fn apply_blocking(app: &AppHandle, profile: &NetworkProfile) -> Result<ApplyOutc
     let stamp = unique_stamp();
     // The only on-disk artifact is the results file the elevated worker writes
     // back (a write-only output channel — stdout can't cross the elevation
-    // boundary). The plan and script are passed in-memory via -EncodedCommand.
+    // boundary). The plan travels as a base64 argv to the elevated re-launch; the
+    // result path is argv[3], validated by the worker before it writes.
     let result_path = dir.join(format!("apply-result-{stamp}.json"));
 
     let plan = ApplyPlan {
@@ -837,9 +1054,8 @@ fn apply_blocking(app: &AppHandle, profile: &NetworkProfile) -> Result<ApplyOutc
     };
     let plan_json = serde_json::to_string(&plan).map_err(|e| format!("could not serialize plan: {e}"))?;
     let plan_b64 = base64_encode(plan_json.as_bytes());
-    let encoded = encode_ps_command(&build_apply_script(&plan_b64, &result_path));
 
-    let run = run_elevated_apply(&encoded);
+    let run = launch_elevated_self(&plan_b64, &result_path);
 
     // Read results regardless of exit code (best effort).
     let steps: Vec<ApplyStep> = std::fs::read_to_string(&result_path)
@@ -931,6 +1147,94 @@ mod tests {
         assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
         assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_round_trips() {
+        for s in ["", "f", "fo", "foo", "foobar", "{\"a\":1,\"b\":\"x y/z+=\"}"] {
+            assert_eq!(base64_decode(&base64_encode(s.as_bytes())).unwrap(), s.as_bytes());
+        }
+        assert!(base64_decode("not base64 ***").is_none());
+    }
+
+    #[test]
+    fn adapter_name_validation() {
+        assert!(is_valid_adapter_name("Ethernet 2"));
+        assert!(is_valid_adapter_name("Bluetooth Network Connection"));
+        assert!(!is_valid_adapter_name(""));
+        assert!(!is_valid_adapter_name("   "));
+        assert!(!is_valid_adapter_name("bad\nname"));
+        assert!(!is_valid_adapter_name("a\tb"));
+    }
+
+    fn sample_plan() -> ApplyPlan {
+        ApplyPlan {
+            adapter_name: "Ethernet 2".into(),
+            ipv4_mode: Ipv4Mode::Static,
+            ip_address: "192.168.1.10".into(),
+            subnet_mask: "255.255.255.0".into(),
+            gateway: String::new(),
+            dns_mode: DnsMode::NoChange,
+            dns_servers: vec![],
+        }
+    }
+
+    #[test]
+    fn plan_validation() {
+        assert!(validate_plan(&sample_plan()).is_ok());
+
+        let mut bad_mask = sample_plan();
+        bad_mask.subnet_mask = "255.0.255.0".into();
+        assert!(validate_plan(&bad_mask).is_err());
+
+        let mut bad_name = sample_plan();
+        bad_name.adapter_name = "bad\nname".into();
+        assert!(validate_plan(&bad_name).is_err());
+
+        let mut manual = sample_plan();
+        manual.dns_mode = DnsMode::Manual;
+        manual.dns_servers = vec!["8.8.8.8".into(), "8.8.4.4".into()];
+        assert!(validate_plan(&manual).is_ok());
+        manual.dns_servers = vec!["not-an-ip".into()];
+        assert!(validate_plan(&manual).is_err());
+    }
+
+    #[test]
+    fn result_path_safety() {
+        use std::fs;
+        // Build a real <bundle-id>/networkmanager cache dir under the temp tree so
+        // canonicalize() has something to resolve; the result file itself need not
+        // exist (only its parent is validated).
+        let base = std::env::temp_dir().join("stier_nm_result_path_test");
+        let _ = fs::remove_dir_all(&base);
+        let app_dir = base.join(APP_IDENTIFIER).join("networkmanager");
+        fs::create_dir_all(&app_dir).expect("create temp app cache dir");
+
+        let good = app_dir.join("apply-result-12-34.json");
+        assert!(result_path_is_safe(good.to_str().unwrap()));
+
+        // Right directory, wrong leaf name.
+        assert!(!result_path_is_safe(app_dir.join("evil.txt").to_str().unwrap()));
+
+        // `..` is resolved away, so the real parent (<bundle-id>) is not the cache dir.
+        let traversal = app_dir.join("..").join("apply-result-x.json");
+        assert!(!result_path_is_safe(traversal.to_str().unwrap()));
+
+        // Right leaf name, but the parent dir isn't <bundle-id>/networkmanager.
+        let wrong_dir = base.join("networkmanager");
+        fs::create_dir_all(&wrong_dir).expect("create wrong dir");
+        assert!(!result_path_is_safe(wrong_dir.join("apply-result-x.json").to_str().unwrap()));
+
+        // Non-existent parent can't be canonicalized.
+        assert!(!result_path_is_safe(base.join("nope").join("apply-result-x.json").to_str().unwrap()));
+
+        // A real system dir outside the app tree.
+        assert!(!result_path_is_safe("C:\\Windows\\System32\\apply-result-x.json"));
+
+        // Relative paths are rejected outright.
+        assert!(!result_path_is_safe("apply-result-x.json"));
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
