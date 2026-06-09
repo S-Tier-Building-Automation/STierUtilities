@@ -665,6 +665,8 @@ let nm = {
     total: 0,
     hosts: [],             // ScanHost[]: { ip, rttMs, mac, hostname }
     filter: "",            // free-text filter over ip/hostname/mac
+    sortKey: "ip",         // "ip" | "hostname" | "mac" | "rtt"
+    sortDir: "asc",        // "asc" | "desc"
     done: false,
     error: "",
     listenersReady: false,
@@ -1290,6 +1292,38 @@ function nmScanFilteredHosts() {
     (h.mac || "").toLowerCase().includes(q));
 }
 
+// Dotted IPv4 -> sortable 32-bit number; -1 for anything unparseable so
+// malformed addresses sort to the top in ascending order.
+function nmIpToNum(ip) {
+  const p = String(ip || "").split(".").map((n) => parseInt(n, 10));
+  if (p.length !== 4 || p.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return -1;
+  return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+}
+
+// Sort a host list by the active column/direction. IP and RTT compare
+// numerically; hostname/MAC compare case-insensitively with blanks pinned
+// last (regardless of direction). IP is the stable tiebreaker throughout.
+function nmScanSortedHosts(hosts) {
+  const { sortKey, sortDir } = nm.scan;
+  const dir = sortDir === "desc" ? -1 : 1;
+  const ipCmp = (a, b) => nmIpToNum(a.ip) - nmIpToNum(b.ip);
+  return hosts.slice().sort((a, b) => {
+    if (sortKey === "ip") return ipCmp(a, b) * dir;
+    if (sortKey === "rtt") {
+      const cmp = (a.rttMs ?? Infinity) - (b.rttMs ?? Infinity);
+      return (cmp || ipCmp(a, b)) * dir;
+    }
+    // hostname / mac
+    const av = (a[sortKey] || "").toLowerCase();
+    const bv = (b[sortKey] || "").toLowerCase();
+    if (!av && !bv) return ipCmp(a, b);
+    if (!av) return 1;   // blanks always last
+    if (!bv) return -1;
+    const cmp = av < bv ? -1 : av > bv ? 1 : 0;
+    return (cmp || ipCmp(a, b)) * dir;
+  });
+}
+
 // "N hosts" when unfiltered, "shown of total" when a filter is active.
 function nmScanFilterCountText() {
   const total = nm.scan.hosts.length;
@@ -1345,7 +1379,7 @@ function nmScanProgress() {
 }
 
 function nmScanResultRows() {
-  const hosts = nmScanFilteredHosts();
+  const hosts = nmScanSortedHosts(nmScanFilteredHosts());
   if (hosts.length === 0) {
     let msg;
     if (nm.scan.hosts.length > 0) msg = "No hosts match the filter.";
@@ -1359,6 +1393,41 @@ function nmScanResultRows() {
     el("td", { class: "nm-scan-mac" }, h.mac || el("span", { class: "muted" }, "—")),
     el("td", { class: "nm-scan-rtt" }, `${h.rttMs} ms`),
   ));
+}
+
+// Click a column to sort by it; click the active column again to flip
+// direction. Re-renders the table in place (header arrows + rows) without a
+// full page render, so the filter input keeps its focus/caret.
+function nmScanSetSort(key) {
+  if (nm.scan.sortKey === key) nm.scan.sortDir = nm.scan.sortDir === "asc" ? "desc" : "asc";
+  else { nm.scan.sortKey = key; nm.scan.sortDir = "asc"; }
+  const tbl = document.getElementById("nm-scan-table");
+  if (tbl) tbl.replaceWith(nmScanTableEl());
+}
+
+function nmScanHeaderCell(key, label) {
+  const active = nm.scan.sortKey === key;
+  const arrow = active ? (nm.scan.sortDir === "asc" ? "▲" : "▼") : "";
+  return el("th", {
+    class: `nm-scan-th${active ? " nm-scan-th-active" : ""}`,
+    role: "button",
+    tabindex: "0",
+    "aria-sort": active ? (nm.scan.sortDir === "asc" ? "ascending" : "descending") : "none",
+    onclick: () => nmScanSetSort(key),
+    onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nmScanSetSort(key); } },
+  }, label, el("span", { class: "nm-scan-sort-ind" }, arrow));
+}
+
+function nmScanTableEl() {
+  return el("table", { id: "nm-scan-table", class: "nm-scan-table" },
+    el("thead", {}, el("tr", {},
+      nmScanHeaderCell("ip", "IP address"),
+      nmScanHeaderCell("hostname", "Hostname"),
+      nmScanHeaderCell("mac", "MAC"),
+      nmScanHeaderCell("rtt", "RTT"),
+    )),
+    el("tbody", { id: "nm-scan-results" }, ...nmScanResultRows()),
+  );
 }
 
 function nmScanTab() {
@@ -1404,15 +1473,7 @@ function nmScanTab() {
     nmScanProgress(),
   );
 
-  const table = el("table", { class: "nm-scan-table" },
-    el("thead", {}, el("tr", {},
-      el("th", {}, "IP address"),
-      el("th", {}, "Hostname"),
-      el("th", {}, "MAC"),
-      el("th", {}, "RTT"),
-    )),
-    el("tbody", { id: "nm-scan-results" }, ...nmScanResultRows()),
-  );
+  const table = nmScanTableEl();
 
   const showFilter = nm.scan.scanning || nm.scan.done || nm.scan.hosts.length > 0;
 

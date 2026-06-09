@@ -724,6 +724,11 @@ a:hover { text-decoration: underline; }
   font-size: 11px; text-transform: uppercase; letter-spacing: 0.7px;
   color: var(--text-dim); border-bottom: 1px solid var(--border);
 }
+.nm-scan-th { cursor: pointer; user-select: none; white-space: nowrap; }
+.nm-scan-th:hover { color: var(--text); }
+.nm-scan-th:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.nm-scan-th-active { color: var(--accent); }
+.nm-scan-sort-ind { margin-left: 5px; font-size: 9px; vertical-align: middle; }
 .nm-scan-table td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
 .nm-scan-row:hover { background: var(--bg-elev-2); }
 .nm-scan-ip, .nm-scan-mac, .nm-scan-rtt {
