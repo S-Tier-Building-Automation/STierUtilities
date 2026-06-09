@@ -10,14 +10,14 @@
 //! - Liveness + round-trip time via `IcmpSendEcho` (IP Helper API — no raw sockets).
 //! - MAC via `SendARP` (IP Helper; local-subnet only, and catches firewalled hosts
 //!   that drop ICMP but still answer ARP).
-//! - Hostname via a single best-effort PowerShell reverse-DNS batch over responders.
+//! - Hostname via best-effort PowerShell reverse-DNS, resolved in parallel chunks
+//!   and streamed to the frontend as each chunk completes.
 //!
 //! Every PowerShell call is launched with `CREATE_NO_WINDOW` (consistent with the
 //! Network Manager module) so no console flashes.
 
 #![cfg(windows)]
 
-use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::os::windows::process::CommandExt;
 use std::process::Command;
@@ -51,6 +51,14 @@ const MAX_HOSTS: usize = 8192;
 /// Max concurrent ICMP workers. Each owns its own ICMP handle, so there's no shared
 /// state on the hot path beyond the work queue and counters.
 const MAX_WORKERS: usize = 128;
+
+/// Number of IPs reverse-resolved per PowerShell process. Small enough that a chunk
+/// of unresolvable hosts returns quickly (so names stream in steadily), large enough
+/// to amortize PowerShell's process-startup cost across the chunk.
+const DNS_CHUNK: usize = 24;
+
+/// Max concurrent reverse-DNS PowerShell processes.
+const MAX_DNS_WORKERS: usize = 8;
 
 // ---------------------------------------------------------------------------
 // Models (shared with the frontend)
@@ -311,14 +319,14 @@ fn parse_ptr_list(json: &str) -> Vec<PtrEntry> {
     Vec::new()
 }
 
-/// Best-effort reverse DNS for the responders, via one PowerShell process using
-/// `Resolve-DnsName -Type PTR -QuickTimeout`. QuickTimeout makes non-resolving
-/// hosts fail fast (a no-PTR LAN host would otherwise stall the resolver for
-/// seconds each). Returns ip -> hostname for the ones that resolved; any failure
-/// yields an empty map (hostnames simply stay blank).
-fn resolve_hostnames(ips: &[String]) -> HashMap<String, String> {
+/// Reverse-resolves one chunk of IPs in a single PowerShell process. `-QuickTimeout`
+/// makes non-resolving hosts fail fast (a no-PTR LAN host would otherwise stall the
+/// resolver for seconds each). There is deliberately no `-DnsOnly`, so the system
+/// resolver may also satisfy the lookup via LLMNR/NetBIOS — not just DNS. Returns the
+/// (ip, hostname) pairs that resolved to a real name; any failure yields an empty list.
+fn resolve_chunk(ips: &[String]) -> Vec<HostName> {
     if ips.is_empty() {
-        return HashMap::new();
+        return Vec::new();
     }
     // IPs are already validated (they came from successful pings), but quote-escape
     // defensively anyway since they're embedded into the script.
@@ -333,7 +341,7 @@ $ips=@({list})
 $out=foreach($ip in $ips){{
   $h=''
   try{{
-    $r=Resolve-DnsName -Name $ip -Type PTR -QuickTimeout -DnsOnly -ErrorAction Stop
+    $r=Resolve-DnsName -Name $ip -Type PTR -QuickTimeout -ErrorAction Stop
     $h=($r | Where-Object {{ $_.NameHost }} | Select-Object -First 1).NameHost
   }}catch{{ $h='' }}
   [pscustomobject]@{{ ip=$ip; host=[string]$h }}
@@ -346,7 +354,7 @@ $out=foreach($ip in $ips){{
         .creation_flags(CREATE_NO_WINDOW)
         .output();
 
-    let mut map = HashMap::new();
+    let mut names = Vec::new();
     if let Ok(out) = output {
         if out.status.success() {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -354,12 +362,59 @@ $out=foreach($ip in $ips){{
                 let host = entry.host.trim().trim_end_matches('.');
                 // Drop entries where reverse DNS just echoed the IP back.
                 if !host.is_empty() && host != entry.ip {
-                    map.insert(entry.ip, host.to_string());
+                    names.push(HostName {
+                        ip: entry.ip,
+                        hostname: host.to_string(),
+                    });
                 }
             }
         }
     }
-    map
+    names
+}
+
+/// Reverse-resolves every responder in parallel chunks, emitting a `netscan:hostnames`
+/// event the moment each chunk resolves so names stream into the table instead of
+/// landing in one lump at the end. Bounded to `MAX_DNS_WORKERS` concurrent PowerShell
+/// processes. Best-effort: unresolved hosts simply stay blank.
+fn resolve_hostnames_streaming(app: &AppHandle, ips: Vec<String>) {
+    let chunks: Vec<Vec<String>> = ips.chunks(DNS_CHUNK).map(|c| c.to_vec()).collect();
+    let n_chunks = chunks.len();
+    if n_chunks == 0 {
+        return;
+    }
+
+    // Feed chunks through a shared queue; bounded workers drain it concurrently.
+    let (tx, rx) = mpsc::channel::<Vec<String>>();
+    for c in chunks {
+        let _ = tx.send(c);
+    }
+    drop(tx);
+    let rx = Arc::new(Mutex::new(rx));
+
+    let worker_count = MAX_DNS_WORKERS.min(n_chunks).max(1);
+    let mut handles = Vec::with_capacity(worker_count);
+    for _ in 0..worker_count {
+        let rx = Arc::clone(&rx);
+        let app = app.clone();
+        handles.push(thread::spawn(move || loop {
+            let next = {
+                let guard = rx.lock().unwrap();
+                guard.recv()
+            };
+            let chunk = match next {
+                Ok(c) => c,
+                Err(_) => break,
+            };
+            let names = resolve_chunk(&chunk);
+            if !names.is_empty() {
+                let _ = app.emit("netscan:hostnames", &names);
+            }
+        }));
+    }
+    for h in handles {
+        let _ = h.join();
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -369,9 +424,10 @@ $out=foreach($ip in $ips){{
 /// Sweeps `ip/prefix` and returns every live host. Streams `netscan:host` and
 /// `netscan:progress` during the sweep, emits `netscan:done` the moment the sweep
 /// finishes, then resolves reverse-DNS hostnames in a **detached** background task
-/// that emits `netscan:hostnames` when ready. Hostname resolution deliberately does
-/// NOT block the command's return — on a large subnet it can take a while, and the
-/// host/MAC/RTT results are already complete and usable without it.
+/// that streams `netscan:hostnames` events as each chunk of names resolves. Hostname
+/// resolution deliberately does NOT block the command's return — on a large subnet it
+/// can take a while, and the host/MAC/RTT results are already complete and usable
+/// without it.
 #[tauri::command]
 pub async fn netscan_scan(app: AppHandle, ip: String, prefix: u8) -> Result<ScanResult, String> {
     let base: Ipv4Addr = ip
@@ -394,21 +450,16 @@ pub async fn netscan_scan(app: AppHandle, ip: String, prefix: u8) -> Result<Scan
     let _ = app.emit("netscan:done", &result);
 
     // Detached, best-effort hostname enrichment — fills in the `hostname` column
-    // after the fact via a separate event, so the sweep result is never held up.
+    // after the fact via streamed events, so the sweep result is never held up and
+    // names appear incrementally as each chunk resolves.
     if !hosts.is_empty() {
         let app_for_dns = app.clone();
         let ips: Vec<String> = hosts.iter().map(|h| h.ip.clone()).collect();
         tauri::async_runtime::spawn(async move {
-            let map = tauri::async_runtime::spawn_blocking(move || resolve_hostnames(&ips))
-                .await
-                .unwrap_or_default();
-            if !map.is_empty() {
-                let names: Vec<HostName> = map
-                    .into_iter()
-                    .map(|(ip, hostname)| HostName { ip, hostname })
-                    .collect();
-                let _ = app_for_dns.emit("netscan:hostnames", &names);
-            }
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                resolve_hostnames_streaming(&app_for_dns, ips);
+            })
+            .await;
         });
     }
 
@@ -451,6 +502,27 @@ mod tests {
     fn host_range_rejects_too_large() {
         // /16 = 65534 hosts > MAX_HOSTS.
         assert!(host_range(Ipv4Addr::new(10, 0, 0, 1), 16).is_err());
+    }
+
+    #[test]
+    fn resolve_chunk_empty_is_noop() {
+        // No IPs -> no PowerShell spawn, empty result.
+        assert!(resolve_chunk(&[]).is_empty());
+    }
+
+    /// Live check that the new resolution path (no `-DnsOnly`) returns a real name
+    /// for an IP that has a PTR record. Ignored by default — it spawns PowerShell and
+    /// needs network. Run with: `cargo test -- --ignored resolve_chunk_resolves_known_ptr`.
+    #[test]
+    #[ignore]
+    fn resolve_chunk_resolves_known_ptr() {
+        let names = resolve_chunk(&["8.8.8.8".to_string()]);
+        assert_eq!(names.len(), 1, "expected one resolved name");
+        assert!(
+            names[0].hostname.contains("dns.google"),
+            "unexpected hostname: {}",
+            names[0].hostname
+        );
     }
 
     #[test]
