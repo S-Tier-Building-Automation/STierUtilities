@@ -664,6 +664,7 @@ let nm = {
     scanned: 0,
     total: 0,
     hosts: [],             // ScanHost[]: { ip, rttMs, mac, hostname }
+    filter: "",            // free-text filter over ip/hostname/mac
     done: false,
     error: "",
     listenersReady: false,
@@ -1275,8 +1276,52 @@ function nmScanRenderLive() {
   if (currentPluginId() !== "networkmanager" || nm.tab !== "scan") return;
   const prog = document.getElementById("nm-scan-progress");
   if (prog) prog.replaceWith(nmScanProgress());
+  nmScanApplyFilter();
+}
+
+// Hosts narrowed by the free-text filter (case-insensitive substring over
+// IP, hostname, and MAC). Empty filter returns every host.
+function nmScanFilteredHosts() {
+  const q = nm.scan.filter.trim().toLowerCase();
+  if (!q) return nm.scan.hosts;
+  return nm.scan.hosts.filter((h) =>
+    (h.ip || "").toLowerCase().includes(q) ||
+    (h.hostname || "").toLowerCase().includes(q) ||
+    (h.mac || "").toLowerCase().includes(q));
+}
+
+// "N hosts" when unfiltered, "shown of total" when a filter is active.
+function nmScanFilterCountText() {
+  const total = nm.scan.hosts.length;
+  if (!nm.scan.filter.trim()) return `${total} host${total === 1 ? "" : "s"}`;
+  return `${nmScanFilteredHosts().length} of ${total} shown`;
+}
+
+// Re-render just the results body + count in place so typing in the filter
+// box never rebuilds the page (which would steal focus from the input).
+function nmScanApplyFilter() {
+  if (currentPluginId() !== "networkmanager" || nm.tab !== "scan") return;
   const body = document.getElementById("nm-scan-results");
   if (body) body.replaceChildren(...nmScanResultRows());
+  const cnt = document.getElementById("nm-scan-filter-count");
+  if (cnt) cnt.textContent = nmScanFilterCountText();
+}
+
+// Filter row above the results table. The <input> is left untouched by
+// nmScanApplyFilter, so it keeps focus + caret while you type.
+function nmScanFilterBar() {
+  return el("div", { class: "nm-scan-filter" },
+    el("input", {
+      type: "search",
+      class: "nm-input nm-scan-filter-input",
+      placeholder: "Filter by IP, hostname, or MAC…",
+      "aria-label": "Filter scan results",
+      value: nm.scan.filter,
+      oninput: (e) => { nm.scan.filter = e.target.value; nmScanApplyFilter(); },
+    }),
+    el("span", { id: "nm-scan-filter-count", class: "muted small nm-scan-filter-count" },
+      nmScanFilterCountText()),
+  );
 }
 
 function nmScanProgress() {
@@ -1300,11 +1345,15 @@ function nmScanProgress() {
 }
 
 function nmScanResultRows() {
-  if (nm.scan.hosts.length === 0) {
-    return [el("tr", {}, el("td", { class: "muted small", colspan: "4" },
-      nm.scan.scanning ? "Listening for hosts…" : "No hosts yet — run a scan."))];
+  const hosts = nmScanFilteredHosts();
+  if (hosts.length === 0) {
+    let msg;
+    if (nm.scan.hosts.length > 0) msg = "No hosts match the filter.";
+    else if (nm.scan.scanning) msg = "Listening for hosts…";
+    else msg = "No hosts yet — run a scan.";
+    return [el("tr", {}, el("td", { class: "muted small", colspan: "4" }, msg))];
   }
-  return nm.scan.hosts.map((h) => el("tr", { class: "nm-scan-row" },
+  return hosts.map((h) => el("tr", { class: "nm-scan-row" },
     el("td", { class: "nm-scan-ip" }, h.ip),
     el("td", {}, h.hostname || el("span", { class: "muted" }, "—")),
     el("td", { class: "nm-scan-mac" }, h.mac || el("span", { class: "muted" }, "—")),
@@ -1365,9 +1414,14 @@ function nmScanTab() {
     el("tbody", { id: "nm-scan-results" }, ...nmScanResultRows()),
   );
 
+  const showFilter = nm.scan.scanning || nm.scan.done || nm.scan.hosts.length > 0;
+
   return el("div", { class: "plugin-controls" },
     head,
-    el("section", { class: "plugin-section" }, table),
+    el("section", { class: "plugin-section" },
+      showFilter ? nmScanFilterBar() : null,
+      table,
+    ),
   );
 }
 

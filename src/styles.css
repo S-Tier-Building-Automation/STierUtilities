@@ -715,6 +715,9 @@ a:hover { text-decoration: underline; }
   background: linear-gradient(90deg, var(--accent) 0%, var(--accent-2) 100%);
   transition: width 0.2s ease;
 }
+.nm-scan-filter { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
+.nm-scan-filter-input { flex: 1; min-width: 0; }
+.nm-scan-filter-count { white-space: nowrap; font-variant-numeric: tabular-nums; }
 .nm-scan-table { width: 100%; border-collapse: collapse; font-size: 13px; }
 .nm-scan-table th {
   text-align: left; padding: 7px 10px;
