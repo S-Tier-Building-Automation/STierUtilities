@@ -721,26 +721,46 @@ fn validate_plan(plan: &ApplyPlan) -> Result<(), String> {
     Ok(())
 }
 
-/// True only for an absolute path under the user's profile whose file name matches
-/// the expected `apply-result-*.json`. The elevated worker refuses to write anywhere
-/// else, so a tampered result-path argument can't turn an admin-level write loose
-/// on an arbitrary location.
+/// Bundle identifier (mirrors `tauri.conf.json`); the elevated worker only ever
+/// writes inside this app's per-user cache subdir, `<identifier>/networkmanager`.
+const APP_IDENTIFIER: &str = "com.stierbuildings.utilities";
+
+/// True only for a result file the un-elevated parent legitimately created: an
+/// absolute `apply-result-*.json` whose **canonical** parent directory is this
+/// app's `<identifier>/networkmanager` cache subdir. The elevated worker re-checks
+/// this so a tampered result-path argument can't turn an admin-level write loose on
+/// an arbitrary location.
+///
+/// The check deliberately does *not* anchor on `%USERPROFILE%`: under credentialed
+/// ("over-the-shoulder") elevation the worker runs as a different admin account, so
+/// the parent's file lives under the standard user's profile, not the worker's — a
+/// profile anchor would reject every such apply. Canonicalizing the parent resolves
+/// junctions/symlinks/`..` to the real target first, so a reparse point can't
+/// redirect the write outside the cache dir.
 fn result_path_is_safe(result_path: &str) -> bool {
-    if result_path.contains("..") {
-        return false;
-    }
     let path = Path::new(result_path);
     if !path.is_absolute() {
         return false;
     }
-    let home = std::env::var("USERPROFILE").unwrap_or_default();
-    if home.is_empty() || !path.starts_with(&home) {
-        return false;
-    }
-    path.file_name()
+    let name_ok = path
+        .file_name()
         .and_then(|n| n.to_str())
         .map(|n| n.starts_with("apply-result-") && n.ends_with(".json"))
-        .unwrap_or(false)
+        .unwrap_or(false);
+    if !name_ok {
+        return false;
+    }
+    // The parent must already exist (the un-elevated parent created it). canonicalize
+    // resolves any symlink/junction/`..` to the real target before we trust it.
+    let canon = match path.parent().and_then(|p| std::fs::canonicalize(p).ok()) {
+        Some(c) => c,
+        None => return false,
+    };
+    let mut tail = canon.components().rev().filter_map(|c| match c {
+        std::path::Component::Normal(s) => s.to_str(),
+        _ => None,
+    });
+    tail.next() == Some("networkmanager") && tail.next() == Some(APP_IDENTIFIER)
 }
 
 /// The apply steps, run inside the elevated re-launch of this exe: IPv4 via netsh,
@@ -1181,16 +1201,40 @@ mod tests {
 
     #[test]
     fn result_path_safety() {
-        let home = std::env::var("USERPROFILE").unwrap_or_default();
-        assert!(!home.is_empty(), "USERPROFILE must be set on the test host");
-        let good = format!(
-            "{home}\\AppData\\Local\\com.stierbuildings.utilities\\networkmanager\\apply-result-12-34.json"
-        );
-        assert!(result_path_is_safe(&good));
-        assert!(!result_path_is_safe("C:\\Windows\\System32\\apply-result-x.json")); // outside profile
-        assert!(!result_path_is_safe(&format!("{home}\\..\\evil\\apply-result-x.json"))); // traversal
-        assert!(!result_path_is_safe(&format!("{home}\\networkmanager\\evil.txt"))); // wrong name
-        assert!(!result_path_is_safe("apply-result-x.json")); // relative
+        use std::fs;
+        // Build a real <bundle-id>/networkmanager cache dir under the temp tree so
+        // canonicalize() has something to resolve; the result file itself need not
+        // exist (only its parent is validated).
+        let base = std::env::temp_dir().join("stier_nm_result_path_test");
+        let _ = fs::remove_dir_all(&base);
+        let app_dir = base.join(APP_IDENTIFIER).join("networkmanager");
+        fs::create_dir_all(&app_dir).expect("create temp app cache dir");
+
+        let good = app_dir.join("apply-result-12-34.json");
+        assert!(result_path_is_safe(good.to_str().unwrap()));
+
+        // Right directory, wrong leaf name.
+        assert!(!result_path_is_safe(app_dir.join("evil.txt").to_str().unwrap()));
+
+        // `..` is resolved away, so the real parent (<bundle-id>) is not the cache dir.
+        let traversal = app_dir.join("..").join("apply-result-x.json");
+        assert!(!result_path_is_safe(traversal.to_str().unwrap()));
+
+        // Right leaf name, but the parent dir isn't <bundle-id>/networkmanager.
+        let wrong_dir = base.join("networkmanager");
+        fs::create_dir_all(&wrong_dir).expect("create wrong dir");
+        assert!(!result_path_is_safe(wrong_dir.join("apply-result-x.json").to_str().unwrap()));
+
+        // Non-existent parent can't be canonicalized.
+        assert!(!result_path_is_safe(base.join("nope").join("apply-result-x.json").to_str().unwrap()));
+
+        // A real system dir outside the app tree.
+        assert!(!result_path_is_safe("C:\\Windows\\System32\\apply-result-x.json"));
+
+        // Relative paths are rejected outright.
+        assert!(!result_path_is_safe("apply-result-x.json"));
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
