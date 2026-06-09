@@ -19,6 +19,9 @@ src-tauri/gen/schemas/
 src-tauri/binaries/ffmpeg-*
 src-tauri/binaries/ffprobe-*
 
+# Dev screenshots (UI verification artifacts)
+/scan-tab-*.png
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
