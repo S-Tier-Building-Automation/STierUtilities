@@ -700,3 +700,31 @@ a:hover { text-decoration: underline; }
 .nm-nic-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-top: 4px; }
 .nm-nic-active { color: var(--ok); }
 .nm-nic-save { padding: 5px 10px; }
+
+/* scan tab */
+.nm-scan-controls { display: flex; align-items: flex-end; gap: 12px; margin-top: 12px; }
+.nm-scan-pick { flex: 1; min-width: 0; }
+.nm-scan-progress { margin-top: 14px; display: flex; flex-direction: column; gap: 6px; }
+.nm-scan-bar {
+  height: 6px; border-radius: 999px;
+  background: var(--bg); border: 1px solid var(--border);
+  overflow: hidden;
+}
+.nm-scan-bar-fill {
+  height: 100%; width: 0;
+  background: linear-gradient(90deg, var(--accent) 0%, var(--accent-2) 100%);
+  transition: width 0.2s ease;
+}
+.nm-scan-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.nm-scan-table th {
+  text-align: left; padding: 7px 10px;
+  font-size: 11px; text-transform: uppercase; letter-spacing: 0.7px;
+  color: var(--text-dim); border-bottom: 1px solid var(--border);
+}
+.nm-scan-table td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
+.nm-scan-row:hover { background: var(--bg-elev-2); }
+.nm-scan-ip, .nm-scan-mac, .nm-scan-rtt {
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, "Cascadia Code", "Consolas", monospace;
+}
+.nm-scan-rtt { color: var(--text-dim); }

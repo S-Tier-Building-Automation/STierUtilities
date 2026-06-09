@@ -3,6 +3,8 @@ mod clipboardtyper;
 #[cfg(windows)]
 mod heicmov;
 #[cfg(windows)]
+mod netscan;
+#[cfg(windows)]
 mod networkmanager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -47,6 +49,7 @@ pub fn run() {
         networkmanager::networkmanager_profiles_path,
         networkmanager::networkmanager_open_profiles_dir,
         networkmanager::networkmanager_apply_profile,
+        netscan::netscan_scan,
     ]);
 
     builder

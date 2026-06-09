@@ -657,7 +657,17 @@ let nm = {
   busy: false,
   busyLabel: "",
   loaded: false,           // adapters/state read at least once this session
-  tab: "profiles",         // "profiles" | "adapters"
+  tab: "profiles",         // "profiles" | "adapters" | "scan"
+  scan: {
+    adapterName: "",       // adapter whose subnet we sweep
+    scanning: false,
+    scanned: 0,
+    total: 0,
+    hosts: [],             // ScanHost[]: { ip, rttMs, mac, hostname }
+    done: false,
+    error: "",
+    listenersReady: false,
+  },
 };
 
 function nmNewId() {
@@ -1157,6 +1167,210 @@ function nmEditorContent(sel) {
   ];
 }
 
+// ---- scan (Angry-IP-Scanner-style subnet sweep) ----
+
+// Dotted IPv4 mask -> CIDR prefix length (count of contiguous high bits).
+function nmMaskToPrefix(mask) {
+  const parts = String(mask || "").split(".").map((n) => parseInt(n, 10));
+  if (parts.length !== 4 || parts.some((n) => Number.isNaN(n) || n < 0 || n > 255)) return null;
+  let bits = 0;
+  for (const oct of parts) bits += (oct >>> 0).toString(2).split("").filter((b) => b === "1").length;
+  return bits;
+}
+
+// Resolve the subnet we'd sweep for an adapter, from its live state. Returns
+// { ip, prefix, network, label } or null when the adapter has no usable IPv4.
+function nmScanSubnetFor(adapterName) {
+  const st = nm.stateByAdapter[adapterName];
+  if (!st || !st.ipAddress) return null;
+  const prefix = nmMaskToPrefix(st.subnetMask);
+  if (prefix == null || prefix < 16 || prefix > 30) return null;
+  const ipParts = st.ipAddress.split(".").map((n) => parseInt(n, 10));
+  if (ipParts.length !== 4 || ipParts.some((n) => Number.isNaN(n))) return null;
+  const ipNum = ((ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]) >>> 0;
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  const net = (ipNum & mask) >>> 0;
+  const network = [(net >>> 24) & 255, (net >>> 16) & 255, (net >>> 8) & 255, net & 255].join(".");
+  const hostCount = Math.max(0, Math.pow(2, 32 - prefix) - 2);
+  return { ip: st.ipAddress, prefix, network, hostCount, label: `${network}/${prefix} · ${hostCount} hosts` };
+}
+
+// Pick a sensible default adapter to scan: the current scan target if still valid,
+// else the selected profile's adapter, else the first "Up" adapter with an IPv4.
+function nmScanDefaultAdapter() {
+  if (nm.scan.adapterName && nmScanSubnetFor(nm.scan.adapterName)) return nm.scan.adapterName;
+  const sel = nmSelected();
+  if (sel?.adapterName && nmScanSubnetFor(sel.adapterName)) return sel.adapterName;
+  const up = nm.adapters.find((a) => a.status === "Up" && nmScanSubnetFor(a.name));
+  if (up) return up.name;
+  const any = nm.adapters.find((a) => nmScanSubnetFor(a.name));
+  return any?.name || "";
+}
+
+function nmScanInitListeners() {
+  if (nm.scan.listenersReady) return;
+  nm.scan.listenersReady = true;
+  listen("netscan:host", (e) => {
+    const h = e.payload;
+    if (!nm.scan.hosts.some((x) => x.ip === h.ip)) nm.scan.hosts.push(h);
+    nmScanRenderLive();
+  });
+  listen("netscan:progress", (e) => {
+    nm.scan.scanned = e.payload.scanned;
+    nm.scan.total = e.payload.total;
+    nmScanRenderLive();
+  });
+  listen("netscan:done", (e) => {
+    // Merge rather than replace: streamed `netscan:host` rows may already carry
+    // hostnames that arrived first; keep them.
+    const byIp = new Map(nm.scan.hosts.map((h) => [h.ip, h]));
+    nm.scan.hosts = (e.payload.hosts || []).map((h) => ({ ...h, hostname: h.hostname || byIp.get(h.ip)?.hostname || "" }));
+    nm.scan.total = e.payload.total;
+    nm.scan.done = true;
+    nm.scan.scanning = false;
+    renderAll();
+  });
+  listen("netscan:hostnames", (e) => {
+    const map = new Map((e.payload || []).map((x) => [x.ip, x.hostname]));
+    for (const h of nm.scan.hosts) { const n = map.get(h.ip); if (n) h.hostname = n; }
+    nmScanRenderLive();
+  });
+}
+
+async function nmScanStart() {
+  if (nm.scan.scanning) return;
+  const adapterName = nmScanDefaultAdapter();
+  const subnet = adapterName ? nmScanSubnetFor(adapterName) : null;
+  if (!subnet) {
+    logTo("networkmanager", "No adapter with a scannable IPv4 subnet. Refresh adapters first.", "warn");
+    return;
+  }
+  nm.scan.adapterName = adapterName;
+  nm.scan.scanning = true;
+  nm.scan.done = false;
+  nm.scan.error = "";
+  nm.scan.hosts = [];
+  nm.scan.scanned = 0;
+  nm.scan.total = subnet.hostCount;
+  renderAll();
+  try {
+    // The `netscan:done` event is authoritative for the host list (and merges
+    // streamed hostnames); don't overwrite it from the resolved value here.
+    const result = await invoke("netscan_scan", { ip: subnet.ip, prefix: subnet.prefix });
+    nm.scan.total = result.total;
+    logTo("networkmanager", `Scan complete — ${result.hosts.length} host${result.hosts.length === 1 ? "" : "s"} on ${subnet.network}/${subnet.prefix}.`, "ok");
+  } catch (err) {
+    nm.scan.error = String(err);
+    logTo("networkmanager", `Scan failed: ${err}`, "error");
+  } finally {
+    nm.scan.scanning = false;
+    nm.scan.done = true;
+    renderAll();
+  }
+}
+
+// Patch the live bits (progress + results) in place so streamed events don't
+// rebuild the whole page (which would steal focus / flicker the adapter picker).
+function nmScanRenderLive() {
+  if (currentPluginId() !== "networkmanager" || nm.tab !== "scan") return;
+  const prog = document.getElementById("nm-scan-progress");
+  if (prog) prog.replaceWith(nmScanProgress());
+  const body = document.getElementById("nm-scan-results");
+  if (body) body.replaceChildren(...nmScanResultRows());
+}
+
+function nmScanProgress() {
+  const { scanned, total, scanning, hosts } = nm.scan;
+  const pct = total > 0 ? Math.min(100, Math.round((scanned / total) * 100)) : 0;
+  let idle = "Pick a subnet to scan.";
+  if (!scanning && !nm.scan.done) {
+    const a = nmScanDefaultAdapter();
+    const sub = a ? nmScanSubnetFor(a) : null;
+    idle = sub ? `${sub.hostCount} hosts in range (${sub.network}/${sub.prefix})` : "No scannable subnet — refresh adapters.";
+  }
+  return el("div", { id: "nm-scan-progress", class: "nm-scan-progress" },
+    el("div", { class: "nm-scan-bar" }, el("div", { class: "nm-scan-bar-fill", style: `width:${pct}%` })),
+    el("div", { class: "muted small" },
+      scanning
+        ? `Scanning… ${scanned}/${total} probed · ${hosts.length} found`
+        : nm.scan.done
+          ? `Done · ${hosts.length} host${hosts.length === 1 ? "" : "s"} of ${total} probed`
+          : idle),
+  );
+}
+
+function nmScanResultRows() {
+  if (nm.scan.hosts.length === 0) {
+    return [el("tr", {}, el("td", { class: "muted small", colspan: "4" },
+      nm.scan.scanning ? "Listening for hosts…" : "No hosts yet — run a scan."))];
+  }
+  return nm.scan.hosts.map((h) => el("tr", { class: "nm-scan-row" },
+    el("td", { class: "nm-scan-ip" }, h.ip),
+    el("td", {}, h.hostname || el("span", { class: "muted" }, "—")),
+    el("td", { class: "nm-scan-mac" }, h.mac || el("span", { class: "muted" }, "—")),
+    el("td", { class: "nm-scan-rtt" }, `${h.rttMs} ms`),
+  ));
+}
+
+function nmScanTab() {
+  nmScanInitListeners();
+  const adapterName = nmScanDefaultAdapter();
+  const subnet = adapterName ? nmScanSubnetFor(adapterName) : null;
+
+  const candidates = nm.adapters.filter((a) => nmScanSubnetFor(a.name));
+  const picker = el("select", {
+    class: "nm-input",
+    disabled: nm.scan.scanning ? "disabled" : undefined,
+    onchange: (e) => { nm.scan.adapterName = e.target.value; renderAll(); },
+  },
+    ...candidates.map((a) => el("option", {
+      value: a.name,
+      selected: a.name === adapterName ? "selected" : undefined,
+    }, `${a.name} — ${nmScanSubnetFor(a.name).label}`)),
+  );
+
+  const scanBtn = el("button", {
+    class: "btn btn-primary",
+    disabled: nm.scan.scanning || !subnet ? "disabled" : undefined,
+    onclick: nmScanStart,
+  }, nm.scan.scanning ? "Scanning…" : "Scan subnet");
+
+  const head = el("section", { class: "plugin-section" },
+    el("div", { class: "nm-pane-head" },
+      el("div", { class: "nm-pane-head-text" },
+        el("h3", {}, "Scan local subnet"),
+        el("p", { class: "muted small nm-section-sub" },
+          "Ping-sweep the adapter's subnet to find live hosts, their MAC, and hostname. Un-elevated."),
+      ),
+    ),
+    candidates.length === 0
+      ? el("p", { class: "muted small" }, nm.loaded ? "No adapter has a scannable IPv4 subnet." : "Reading adapters…")
+      : el("div", { class: "nm-scan-controls" },
+          el("label", { class: "nm-field nm-scan-pick" },
+            el("span", { class: "nm-field-label" }, "Subnet"),
+            picker,
+          ),
+          scanBtn,
+        ),
+    nmScanProgress(),
+  );
+
+  const table = el("table", { class: "nm-scan-table" },
+    el("thead", {}, el("tr", {},
+      el("th", {}, "IP address"),
+      el("th", {}, "Hostname"),
+      el("th", {}, "MAC"),
+      el("th", {}, "RTT"),
+    )),
+    el("tbody", { id: "nm-scan-results" }, ...nmScanResultRows()),
+  );
+
+  return el("div", { class: "plugin-controls" },
+    head,
+    el("section", { class: "plugin-section" }, table),
+  );
+}
+
 function nmTabBar() {
   const tab = (id, label) => el("button", {
     class: `nm-tab ${nm.tab === id ? "nm-tab-active" : ""}`,
@@ -1165,6 +1379,7 @@ function nmTabBar() {
   return el("div", { class: "nm-tabs" },
     tab("profiles", "Profiles"),
     tab("adapters", "Adapters"),
+    tab("scan", "Scan"),
   );
 }
 
@@ -1254,9 +1469,13 @@ function nmAdaptersTab() {
 
 function renderNetworkManagerPage() {
   nmEnsureLoaded();
+  const body =
+    nm.tab === "adapters" ? nmAdaptersTab()
+    : nm.tab === "scan" ? nmScanTab()
+    : nmProfilesTab();
   return el("div", { class: "plugin-controls nm-root" },
     nmTabBar(),
-    nm.tab === "adapters" ? nmAdaptersTab() : nmProfilesTab(),
+    body,
   );
 }
 
