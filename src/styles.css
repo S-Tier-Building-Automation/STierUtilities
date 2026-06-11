@@ -305,6 +305,28 @@ a:hover { text-decoration: underline; }
   margin-bottom: 10px;
 }
 
+/* ===== Cell rules ===== */
+
+.rule-row {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 8px;
+}
+.rule-input {
+  padding: 7px 10px; border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg); color: var(--text);
+  font-size: 13px; font-family: inherit;
+  min-width: 0;
+}
+.rule-input:focus { outline: none; border-color: var(--accent); }
+.rule-match { width: 130px; flex: none; }
+.rule-output { flex: 1; }
+.rule-arrow { color: var(--text-dim); }
+.rule-remove { flex: none; padding: 6px 10px; line-height: 1; }
+.rule-tokens code {
+  background: var(--bg); border: 1px solid var(--border);
+  border-radius: 5px; padding: 1px 5px; font-size: 12px;
+}
+
 /* ===== Toggle ===== */
 
 .toggle {

@@ -17,6 +17,7 @@
 
 #![cfg(windows)]
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::thread;
@@ -24,15 +25,17 @@ use std::time::Duration;
 
 use once_cell::sync::Lazy;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 use windows::Win32::Foundation::{HINSTANCE, HMODULE, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     MapVirtualKeyW, SendInput, VkKeyScanW, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT,
-    KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE, KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC,
-    VIRTUAL_KEY, VK_RETURN, VK_SHIFT, VK_TAB,
+    KEYBD_EVENT_FLAGS, KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP, KEYEVENTF_SCANCODE,
+    KEYEVENTF_UNICODE, MAPVK_VK_TO_VSC, VIRTUAL_KEY, VK_BACK, VK_DELETE, VK_DOWN, VK_END,
+    VK_ESCAPE, VK_HOME, VK_LEFT, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
+    VK_TAB, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, GetMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, MSG,
@@ -50,19 +53,51 @@ static HOOK_THREAD_ID: AtomicU32 = AtomicU32::new(0);
 static TYPE_DELAY_MS: AtomicU64 = AtomicU64::new(60);
 static MODIFIER_HOLD_MS: AtomicU64 = AtomicU64::new(40);
 static START_DELAY_MS: AtomicU64 = AtomicU64::new(40);
+static TRAILING_TAB: AtomicBool = AtomicBool::new(false);
+static NEWLINE_AS_TAB: AtomicBool = AtomicBool::new(false);
+static COLUMN_MAJOR: AtomicBool = AtomicBool::new(false);
+
+static RULES: Lazy<Mutex<Vec<Rule>>> = Lazy::new(|| Mutex::new(Vec::new()));
+static LOADED: AtomicBool = AtomicBool::new(false);
 
 static APP_HANDLE: Lazy<Mutex<Option<AppHandle>>> = Lazy::new(|| Mutex::new(None));
 
 // ---------- Public types (shared with the frontend) ----------
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+/// A value-based substitution: when a cell equals `match_value` (trimmed,
+/// case-insensitive), send `output` instead of typing the literal cell.
+/// `output` may contain key tokens like `{space}`, `{tab}`, `{enter}`, `{down}`.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Rule {
+    #[serde(rename = "match")]
+    pub match_value: String,
+    #[serde(default)]
+    pub output: String,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Settings {
     pub type_delay_ms: u64,
     pub modifier_hold_ms: u64,
     pub start_delay_ms: u64,
+    /// Press Tab once more after the last cell, so a copied Excel row can be
+    /// typed back-to-back without manually advancing to the next field.
+    #[serde(default)]
+    pub trailing_tab: bool,
+    /// Emit Tab instead of Enter for line breaks. A column copied from Excel is
+    /// new-line separated (no tabs), so this lets it advance field-to-field.
+    #[serde(default)]
+    pub newline_as_tab: bool,
+    /// Type a copied block column-by-column (top-to-bottom) instead of Excel's
+    /// row-major (left-to-right) order. Cells are reordered and Tab-separated.
+    #[serde(default)]
+    pub column_major: bool,
+    /// Cell substitution rules, applied in order (first match wins).
+    #[serde(default)]
+    pub rules: Vec<Rule>,
 }
 
-#[derive(Serialize, Clone, Copy)]
+#[derive(Serialize, Clone)]
 pub struct State {
     pub running: bool,
     pub armed: bool,
@@ -82,6 +117,53 @@ fn current_settings() -> Settings {
         type_delay_ms: TYPE_DELAY_MS.load(Ordering::Relaxed),
         modifier_hold_ms: MODIFIER_HOLD_MS.load(Ordering::Relaxed),
         start_delay_ms: START_DELAY_MS.load(Ordering::Relaxed),
+        trailing_tab: TRAILING_TAB.load(Ordering::Relaxed),
+        newline_as_tab: NEWLINE_AS_TAB.load(Ordering::Relaxed),
+        column_major: COLUMN_MAJOR.load(Ordering::Relaxed),
+        rules: RULES.lock().map(|g| g.clone()).unwrap_or_default(),
+    }
+}
+
+/// Apply a settings snapshot to the in-memory stores (timing is clamped).
+fn apply_settings(s: &Settings) {
+    TYPE_DELAY_MS.store(s.type_delay_ms.min(2000), Ordering::Relaxed);
+    MODIFIER_HOLD_MS.store(s.modifier_hold_ms.min(2000), Ordering::Relaxed);
+    START_DELAY_MS.store(s.start_delay_ms.min(2000), Ordering::Relaxed);
+    TRAILING_TAB.store(s.trailing_tab, Ordering::Relaxed);
+    NEWLINE_AS_TAB.store(s.newline_as_tab, Ordering::Relaxed);
+    COLUMN_MAJOR.store(s.column_major, Ordering::Relaxed);
+    if let Ok(mut g) = RULES.lock() {
+        *g = s.rules.clone();
+    }
+}
+
+// ---------- Persistence ----------
+
+fn settings_file(app: &AppHandle) -> Option<PathBuf> {
+    app.path()
+        .app_config_dir()
+        .ok()
+        .map(|dir| dir.join("clipboardtyper.json"))
+}
+
+fn save_settings(app: &AppHandle, settings: &Settings) {
+    if let Some(path) = settings_file(app) {
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(json) = serde_json::to_string_pretty(settings) {
+            let _ = std::fs::write(&path, json);
+        }
+    }
+}
+
+fn load_settings(app: &AppHandle) {
+    if let Some(path) = settings_file(app) {
+        if let Ok(data) = std::fs::read_to_string(&path) {
+            if let Ok(settings) = serde_json::from_str::<Settings>(&data) {
+                apply_settings(&settings);
+            }
+        }
     }
 }
 
@@ -176,16 +258,26 @@ pub fn clipboardtyper_set_armed(armed: bool) -> State {
 }
 
 #[tauri::command]
-pub fn clipboardtyper_set_settings(settings: Settings) -> State {
-    TYPE_DELAY_MS.store(settings.type_delay_ms.min(2000), Ordering::Relaxed);
-    MODIFIER_HOLD_MS.store(settings.modifier_hold_ms.min(2000), Ordering::Relaxed);
-    START_DELAY_MS.store(settings.start_delay_ms.min(2000), Ordering::Relaxed);
+pub fn clipboardtyper_set_settings(app: AppHandle, settings: Settings) -> State {
+    apply_settings(&settings);
+    // Keep a handle around so settings changes can emit even before the hook
+    // is started, and persist the canonical state to disk.
+    if let Ok(mut g) = APP_HANDLE.lock() {
+        if g.is_none() {
+            *g = Some(app.clone());
+        }
+    }
+    save_settings(&app, &current_settings());
     emit_state();
     current_state()
 }
 
 #[tauri::command]
-pub fn clipboardtyper_get_state() -> State {
+pub fn clipboardtyper_get_state(app: AppHandle) -> State {
+    // Load persisted settings once, on the first state read at startup.
+    if !LOADED.swap(true, Ordering::AcqRel) {
+        load_settings(&app);
+    }
     current_state()
 }
 
@@ -261,6 +353,14 @@ unsafe extern "system" fn mouse_hook_proc(
 
 // ---------- Clipboard + typing ----------
 
+/// The keystroke that advances after a cell.
+#[derive(Clone, Copy)]
+enum Sep {
+    Tab,
+    Enter,
+    None,
+}
+
 fn type_clipboard() {
     if TYPING.swap(true, Ordering::AcqRel) {
         return;
@@ -278,17 +378,79 @@ fn type_clipboard() {
         let start_delay = Duration::from_millis(START_DELAY_MS.load(Ordering::Relaxed));
         let type_delay = Duration::from_millis(TYPE_DELAY_MS.load(Ordering::Relaxed));
         let modifier_hold = Duration::from_millis(MODIFIER_HOLD_MS.load(Ordering::Relaxed));
+        let column_major = COLUMN_MAJOR.load(Ordering::Relaxed);
+        let newline_as_tab = NEWLINE_AS_TAB.load(Ordering::Relaxed);
+        let trailing_tab = TRAILING_TAB.load(Ordering::Relaxed);
+
+        // Parse the clipboard into a grid: rows split by '\n', cells by '\t'.
+        let grid: Vec<Vec<&str>> = text
+            .split('\n')
+            .map(|line| line.trim_end_matches('\r').split('\t').collect())
+            .collect();
+
+        // Flatten into an ordered list of (cell, separator-that-follows). Within a
+        // row cells are Tab-separated; between rows it's Enter (or Tab). In
+        // column-major mode we walk top-to-bottom down each column, all Tabs.
+        let mut tokens: Vec<(&str, Sep)> = Vec::new();
+        if column_major {
+            let cols = grid.iter().map(|r| r.len()).max().unwrap_or(0);
+            for c in 0..cols {
+                for row in &grid {
+                    if let Some(cell) = row.get(c) {
+                        tokens.push((*cell, Sep::Tab));
+                    }
+                }
+            }
+        } else {
+            for row in &grid {
+                for cell in row {
+                    tokens.push((*cell, Sep::Tab));
+                }
+                if let Some(last) = tokens.last_mut() {
+                    last.1 = if newline_as_tab { Sep::Tab } else { Sep::Enter };
+                }
+            }
+        }
+        // The final cell advances only if "trailing tab" is on (handled below).
+        if let Some(last) = tokens.last_mut() {
+            last.1 = Sep::None;
+        }
 
         thread::sleep(start_delay);
 
         let mut typed = 0usize;
-        for ch in text.chars() {
-            type_char(ch, modifier_hold)?;
-            typed += 1;
-            if type_delay > Duration::ZERO {
-                thread::sleep(type_delay);
+        for &(cell, sep) in &tokens {
+            // A matching rule replaces the literal cell with its output template.
+            match rule_output(cell) {
+                Some(out) => typed += type_template(&out, modifier_hold, type_delay)?,
+                None => typed += type_text(cell, modifier_hold, type_delay)?,
+            }
+            match sep {
+                Sep::Tab => {
+                    send_vk_press(VK_TAB)?;
+                    typed += 1;
+                    if type_delay > Duration::ZERO {
+                        thread::sleep(type_delay);
+                    }
+                }
+                Sep::Enter => {
+                    send_vk_press(VK_RETURN)?;
+                    typed += 1;
+                    if type_delay > Duration::ZERO {
+                        thread::sleep(type_delay);
+                    }
+                }
+                Sep::None => {}
             }
         }
+
+        // Optional trailing Tab: advance out of the last cell so the next row
+        // can be typed without manually pressing Tab first.
+        if trailing_tab {
+            send_vk_press(VK_TAB)?;
+            typed += 1;
+        }
+
         Ok(typed)
     })();
 
@@ -308,7 +470,13 @@ fn read_clipboard() -> Result<String, String> {
 fn type_char(ch: char, modifier_hold: Duration) -> Result<(), String> {
     match ch {
         '\r' => Ok(()),
-        '\n' => send_vk_press(VK_RETURN),
+        '\n' => {
+            if NEWLINE_AS_TAB.load(Ordering::Relaxed) {
+                send_vk_press(VK_TAB)
+            } else {
+                send_vk_press(VK_RETURN)
+            }
+        }
         '\t' => send_vk_press(VK_TAB),
         _ => {
             let mut buf = [0u16; 2];
@@ -346,6 +514,87 @@ fn type_char(ch: char, modifier_hold: Duration) -> Result<(), String> {
     }
 }
 
+// ---------- Cell rules ----------
+
+/// Look up a cell's substitution rule (trimmed, case-insensitive). Rules with an
+/// empty match string are ignored so a half-filled row can't swallow every cell.
+fn rule_output(cell: &str) -> Option<String> {
+    let key = cell.trim().to_lowercase();
+    let rules = RULES.lock().ok()?;
+    rules
+        .iter()
+        .find(|r| {
+            let m = r.match_value.trim();
+            !m.is_empty() && m.to_lowercase() == key
+        })
+        .map(|r| r.output.clone())
+}
+
+/// Type a literal cell value, character by character.
+fn type_text(s: &str, modifier_hold: Duration, type_delay: Duration) -> Result<usize, String> {
+    let mut typed = 0usize;
+    for ch in s.chars() {
+        type_char(ch, modifier_hold)?;
+        typed += 1;
+        if type_delay > Duration::ZERO {
+            thread::sleep(type_delay);
+        }
+    }
+    Ok(typed)
+}
+
+/// Type a rule output: literal text, with `{token}` sequences sent as keys.
+/// Unknown tokens (or a stray `{`) are typed literally.
+fn type_template(s: &str, modifier_hold: Duration, type_delay: Duration) -> Result<usize, String> {
+    let chars: Vec<char> = s.chars().collect();
+    let mut typed = 0usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        if chars[i] == '{' {
+            if let Some(rel) = chars[i + 1..].iter().position(|&c| c == '}') {
+                let name: String = chars[i + 1..i + 1 + rel].iter().collect();
+                if let Some((vk, extended)) = named_key(&name) {
+                    send_key_ex(vk, extended)?;
+                    typed += 1;
+                    if type_delay > Duration::ZERO {
+                        thread::sleep(type_delay);
+                    }
+                    i += rel + 2;
+                    continue;
+                }
+            }
+        }
+        type_char(chars[i], modifier_hold)?;
+        typed += 1;
+        if type_delay > Duration::ZERO {
+            thread::sleep(type_delay);
+        }
+        i += 1;
+    }
+    Ok(typed)
+}
+
+/// Map a `{token}` name to a virtual key and whether it is an extended key.
+fn named_key(name: &str) -> Option<(VIRTUAL_KEY, bool)> {
+    match name.trim().to_lowercase().as_str() {
+        "space" | "spc" => Some((VK_SPACE, false)),
+        "tab" => Some((VK_TAB, false)),
+        "enter" | "return" => Some((VK_RETURN, false)),
+        "esc" | "escape" => Some((VK_ESCAPE, false)),
+        "bksp" | "backspace" | "back" => Some((VK_BACK, false)),
+        "del" | "delete" => Some((VK_DELETE, true)),
+        "up" => Some((VK_UP, true)),
+        "down" => Some((VK_DOWN, true)),
+        "left" => Some((VK_LEFT, true)),
+        "right" => Some((VK_RIGHT, true)),
+        "home" => Some((VK_HOME, true)),
+        "end" => Some((VK_END, true)),
+        "pgup" | "pageup" => Some((VK_PRIOR, true)),
+        "pgdn" | "pagedown" => Some((VK_NEXT, true)),
+        _ => None,
+    }
+}
+
 // ---------- SendInput helpers ----------
 
 fn send_vk_down(vk: VIRTUAL_KEY) -> Result<(), String> {
@@ -377,6 +626,30 @@ where
 
 fn send_vk_press(vk: VIRTUAL_KEY) -> Result<(), String> {
     send_input(&mut [scan_input(vk, false)?, scan_input(vk, true)?])
+}
+
+/// Press and release a key, optionally flagged extended (arrows, nav, Delete) so
+/// it is not mistaken for its numpad equivalent.
+fn send_key_ex(vk: VIRTUAL_KEY, extended: bool) -> Result<(), String> {
+    send_input(&mut [
+        scan_input_ex(vk, false, extended)?,
+        scan_input_ex(vk, true, extended)?,
+    ])
+}
+
+fn scan_input_ex(vk: VIRTUAL_KEY, key_up: bool, extended: bool) -> Result<INPUT, String> {
+    let scan = unsafe { MapVirtualKeyW(vk.0 as u32, MAPVK_VK_TO_VSC) };
+    if scan == 0 {
+        return Err(format!("could not map virtual key {} to scan code", vk.0));
+    }
+    let mut flags = KEYEVENTF_SCANCODE;
+    if key_up {
+        flags = KEYBD_EVENT_FLAGS(flags.0 | KEYEVENTF_KEYUP.0);
+    }
+    if extended {
+        flags = KEYBD_EVENT_FLAGS(flags.0 | KEYEVENTF_EXTENDEDKEY.0);
+    }
+    Ok(keyboard_input(VIRTUAL_KEY(0), scan as u16, flags))
 }
 
 fn send_scan(vk: VIRTUAL_KEY, key_up: bool) -> Result<(), String> {

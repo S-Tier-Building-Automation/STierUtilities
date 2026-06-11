@@ -143,9 +143,13 @@ function pluginView(id) { return `plugin:${id}`; }
 let ct = {
   running: false,
   armed: false,
-  settings: { type_delay_ms: 60, modifier_hold_ms: 40, start_delay_ms: 40 },
+  settings: { type_delay_ms: 60, modifier_hold_ms: 40, start_delay_ms: 40, trailing_tab: false, newline_as_tab: false, column_major: false, rules: [] },
 };
-let ctPending = { ...ct.settings };
+// Deep-copy so editing pending rules doesn't mutate the last-applied state.
+function ctClonePending(settings) {
+  return { ...settings, rules: (settings.rules || []).map((r) => ({ ...r })) };
+}
+let ctPending = ctClonePending(ct.settings);
 
 // ============================================================================
 // Per-plugin activity log
@@ -269,6 +273,63 @@ async function ctSetArmed(armed) {
   }
 }
 
+function ctSetTrailingTab(value) {
+  ctPending.trailing_tab = value;
+  ctPushSettings();
+  logTo(
+    "clipboardtyper",
+    value ? "Trailing Tab on: a Tab is sent after the last cell." : "Trailing Tab off.",
+    "info",
+  );
+  renderAll();
+}
+
+function ctSetNewlineAsTab(value) {
+  ctPending.newline_as_tab = value;
+  ctPushSettings();
+  logTo(
+    "clipboardtyper",
+    value
+      ? "New line → Tab on: line breaks advance with Tab (good for copied columns)."
+      : "New line → Tab off: line breaks press Enter.",
+    "info",
+  );
+  renderAll();
+}
+
+function ctSetColumnMajor(value) {
+  ctPending.column_major = value;
+  ctPushSettings();
+  logTo(
+    "clipboardtyper",
+    value
+      ? "Column order on: a copied block types each column top-to-bottom (Tab-separated)."
+      : "Column order off: types in Excel's left-to-right, row-by-row order.",
+    "info",
+  );
+  renderAll();
+}
+
+function ctAddRule() {
+  ctPending.rules = [...(ctPending.rules || []), { match: "", output: "" }];
+  ctPushSettings();
+  renderAll();
+}
+
+function ctRemoveRule(index) {
+  ctPending.rules = (ctPending.rules || []).filter((_, i) => i !== index);
+  ctPushSettings();
+  renderAll();
+}
+
+// Live-edit of a rule field. No renderAll here — that would recreate the input
+// and steal focus mid-keystroke; the state echo is also suppressed (see listener).
+function ctUpdateRule(index, field, value) {
+  if (!ctPending.rules || !ctPending.rules[index]) return;
+  ctPending.rules[index][field] = value;
+  ctPushSettings();
+}
+
 function renderClipboardTyperPage(tool) {
   const status = ctStatusPill();
 
@@ -301,6 +362,86 @@ function renderClipboardTyperPage(tool) {
               : "Hook installed but disarmed. Toggle Armed to react to middle-clicks.")
           : "Click Enable to install the mouse hook.",
       ),
+    ),
+
+    el("section", { class: "plugin-section" },
+      el("h3", {}, "Behavior"),
+      el("label",
+        { class: `toggle ${ctPending.trailing_tab ? "toggle-on" : ""}` },
+        el("input", {
+          type: "checkbox",
+          checked: ctPending.trailing_tab ? "checked" : undefined,
+          onchange: (e) => ctSetTrailingTab(e.target.checked),
+        }),
+        el("span", { class: "toggle-track" }, el("span", { class: "toggle-knob" })),
+        el("span", { class: "toggle-label" }, "Trailing Tab"),
+      ),
+      el("p", { class: "muted small" },
+        "Press Tab once more after the last cell, so you can type a copied Excel ",
+        "row and land on the next field (or next row) without advancing manually.",
+      ),
+      el("label",
+        { class: `toggle ${ctPending.newline_as_tab ? "toggle-on" : ""}` },
+        el("input", {
+          type: "checkbox",
+          checked: ctPending.newline_as_tab ? "checked" : undefined,
+          onchange: (e) => ctSetNewlineAsTab(e.target.checked),
+        }),
+        el("span", { class: "toggle-track" }, el("span", { class: "toggle-knob" })),
+        el("span", { class: "toggle-label" }, "New line → Tab"),
+      ),
+      el("p", { class: "muted small" },
+        "Treat line breaks as a Tab instead of Enter. A column copied from Excel is ",
+        "new-line separated (no tabs), so turn this on to advance field-to-field.",
+      ),
+      el("label",
+        { class: `toggle ${ctPending.column_major ? "toggle-on" : ""}` },
+        el("input", {
+          type: "checkbox",
+          checked: ctPending.column_major ? "checked" : undefined,
+          onchange: (e) => ctSetColumnMajor(e.target.checked),
+        }),
+        el("span", { class: "toggle-track" }, el("span", { class: "toggle-knob" })),
+        el("span", { class: "toggle-label" }, "Column order (top → bottom)"),
+      ),
+      el("p", { class: "muted small" },
+        "When you copy a block of several columns, type each column top-to-bottom ",
+        "instead of Excel's left-to-right, row-by-row order. Values are Tab-separated, ",
+        "so this covers the \"New line → Tab\" case on its own.",
+      ),
+    ),
+
+    el("section", { class: "plugin-section" },
+      el("h3", {}, "Cell Rules"),
+      el("p", { class: "muted small rule-tokens" },
+        "When a cell matches (case-insensitive), send the output instead of typing it. ",
+        "Output can mix text with key tokens: ",
+        el("code", {}, "{space}"), " ", el("code", {}, "{tab}"), " ", el("code", {}, "{enter}"), " ",
+        el("code", {}, "{esc}"), " ", el("code", {}, "{up}"), " ", el("code", {}, "{down}"), " ",
+        el("code", {}, "{left}"), " ", el("code", {}, "{right}"), " ", el("code", {}, "{bksp}"), " ",
+        el("code", {}, "{del}"), ". Leave the output blank to skip the cell (just advance).",
+      ),
+      ...(ctPending.rules || []).map((rule, i) =>
+        el("div", { class: "rule-row" },
+          el("input", {
+            type: "text",
+            class: "rule-input rule-match",
+            placeholder: "when cell is…",
+            value: rule.match ?? "",
+            oninput: (e) => ctUpdateRule(i, "match", e.target.value),
+          }),
+          el("span", { class: "rule-arrow" }, "→"),
+          el("input", {
+            type: "text",
+            class: "rule-input rule-output",
+            placeholder: "send instead (e.g. {space})",
+            value: rule.output ?? "",
+            oninput: (e) => ctUpdateRule(i, "output", e.target.value),
+          }),
+          el("button", { class: "btn btn-ghost rule-remove", title: "Remove rule", onclick: () => ctRemoveRule(i) }, "✕"),
+        ),
+      ),
+      el("button", { class: "btn btn-ghost", onclick: ctAddRule }, "+ Add rule"),
     ),
 
     el("section", { class: "plugin-section" },
@@ -1960,9 +2101,15 @@ function renderAll() {
 // ============================================================================
 
 listen("clipboardtyper:state", (event) => {
-  ct = event.payload;
-  ctPending = { ...ct.settings };
-  renderAll();
+  const p = event.payload;
+  // Skip the re-render when this is just the echo of our own settings push —
+  // otherwise editing a rule field would lose focus mid-keystroke. Still
+  // re-render on external settings changes or enable/arm changes.
+  const settingsSame = JSON.stringify(p.settings) === JSON.stringify(ctPending);
+  const liveSame = p.running === ct.running && p.armed === ct.armed;
+  ct = p;
+  if (!settingsSame) ctPending = ctClonePending(p.settings);
+  if (!settingsSame || !liveSame) renderAll();
 });
 
 listen("clipboardtyper:typed", (event) => {
@@ -1987,7 +2134,7 @@ window.addEventListener("DOMContentLoaded", async () => {
   try {
     const s = await invoke("clipboardtyper_get_state");
     ct = s;
-    ctPending = { ...s.settings };
+    ctPending = ctClonePending(s.settings);
   } catch (err) {
     logTo("clipboardtyper", `Could not read state: ${err}`, "error");
   }
