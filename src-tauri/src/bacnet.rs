@@ -184,11 +184,18 @@ struct CovEvent {
 
 struct Client {
     socket: UdpSocket,
-    pending: Mutex<HashMap<u8, mpsc::Sender<Outcome>>>,
+    /// invoke-id -> (peer we sent to, reply channel). The peer address lets the
+    /// reader reject a stale/duplicate reply whose source doesn't match the
+    /// request that currently owns this invoke id (the u8 id space is reused).
+    pending: Mutex<HashMap<u8, (SocketAddr, mpsc::Sender<Outcome>)>>,
     next_invoke: Mutex<u8>,
     discovery: Mutex<Option<Discovery>>,
     cov: Mutex<HashMap<u32, CovEntry>>,
     next_process: Mutex<u32>,
+    /// Bumped each time a device's objects are read; a detached name-enrichment
+    /// pass stops early once it's no longer the current generation, so rapidly
+    /// switching devices doesn't stack zombie passes hammering the shared socket.
+    objects_gen: AtomicUsize,
     /// COV notifications are forwarded as `CovEvent`s through this channel to a
     /// dedicated emitter thread that owns the `AppHandle`. Keeping tauri types
     /// out of `Client` (which lives in a `static`) matters: storing an
@@ -221,6 +228,7 @@ impl Client {
             discovery: Mutex::new(None),
             cov: Mutex::new(HashMap::new()),
             next_process: Mutex::new(1),
+            objects_gen: AtomicUsize::new(0),
             cov_tx: Mutex::new(None),
         });
         let for_thread = Arc::clone(&client);
@@ -262,7 +270,7 @@ impl Client {
         let frame = codec::bvlc_encode(codec::BVLC_ORIGINAL_UNICAST, &payload);
 
         let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(invoke_id, tx);
+        self.pending.lock().unwrap().insert(invoke_id, (target.sa, tx));
         let result = (|| {
             for _ in 0..APDU_ATTEMPTS {
                 self.socket
@@ -283,9 +291,16 @@ impl Client {
         result
     }
 
-    fn complete(&self, invoke_id: u8, outcome: Outcome) {
-        if let Some(tx) = self.pending.lock().unwrap().get(&invoke_id) {
-            let _ = tx.send(outcome);
+    /// Delivers a reply to the pending transaction for `invoke_id`, but only if
+    /// it came from the peer that transaction is talking to — so a delayed reply
+    /// to a finished transaction can't be mismatched to a different device that
+    /// has since been handed the same (reused) invoke id. Compared by IP, since
+    /// a BACnet device replies from its B/IP port regardless of our source port.
+    fn complete(&self, invoke_id: u8, src: SocketAddr, outcome: Outcome) {
+        if let Some((peer, tx)) = self.pending.lock().unwrap().get(&invoke_id) {
+            if peer.ip() == src.ip() {
+                let _ = tx.send(outcome);
+            }
         }
     }
 
@@ -492,7 +507,7 @@ fn handle_frame(client: &Client, frame: &[u8], src: SocketAddr) {
                 }
             }
         }
-        Apdu::SimpleAck { invoke_id, .. } => client.complete(invoke_id, Outcome::Simple),
+        Apdu::SimpleAck { invoke_id, .. } => client.complete(invoke_id, effective_src, Outcome::Simple),
         Apdu::ComplexAck { invoke_id, service, segmented, payload_offset } => {
             let outcome = if segmented {
                 // We advertise no segmentation support; treat as a failure so
@@ -504,10 +519,11 @@ fn handle_frame(client: &Client, frame: &[u8], src: SocketAddr) {
                     payload: apdu.get(payload_offset..).unwrap_or_default().to_vec(),
                 }
             };
-            client.complete(invoke_id, outcome);
+            client.complete(invoke_id, effective_src, outcome);
         }
         Apdu::Error { invoke_id, error_class, error_code, .. } => client.complete(
             invoke_id,
+            effective_src,
             Outcome::Failed(format!(
                 "device error: {} / {}",
                 codec::error_class_name(error_class),
@@ -516,10 +532,12 @@ fn handle_frame(client: &Client, frame: &[u8], src: SocketAddr) {
         ),
         Apdu::Reject { invoke_id, reason } => client.complete(
             invoke_id,
+            effective_src,
             Outcome::Failed(format!("request rejected: {}", codec::reject_reason_name(reason))),
         ),
         Apdu::Abort { invoke_id, reason } => client.complete(
             invoke_id,
+            effective_src,
             Outcome::Failed(format!("request aborted: {}", codec::abort_reason_name(reason))),
         ),
         _ => {}
@@ -610,7 +628,16 @@ fn read_property(
     let apdu = codec::encode_read_property(invoke, object, property, array_index);
     match client.request(target, &apdu, invoke)? {
         Outcome::Complex { service: codec::SERVICE_READ_PROPERTY, payload } => {
-            Ok(codec::decode_read_property_ack(&payload)?.values)
+            let ack = codec::decode_read_property_ack(&payload)?;
+            // Guard against a stale reply on a reused invoke id from the same
+            // peer: the ACK must describe the object+property we asked for.
+            if ack.object != object || ack.property != property {
+                return Err(format!(
+                    "response mismatch: asked {}:{} prop {property}, got {}:{} prop {}",
+                    object.object_type, object.instance, ack.object.object_type, ack.object.instance, ack.property
+                ));
+            }
+            Ok(ack.values)
         }
         Outcome::Complex { service, .. } => Err(format!("unexpected ack for service {service}")),
         Outcome::Simple => Err("unexpected simple ack for ReadProperty".into()),
@@ -907,11 +934,13 @@ fn read_object_ids_core(
 /// Streams object names for `ids`, best-effort. Tries RPM chunks first,
 /// shrinking the chunk when a device's APDU can't fit a full one (MS/TP gear
 /// at 480 bytes with long names), and drops to per-object RP when the device
-/// lacks RPM entirely. Each resolved batch is handed to `on_names`.
+/// lacks RPM entirely. Each resolved batch is handed to `on_names`. Stops early
+/// the moment `should_continue` returns false (e.g. the user switched devices).
 fn enrich_object_names_core(
     client: &Client,
     target: &Target,
     ids: &[ObjectId],
+    should_continue: impl Fn() -> bool,
     mut on_names: impl FnMut(&[(ObjectId, String)]),
 ) {
     let mut chunk_size = NAME_CHUNK;
@@ -919,6 +948,9 @@ fn enrich_object_names_core(
     let mut i = 0usize;
     let mut timeouts = 0u32;
     while i < ids.len() {
+        if !should_continue() {
+            return;
+        }
         if rp_mode {
             let id = ids[i];
             match read_property(client, target, id, codec::PROP_OBJECT_NAME, None) {
@@ -1116,8 +1148,19 @@ fn render_value(v: &BacnetValue) -> String {
         BacnetValue::CharacterString { value } => value.clone(),
         BacnetValue::BitString { bits, .. } => bits.clone(),
         BacnetValue::Enumerated { value } => value.to_string(),
-        BacnetValue::Date { year, month, day, .. } => format!("{year:04}-{month:02}-{day:02}"),
-        BacnetValue::Time { hour, minute, second, .. } => format!("{hour:02}:{minute:02}:{second:02}"),
+        BacnetValue::Date { year, month, day, .. } => {
+            // 0/0xFF in any field is the BACnet "unspecified" wildcard.
+            let y = if *year == 0 { "****".to_string() } else { format!("{year:04}") };
+            let m = if *month == 0xFF || *month == 0 { "**".to_string() } else { format!("{month:02}") };
+            let d = if *day == 0xFF || *day == 0 { "**".to_string() } else { format!("{day:02}") };
+            format!("{y}-{m}-{d}")
+        }
+        BacnetValue::Time { hour, minute, second, .. } => {
+            let h = if *hour == 0xFF { "**".to_string() } else { format!("{hour:02}") };
+            let mi = if *minute == 0xFF { "**".to_string() } else { format!("{minute:02}") };
+            let s = if *second == 0xFF { "**".to_string() } else { format!("{second:02}") };
+            format!("{h}:{mi}:{s}")
+        }
         BacnetValue::ObjectIdentifier { object_type, instance } => {
             format!("{}:{instance}", codec::object_type_name(*object_type))
         }
@@ -1303,6 +1346,9 @@ pub async fn bacnet_read_objects(
 ) -> Result<Vec<BacnetObject>, String> {
     let client = client()?;
     let target = resolve_device(&device)?;
+    // Claim a new objects generation; the enrichment pass below stops once a
+    // later read_objects call supersedes it.
+    let my_gen = client.objects_gen.fetch_add(1, Ordering::Relaxed) + 1;
     tauri::async_runtime::spawn_blocking(move || {
         let app_progress = app.clone();
         let objects = read_object_ids_core(&client, &target, device_instance, |done, total| {
@@ -1317,7 +1363,8 @@ pub async fn bacnet_read_objects(
         let client_bg = Arc::clone(&client);
         let target_bg = target.clone();
         thread::spawn(move || {
-            enrich_object_names_core(&client_bg, &target_bg, &ids, |names| {
+            let still_current = || client_bg.objects_gen.load(Ordering::Relaxed) == my_gen;
+            enrich_object_names_core(&client_bg, &target_bg, &ids, still_current, |names| {
                 let batch = ObjectNames {
                     device_key: dev_key.clone(),
                     names: names
@@ -1348,25 +1395,6 @@ pub async fn bacnet_read_properties(
     let target = resolve_device(&device)?;
     tauri::async_runtime::spawn_blocking(move || {
         read_all_properties_core(&client, &target, ObjectId::new(object_type, instance))
-    })
-    .await
-    .map_err(|e| format!("property read task panicked: {e}"))?
-}
-
-/// Reads a single property (used for refreshing one value, e.g. priority-array).
-#[tauri::command]
-pub async fn bacnet_read_property(
-    device: DeviceRef,
-    object_type: u16,
-    instance: u32,
-    property: u32,
-    array_index: Option<u32>,
-) -> Result<PropertyEntry, String> {
-    let client = client()?;
-    let target = resolve_device(&device)?;
-    tauri::async_runtime::spawn_blocking(move || {
-        let values = read_property(&client, &target, ObjectId::new(object_type, instance), property, array_index)?;
-        Ok(make_entry(object_type, property, Some(values), None))
     })
     .await
     .map_err(|e| format!("property read task panicked: {e}"))?
@@ -1411,14 +1439,21 @@ pub async fn bacnet_write_property(
 const COV_LIFETIME_SECS: u32 = 300;
 const COV_RESUBSCRIBE_SECS: u64 = 180;
 
+/// Consecutive resubscribe failures before the keep-alive gives up and drops the
+/// subscription — bounds the thread's life if the device or frontend goes away
+/// (e.g. a webview reload that never calls unsubscribe).
+const COV_MAX_RESUBSCRIBE_FAILURES: u32 = 2;
+
 /// Subscribes to COV notifications for one object. Returns the subscriber
 /// process id; notifications then stream as `bacnet:cov` events until
 /// `bacnet_unsubscribe_cov` is called. A background thread resubscribes before
-/// the lifetime expires so the stream doesn't lapse.
+/// the lifetime expires so the stream doesn't lapse; it self-terminates after a
+/// few consecutive failures so an orphaned subscription can't loop forever.
 #[tauri::command]
 pub async fn bacnet_subscribe_cov(
     app: AppHandle,
     device: DeviceRef,
+    device_instance: u32,
     object_type: u16,
     instance: u32,
     confirmed: Option<bool>,
@@ -1428,21 +1463,28 @@ pub async fn bacnet_subscribe_cov(
     let target = resolve_device(&device)?;
     let object = ObjectId::new(object_type, instance);
     let confirmed = confirmed.unwrap_or(false);
-    let dev_key = device_key(&device.address, device.network, device.mac.as_deref(), instance);
+    // device_key keys on the DEVICE instance (matches discovery / read_objects),
+    // not the monitored object's instance.
+    let dev_key = device_key(&device.address, device.network, device.mac.as_deref(), device_instance);
     let process_id = client.alloc_process();
 
     let client_run = Arc::clone(&client);
     tauri::async_runtime::spawn_blocking(move || {
-        subscribe_cov_core(&client_run, &target, process_id, object, confirmed, Some(COV_LIFETIME_SECS))?;
-
-        // Register and start the resubscribe keep-alive.
+        // Register BEFORE subscribing so the initial COV notification a device
+        // emits immediately on SubscribeCOV isn't dropped as an unknown process.
         let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
         client_run.cov.lock().unwrap().insert(
             process_id,
             CovEntry { device_key: dev_key, object, active: Arc::clone(&active) },
         );
+        if let Err(e) = subscribe_cov_core(&client_run, &target, process_id, object, confirmed, Some(COV_LIFETIME_SECS)) {
+            client_run.cov.lock().unwrap().remove(&process_id);
+            return Err(e);
+        }
+
         let client_bg = Arc::clone(&client_run);
         thread::spawn(move || {
+            let mut failures = 0u32;
             while active.load(Ordering::Relaxed) {
                 // Sleep in short slices so unsubscribe takes effect promptly.
                 for _ in 0..(COV_RESUBSCRIBE_SECS * 2) {
@@ -1454,14 +1496,18 @@ pub async fn bacnet_subscribe_cov(
                 if !active.load(Ordering::Relaxed) {
                     return;
                 }
-                let _ = subscribe_cov_core(
-                    &client_bg,
-                    &target,
-                    process_id,
-                    object,
-                    confirmed,
-                    Some(COV_LIFETIME_SECS),
-                );
+                match subscribe_cov_core(&client_bg, &target, process_id, object, confirmed, Some(COV_LIFETIME_SECS)) {
+                    Ok(()) => failures = 0,
+                    Err(_) => {
+                        failures += 1;
+                        if failures >= COV_MAX_RESUBSCRIBE_FAILURES {
+                            // Device unreachable or gone — stop and drop the entry.
+                            active.store(false, Ordering::Relaxed);
+                            client_bg.cov.lock().unwrap().remove(&process_id);
+                            return;
+                        }
+                    }
+                }
             }
         });
         Ok(process_id)
@@ -1792,6 +1838,58 @@ mod tests {
                 .unwrap();
         t.join().unwrap();
         assert_eq!(values, vec![BacnetValue::Real { value: 72.0 }]);
+    }
+
+    #[test]
+    fn read_property_rejects_wrong_object_reply() {
+        // A device that answers with a DIFFERENT object than asked (the stale
+        // reused-invoke-id case, same peer) must be rejected, not shown as the
+        // requested object's value.
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            let (frame, src) = recv_frame(&fake);
+            let bvlc = codec::bvlc_decode(&frame).unwrap();
+            let npdu = codec::decode_npdu(&frame[bvlc.payload_offset..]).unwrap();
+            let apdu = &frame[bvlc.payload_offset + npdu.apdu_offset..];
+            let Apdu::ConfirmedRequest { invoke_id, .. } = codec::decode_apdu(apdu).unwrap() else {
+                panic!("expected confirmed request");
+            };
+            // Reply describes AI-2 though AI-1 was requested.
+            let mut reply = vec![codec::PDU_COMPLEX_ACK, invoke_id, codec::SERVICE_READ_PROPERTY];
+            codec::encode_context_object_id(&mut reply, 0, ObjectId::new(0, 2));
+            codec::encode_context_unsigned(&mut reply, 1, codec::PROP_PRESENT_VALUE as u64);
+            codec::encode_opening_tag(&mut reply, 3);
+            codec::encode_application_value(&mut reply, &BacnetValue::Real { value: 99.0 });
+            codec::encode_closing_tag(&mut reply, 3);
+            fake.send_to(&unicast_reply(&reply), src).unwrap();
+        });
+
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let target = Target { sa: fake_addr, route: None };
+        let err =
+            read_property(&client, &target, ObjectId::new(0, 1), codec::PROP_PRESENT_VALUE, None)
+                .unwrap_err();
+        t.join().unwrap();
+        assert!(err.contains("response mismatch"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn complete_ignores_reply_from_wrong_source() {
+        // complete() must only deliver a reply whose source IP matches the peer
+        // the transaction is talking to — the cross-device reused-invoke-id case.
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let (tx, rx) = mpsc::channel();
+        let peer: SocketAddr = "10.0.0.5:47808".parse().unwrap();
+        client.pending.lock().unwrap().insert(7, (peer, tx));
+
+        // Wrong source IP -> dropped.
+        client.complete(7, "10.0.0.9:47808".parse().unwrap(), Outcome::Simple);
+        assert!(rx.try_recv().is_err(), "reply from wrong source should be dropped");
+
+        // Correct source IP (any port) -> delivered.
+        client.complete(7, "10.0.0.5:12345".parse().unwrap(), Outcome::Simple);
+        assert!(matches!(rx.try_recv(), Ok(Outcome::Simple)), "matching-source reply should deliver");
     }
 
     #[test]
@@ -2279,7 +2377,7 @@ mod tests {
             .collect();
         let t1 = Instant::now();
         let mut named = 0usize;
-        enrich_object_names_core(&client, &target, &ids, |batch| {
+        enrich_object_names_core(&client, &target, &ids, || true, |batch| {
             let before = named;
             named += batch.len();
             if before / 48 != named / 48 || named == ids.len() {

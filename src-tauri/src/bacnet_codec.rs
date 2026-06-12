@@ -472,8 +472,11 @@ pub fn decode_application_value(buf: &[u8]) -> Result<(BacnetValue, usize), Stri
             if len != 4 {
                 return Err(format!("bad Date length {len}"));
             }
+            // 0xFF is the "unspecified/any" wildcard in each Date octet (common
+            // in schedule/calendar date patterns). Surface a wildcard year as 0
+            // rather than decoding it to 2155; raw octets are kept for the rest.
             BacnetValue::Date {
-                year: 1900 + content[0] as u16,
+                year: if content[0] == 0xFF { 0 } else { 1900 + content[0] as u16 },
                 month: content[1],
                 day: content[2],
                 weekday: content[3],
@@ -1231,6 +1234,8 @@ pub fn decode_cov_notification(payload: &[u8]) -> Result<CovNotification, String
 
 /// Encodes the listOfValues body (used by tests and any notifier path) for a
 /// single property — opening 2, value, closing 2, wrapped as a BACnetPropertyValue.
+/// Kept public for the COV test vectors and a future notifier path.
+#[allow(dead_code)]
 pub fn encode_cov_property_value(buf: &mut Vec<u8>, property: u32, value: &BacnetValue) {
     encode_context_unsigned(buf, 0, property as u64);
     encode_opening_tag(buf, 2);
@@ -2161,6 +2166,16 @@ mod tests {
         assert_eq!(d, BacnetValue::Date { year: 2026, month: 6, day: 12, weekday: 5 });
         let (t, _) = decode_application_value(&[0xB4, 13, 45, 30, 0]).unwrap();
         assert_eq!(t, BacnetValue::Time { hour: 13, minute: 45, second: 30, hundredths: 0 });
+    }
+
+    #[test]
+    fn date_wildcard_year_is_zero_not_2155() {
+        // A fully-wildcarded Date (all 0xFF) must not decode the year as 2155.
+        let (d, _) = decode_application_value(&[0xA4, 0xFF, 0xFF, 0xFF, 0xFF]).unwrap();
+        assert_eq!(d, BacnetValue::Date { year: 0, month: 0xFF, day: 0xFF, weekday: 0xFF });
+        // A wildcard-year-only pattern (every Tuesday in any year/month).
+        let (d, _) = decode_application_value(&[0xA4, 0xFF, 0xFF, 0xFF, 2]).unwrap();
+        assert_eq!(d, BacnetValue::Date { year: 0, month: 0xFF, day: 0xFF, weekday: 2 });
     }
 
     #[test]

@@ -1844,6 +1844,9 @@ function bacEnsureListeners() {
     // Only apply notifications for the subscription we're currently showing.
     if (p.processId !== bac.cov.processId) return;
     if (`${p.objectType}:${p.instance}` !== bac.cov.objectKey) return;
+    // Skip while the property grid is mid-rebuild (a re-read cleared bac.props);
+    // applying now would bump the counter against rows that aren't there yet.
+    if (bac.propsLoading || bac.props.length === 0) return;
     bac.cov.updates += 1;
     bac.cov.lastAt = Date.now();
     bacApplyCovUpdate(p.values || []);
@@ -1979,6 +1982,7 @@ async function bacToggleCov() {
   try {
     const processId = await invoke("bacnet_subscribe_cov", {
       device: bacDeviceRef(dev),
+      deviceInstance: dev.instance,
       objectType: obj.objectType,
       instance: obj.instance,
       confirmed: false,
@@ -2006,9 +2010,21 @@ function bacApplyCovUpdate(values) {
 }
 
 // Builds the typed value payload the backend expects ({ kind, ... }).
+// Integer kinds use Number.isSafeInteger so a value past 2^53 is rejected
+// rather than silently rounded to a different integer before it's written.
 function bacBuildWriteValue() {
   const kind = bac.write.kind;
   const raw = bac.write.value.trim();
+  const safeInt = (allowNegative) => {
+    const v = Number(raw);
+    if (!Number.isInteger(v) || (!allowNegative && v < 0)) {
+      throw new Error(`"${raw}" is not ${allowNegative ? "an integer" : "a non-negative integer"}`);
+    }
+    if (!Number.isSafeInteger(v)) {
+      throw new Error(`"${raw}" is too large to enter precisely (max ${Number.MAX_SAFE_INTEGER})`);
+    }
+    return v;
+  };
   switch (kind) {
     case "null": return { kind: "null" };
     case "real": {
@@ -2016,21 +2032,9 @@ function bacBuildWriteValue() {
       if (!Number.isFinite(v)) throw new Error(`"${raw}" is not a number`);
       return { kind: "real", value: v };
     }
-    case "unsigned": {
-      const v = Number(raw);
-      if (!Number.isInteger(v) || v < 0) throw new Error(`"${raw}" is not a non-negative integer`);
-      return { kind: "unsigned", value: v };
-    }
-    case "signed": {
-      const v = Number(raw);
-      if (!Number.isInteger(v)) throw new Error(`"${raw}" is not an integer`);
-      return { kind: "signed", value: v };
-    }
-    case "enumerated": {
-      const v = Number(raw);
-      if (!Number.isInteger(v) || v < 0) throw new Error(`"${raw}" is not a non-negative integer`);
-      return { kind: "enumerated", value: v };
-    }
+    case "unsigned": return { kind: "unsigned", value: safeInt(false) };
+    case "signed": return { kind: "signed", value: safeInt(true) };
+    case "enumerated": return { kind: "enumerated", value: safeInt(false) };
     case "boolean": {
       const t = raw.toLowerCase();
       if (!["true", "false", "1", "0", "active", "inactive"].includes(t)) {
@@ -2999,6 +3003,21 @@ listen("clipboardtyper:typed", (event) => {
 // ============================================================================
 // Bootstrap
 // ============================================================================
+
+// Cancel any live COV subscription if the webview is torn down (reload, close),
+// so the backend keep-alive thread doesn't orphan. Best-effort and synchronous-
+// ish; the backend also self-terminates the keep-alive after repeated failures.
+window.addEventListener("pagehide", () => {
+  if (bac.cov.processId != null) {
+    const dev = bacSelectedDevice();
+    const [t, i] = (bac.cov.objectKey || "0:0").split(":").map((n) => parseInt(n, 10));
+    if (dev) {
+      invoke("bacnet_unsubscribe_cov", {
+        device: bacDeviceRef(dev), objectType: t, instance: i, processId: bac.cov.processId,
+      }).catch(() => {});
+    }
+  }
+});
 
 window.addEventListener("DOMContentLoaded", async () => {
   document.getElementById("gh-link").addEventListener("click", (e) => {
