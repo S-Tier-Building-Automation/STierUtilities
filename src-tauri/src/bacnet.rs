@@ -105,6 +105,24 @@ struct ObjectsProgress {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct TrendRecord {
+    timestamp: String,
+    value: String,
+    status: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TrendResult {
+    object_type: u16,
+    instance: u32,
+    record_count: u32,
+    records: Vec<TrendRecord>,
+    truncated: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct ObjectName {
     key: String,
     name: String,
@@ -788,6 +806,34 @@ fn write_property_core(
     match client.request(target, &apdu, invoke)? {
         Outcome::Simple => Ok(()),
         Outcome::Complex { .. } => Err("unexpected complex ack for WriteProperty".into()),
+        Outcome::Failed(e) => Err(e),
+    }
+}
+
+/// Reads a range of a list/array property (used for trend-log log-buffer reads)
+/// by position.
+fn read_range_core(
+    client: &Client,
+    target: &Target,
+    object: ObjectId,
+    reference_index: u32,
+    count: i32,
+) -> Result<codec::ReadRangeAck, String> {
+    let invoke = client.alloc_invoke();
+    let apdu = codec::encode_read_range_by_position(
+        invoke,
+        object,
+        codec::PROP_LOG_BUFFER,
+        None,
+        reference_index,
+        count,
+    );
+    match client.request(target, &apdu, invoke)? {
+        Outcome::Complex { service: codec::SERVICE_READ_RANGE, payload } => {
+            codec::decode_read_range_ack(&payload)
+        }
+        Outcome::Complex { service, .. } => Err(format!("unexpected ack for service {service}")),
+        Outcome::Simple => Err("unexpected simple ack for ReadRange".into()),
         Outcome::Failed(e) => Err(e),
     }
 }
@@ -1546,6 +1592,99 @@ pub async fn bacnet_write_property(
     .map_err(|e| format!("write task panicked: {e}"))?
 }
 
+/// Records per ReadRange request — kept under a 480-byte device's APDU budget so
+/// even un-segmented trend logs answer (records are ~12-20 bytes each).
+const TREND_CHUNK: i32 = 20;
+/// Hard cap on records fetched in one trend read.
+const TREND_MAX: u32 = 2000;
+
+fn format_log_timestamp(rec: &codec::LogRecord) -> String {
+    let d = rec.date.as_ref().map(render_value).unwrap_or_default();
+    let t = rec.time.as_ref().map(render_value).unwrap_or_default();
+    format!("{d} {t}").trim().to_string()
+}
+
+/// Reads recent records from a trend log's `log-buffer`. Reads `record-count`
+/// first, then pages forward from the oldest wanted position in `TREND_CHUNK`
+/// batches (so even un-segmented 480-byte devices answer), up to `max_records`.
+fn read_trend_core(
+    client: &Client,
+    target: &Target,
+    object: ObjectId,
+    max_records: u32,
+) -> Result<TrendResult, String> {
+    let want = max_records.clamp(1, TREND_MAX);
+
+    // How many records exist? (best-effort — some devices omit record-count).
+    let total = match read_property(client, target, object, codec::PROP_RECORD_COUNT, None) {
+        Ok(values) => match values.first() {
+            Some(BacnetValue::Unsigned { value }) => *value as u32,
+            _ => 0,
+        },
+        Err(_) => 0,
+    };
+
+    // Start position: the oldest record we want (1-based). If total is unknown,
+    // start at 1 and rely on the result flags to stop.
+    let start = if total > want { total - want + 1 } else { 1 };
+
+    let mut records = Vec::new();
+    let mut pos = start;
+    let mut truncated = false;
+    let mut guard = 0u32;
+    loop {
+        if records.len() as u32 >= want {
+            truncated = true;
+            break;
+        }
+        guard += 1;
+        if guard > (want / TREND_CHUNK as u32) + 4 {
+            break; // safety: never loop unbounded
+        }
+        let ack = read_range_core(client, target, object, pos, TREND_CHUNK)?;
+        let batch = codec::decode_log_records(&ack.item_data);
+        let got = batch.len() as u32;
+        for rec in batch {
+            records.push(TrendRecord {
+                timestamp: format_log_timestamp(&rec),
+                value: render_value(&rec.datum),
+                status: rec.status.clone().unwrap_or_default(),
+            });
+        }
+        if got == 0 || ack.last_item || !ack.more_items {
+            break;
+        }
+        pos += got;
+    }
+    records.truncate(want as usize);
+
+    Ok(TrendResult {
+        object_type: object.object_type,
+        instance: object.instance,
+        record_count: total,
+        records,
+        truncated,
+    })
+}
+
+/// Reads recent records from a Trend Log object's buffer (ReadRange byPosition).
+#[tauri::command]
+pub async fn bacnet_read_trend(
+    device: DeviceRef,
+    object_type: u16,
+    instance: u32,
+    max_records: Option<u32>,
+) -> Result<TrendResult, String> {
+    let client = client()?;
+    let target = resolve_device(&device)?;
+    let want = max_records.unwrap_or(200);
+    tauri::async_runtime::spawn_blocking(move || {
+        read_trend_core(&client, &target, ObjectId::new(object_type, instance), want)
+    })
+    .await
+    .map_err(|e| format!("trend read task panicked: {e}"))?
+}
+
 /// Default COV subscription lifetime, and how often to resubscribe (well before
 /// expiry). Devices cap lifetime; 300 s with a ~180 s refresh is conservative.
 const COV_LIFETIME_SECS: u32 = 300;
@@ -2127,6 +2266,84 @@ mod tests {
     }
 
     #[test]
+    fn read_trend_over_loopback() {
+        // Fake trend log: record-count = 2, then a ReadRange-ACK with 2 records.
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            // 1) ReadProperty record-count -> 2.
+            let (frame, src) = recv_frame(&fake);
+            let bvlc = codec::bvlc_decode(&frame).unwrap();
+            let npdu = codec::decode_npdu(&frame[bvlc.payload_offset..]).unwrap();
+            let Apdu::ConfirmedRequest { invoke_id, service, .. } =
+                codec::decode_apdu(&frame[bvlc.payload_offset + npdu.apdu_offset..]).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(service, codec::SERVICE_READ_PROPERTY);
+            let mut reply = vec![codec::PDU_COMPLEX_ACK, invoke_id, codec::SERVICE_READ_PROPERTY];
+            codec::encode_context_object_id(&mut reply, 0, ObjectId::new(20, 1));
+            codec::encode_context_unsigned(&mut reply, 1, codec::PROP_RECORD_COUNT as u64);
+            codec::encode_opening_tag(&mut reply, 3);
+            codec::encode_application_value(&mut reply, &BacnetValue::Unsigned { value: 2 });
+            codec::encode_closing_tag(&mut reply, 3);
+            fake.send_to(&unicast_reply(&reply), src).unwrap();
+
+            // 2) ReadRange -> 2 real records.
+            let (frame2, src2) = recv_frame(&fake);
+            let bvlc2 = codec::bvlc_decode(&frame2).unwrap();
+            let npdu2 = codec::decode_npdu(&frame2[bvlc2.payload_offset..]).unwrap();
+            let Apdu::ConfirmedRequest { invoke_id: inv2, service: svc2, .. } =
+                codec::decode_apdu(&frame2[bvlc2.payload_offset + npdu2.apdu_offset..]).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(svc2, codec::SERVICE_READ_RANGE);
+
+            let mut item_data = Vec::new();
+            for (min, val) in [(0u8, 70.5f32), (15, 71.0)] {
+                codec::encode_opening_tag(&mut item_data, 0);
+                codec::encode_application_value(
+                    &mut item_data,
+                    &BacnetValue::Date { year: 2026, month: 6, day: 12, weekday: 5 },
+                );
+                codec::encode_application_value(
+                    &mut item_data,
+                    &BacnetValue::Time { hour: 9, minute: min, second: 0, hundredths: 0 },
+                );
+                codec::encode_closing_tag(&mut item_data, 0);
+                codec::encode_opening_tag(&mut item_data, 1);
+                let mut datum = Vec::new();
+                codec::encode_tag(&mut datum, 2, true, 4);
+                datum.extend_from_slice(&val.to_be_bytes());
+                item_data.extend_from_slice(&datum);
+                codec::encode_closing_tag(&mut item_data, 1);
+            }
+            let mut ack = vec![codec::PDU_COMPLEX_ACK, inv2, codec::SERVICE_READ_RANGE];
+            codec::encode_context_object_id(&mut ack, 0, ObjectId::new(20, 1));
+            codec::encode_context_unsigned(&mut ack, 1, codec::PROP_LOG_BUFFER as u64);
+            codec::encode_tag(&mut ack, 3, true, 2);
+            ack.extend_from_slice(&[0x05, 0b1100_0000]); // first+last
+            codec::encode_context_unsigned(&mut ack, 4, 2);
+            codec::encode_opening_tag(&mut ack, 5);
+            ack.extend_from_slice(&item_data);
+            codec::encode_closing_tag(&mut ack, 5);
+            fake.send_to(&unicast_reply(&ack), src2).unwrap();
+        });
+
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let target = Target { sa: fake_addr, route: None };
+        let result = read_trend_core(&client, &target, ObjectId::new(20, 1), 200).unwrap();
+        t.join().unwrap();
+        assert_eq!(result.record_count, 2);
+        assert_eq!(result.records.len(), 2);
+        assert_eq!(result.records[0].value, "70.5");
+        assert_eq!(result.records[1].value, "71");
+        assert!(result.records[0].timestamp.contains("2026-06-12"));
+        assert!(result.records[0].timestamp.contains("09:00:00"));
+    }
+
+    #[test]
     fn confirmed_cov_notification_is_acked_by_reader() {
         // A device pushing a ConfirmedCOVNotification must get a SimpleACK back
         // from our reader thread, or it stops sending. Drive that end-to-end:
@@ -2653,6 +2870,44 @@ mod tests {
         // The initial notification fires on subscribe regardless of change, so
         // we expect at least one.
         assert!(count >= 1, "no COV notifications received (device may not support COV)");
+    }
+
+    /// Live trend read (read-only): discover, find a device that hosts a
+    /// trend-log object, and read its recent records via ReadRange.
+    ///
+    ///   cargo test live_read_trend -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_read_trend() {
+        let target = std::env::var("BACNET_TARGET").unwrap_or_else(|_| "192.168.1.255".into());
+        let client = Client::new("0.0.0.0:0").unwrap();
+        let devices = discover_core(&client, &target, None, None, Duration::from_secs(5), |_| {}).unwrap();
+        println!("scanning {} devices for a trend-log…", devices.len());
+
+        // Check up to 40 devices for a trend-log (type 20) object.
+        for dev in devices.iter().take(40) {
+            let Ok(t) = resolve_device(&DeviceRef {
+                address: dev.address.clone(),
+                network: dev.network,
+                mac: dev.mac.clone(),
+            }) else { continue };
+            let Ok(objects) = read_object_ids_core(&client, &t, dev.instance, |_, _| {}) else { continue };
+            let Some(tl) = objects.iter().find(|o| o.object_type == 20) else { continue };
+            let object = ObjectId::new(tl.object_type, tl.instance);
+            println!("found trend-log {}:{} on device {} ({})", tl.object_type, tl.instance, dev.instance, dev.address);
+            match read_trend_core(&client, &t, object, 20) {
+                Ok(res) => {
+                    println!("  record-count {}, read {} records:", res.record_count, res.records.len());
+                    for r in res.records.iter().take(10) {
+                        println!("    {} = {} [{}]", r.timestamp, r.value, r.status);
+                    }
+                    assert!(res.record_count > 0 || !res.records.is_empty(), "trend log returned nothing");
+                    return;
+                }
+                Err(e) => println!("  read failed: {e}"),
+            }
+        }
+        println!("no readable trend-log object found in the first 40 devices (not a failure).");
     }
 
     #[test]

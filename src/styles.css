@@ -847,3 +847,11 @@ a:hover { text-decoration: underline; }
   100% { background: transparent; }
 }
 .bac-prop-flash td { animation: bac-cov-flash 0.9s ease-out; }
+
+.bac-trend { border-top: 1px solid var(--border); padding-top: 12px; margin-bottom: 12px; }
+.bac-trend h4 { margin: 0; font-size: 14px; }
+.bac-trend-controls { align-items: flex-end; }
+.bac-trend-field { margin-bottom: 0; }
+.bac-trend-max { width: 80px; }
+.bac-trend-table { margin-top: 10px; max-height: 320px; }
+.bac-trend-table th { position: sticky; top: 0; background: var(--bg-elev); }
