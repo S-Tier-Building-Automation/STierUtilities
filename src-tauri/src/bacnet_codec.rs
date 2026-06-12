@@ -53,11 +53,22 @@ pub const SERVICE_SUBSCRIBE_COV: u8 = 5;
 pub const SERVICE_READ_PROPERTY: u8 = 12;
 pub const SERVICE_READ_PROPERTY_MULTIPLE: u8 = 14;
 pub const SERVICE_WRITE_PROPERTY: u8 = 15;
+pub const SERVICE_READ_RANGE: u8 = 26;
 
-/// `max-segments-accepted = unspecified, max-APDU-accepted = 1476` — the second
-/// octet of every confirmed request this client sends (we do not accept
-/// segmented responses; conformant devices abort instead, and callers fall back).
-pub const MAX_SEGS_MAX_APDU: u8 = 0x05;
+// Confirmed-request octet-0 flag bits (clause 20.1.2).
+/// SEG — this request is itself segmented (we never send segmented requests).
+pub const APDU_FLAG_SEGMENTED: u8 = 0x08;
+/// MOR — more segments follow.
+pub const APDU_FLAG_MORE: u8 = 0x04;
+/// SA — segmented-response-accepted: we can receive a segmented reply.
+pub const APDU_FLAG_SA: u8 = 0x02;
+
+/// Octet 1 of a confirmed request: `max-segments-accepted = 16` (code 4) in bits
+/// 6-4, `max-APDU-accepted = 1476` (code 5) in bits 3-0. Paired with the SA flag
+/// in octet 0, this tells a device it may segment a large reply to us (up to 16
+/// segments). Devices that can't fit a reply in one APDU now segment instead of
+/// aborting; the index-by-index / RPM-shrink fallbacks remain for ones that still do.
+pub const MAX_SEGS_MAX_APDU: u8 = 0x45;
 
 /// NPDU global-broadcast network number.
 pub const BROADCAST_NETWORK: u16 = 0xFFFF;
@@ -75,9 +86,15 @@ pub const PROP_PRIORITY_ARRAY: u32 = 87;
 pub const PROP_RELINQUISH_DEFAULT: u32 = 104;
 pub const PROP_VENDOR_NAME: u32 = 121;
 pub const PROP_MODEL_NAME: u32 = 70;
+pub const PROP_LOG_BUFFER: u32 = 131;
+pub const PROP_RECORD_COUNT: u32 = 141;
 
 /// Device object type number.
 pub const OBJECT_TYPE_DEVICE: u16 = 8;
+/// Trend-log object type number (the UI gates the trend panel on this; kept
+/// here as the canonical constant and used by the codec tests).
+#[allow(dead_code)]
+pub const OBJECT_TYPE_TREND_LOG: u16 = 20;
 
 // ---------------------------------------------------------------------------
 // Object identifier
@@ -804,7 +821,18 @@ pub enum Apdu {
     ConfirmedRequest { invoke_id: u8, service: u8, payload_offset: usize },
     Unconfirmed { service: u8, payload_offset: usize },
     SimpleAck { invoke_id: u8, service: u8 },
-    ComplexAck { invoke_id: u8, service: u8, segmented: bool, payload_offset: usize },
+    ComplexAck {
+        invoke_id: u8,
+        service: u8,
+        segmented: bool,
+        /// More-follows: another segment is coming (only meaningful when segmented).
+        more: bool,
+        /// Segment sequence number (only meaningful when segmented).
+        sequence: u8,
+        /// Proposed window size (only meaningful when segmented).
+        window: u8,
+        payload_offset: usize,
+    },
     SegmentAck { invoke_id: u8 },
     Error { invoke_id: u8, service: u8, error_class: u32, error_code: u32 },
     Reject { invoke_id: u8, reason: u8 },
@@ -832,11 +860,25 @@ pub fn decode_apdu(buf: &[u8]) -> Result<Apdu, String> {
             service: *buf.get(2).ok_or_else(err_short)?,
         }),
         PDU_COMPLEX_ACK => {
-            let segmented = first & 0x08 != 0;
+            // [0]=type/flags [1]=invoke [if SEG: 2=seq 3=window] [n]=service [n+1..]=data
+            let segmented = first & APDU_FLAG_SEGMENTED != 0;
+            let more = first & APDU_FLAG_MORE != 0;
             let invoke_id = *buf.get(1).ok_or_else(err_short)?;
-            let svc_at = if segmented { 4 } else { 2 };
+            let (sequence, window, svc_at) = if segmented {
+                (*buf.get(2).ok_or_else(err_short)?, *buf.get(3).ok_or_else(err_short)?, 4)
+            } else {
+                (0, 0, 2)
+            };
             let service = *buf.get(svc_at).ok_or_else(err_short)?;
-            Ok(Apdu::ComplexAck { invoke_id, service, segmented, payload_offset: svc_at + 1 })
+            Ok(Apdu::ComplexAck {
+                invoke_id,
+                service,
+                segmented,
+                more,
+                sequence,
+                window,
+                payload_offset: svc_at + 1,
+            })
         }
         PDU_SEGMENT_ACK => Ok(Apdu::SegmentAck { invoke_id: *buf.get(1).ok_or_else(err_short)? }),
         PDU_ERROR => {
@@ -879,7 +921,24 @@ pub fn decode_apdu(buf: &[u8]) -> Result<Apdu, String> {
 }
 
 fn confirmed_header(invoke_id: u8, service: u8) -> Vec<u8> {
-    vec![PDU_CONFIRMED, MAX_SEGS_MAX_APDU, invoke_id, service]
+    // SA flag set so the device may segment a large reply back to us.
+    vec![PDU_CONFIRMED | APDU_FLAG_SA, MAX_SEGS_MAX_APDU, invoke_id, service]
+}
+
+/// Encodes a SegmentACK acknowledging segments up to `sequence`, granting the
+/// sender `window` more segments before the next ack. `negative` requests
+/// retransmission; `server` is set when we're the segment receiver of a
+/// confirmed *request* (always false for our client, which only receives
+/// segmented *responses*).
+pub fn encode_segment_ack(negative: bool, server: bool, invoke_id: u8, sequence: u8, window: u8) -> Vec<u8> {
+    let mut octet0 = PDU_SEGMENT_ACK;
+    if negative {
+        octet0 |= 0x02; // NAK
+    }
+    if server {
+        octet0 |= 0x01; // SRV
+    }
+    vec![octet0, invoke_id, sequence, window]
 }
 
 // ---------------------------------------------------------------------------
@@ -1241,6 +1300,281 @@ pub fn encode_cov_property_value(buf: &mut Vec<u8>, property: u32, value: &Bacne
     encode_opening_tag(buf, 2);
     encode_application_value(buf, value);
     encode_closing_tag(buf, 2);
+}
+
+// ---------------------------------------------------------------------------
+// ReadRange (confirmed service 26) — trend-log history
+// ---------------------------------------------------------------------------
+
+/// Encodes a ReadRange request reading `count` items by position. A negative
+/// `count` reads backward from `reference_index` (toward record 1), so
+/// `reference_index = N, count = -k` returns the k records ending at N — the
+/// natural "most recent k" query against a 1-based log buffer.
+pub fn encode_read_range_by_position(
+    invoke_id: u8,
+    object: ObjectId,
+    property: u32,
+    array_index: Option<u32>,
+    reference_index: u32,
+    count: i32,
+) -> Vec<u8> {
+    let mut buf = confirmed_header(invoke_id, SERVICE_READ_RANGE);
+    encode_context_object_id(&mut buf, 0, object);
+    encode_context_unsigned(&mut buf, 1, property as u64);
+    if let Some(idx) = array_index {
+        encode_context_unsigned(&mut buf, 2, idx as u64);
+    }
+    // byPosition [3] SEQUENCE { referenceIndex Unsigned, count INTEGER }
+    encode_opening_tag(&mut buf, 3);
+    encode_application_value(&mut buf, &BacnetValue::Unsigned { value: reference_index as u64 });
+    encode_application_value(&mut buf, &BacnetValue::Signed { value: count as i64 });
+    encode_closing_tag(&mut buf, 3);
+    buf
+}
+
+/// A decoded ReadRange-ACK envelope. `item_data` is the raw bytes between the
+/// opening/closing of the itemData list, parsed further by [`decode_log_records`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReadRangeAck {
+    pub object: ObjectId,
+    pub property: u32,
+    pub array_index: Option<u32>,
+    pub first_item: bool,
+    pub last_item: bool,
+    pub more_items: bool,
+    pub item_count: u32,
+    pub item_data: Vec<u8>,
+    pub first_sequence: Option<u32>,
+}
+
+/// Finds the offset of the closing tag `closing_number` at depth 0, where `buf`
+/// begins immediately AFTER the matching opening tag (nested constructs skipped).
+fn find_closing(buf: &[u8], closing_number: u8) -> Result<usize, String> {
+    let mut at = 0usize;
+    let mut depth = 0usize;
+    loop {
+        let t = decode_tag(buf.get(at..).ok_or_else(err_short)?)?;
+        if t.closing && t.context && depth == 0 && t.number == closing_number {
+            return Ok(at);
+        }
+        if t.opening {
+            depth += 1;
+            at += t.header_len;
+        } else if t.closing {
+            depth = depth.checked_sub(1).ok_or_else(|| "unbalanced tags".to_string())?;
+            at += t.header_len;
+        } else if !t.context && t.number == TAG_BOOLEAN {
+            at += t.header_len;
+        } else {
+            at = at
+                .checked_add(t.header_len)
+                .and_then(|v| v.checked_add(t.lvt as usize))
+                .ok_or_else(err_short)?;
+        }
+        if at > buf.len() {
+            return Err(err_short());
+        }
+    }
+}
+
+/// Decodes a ReadRange-ACK service payload (bytes after the service choice).
+pub fn decode_read_range_ack(payload: &[u8]) -> Result<ReadRangeAck, String> {
+    let mut at = 0usize;
+    let (object, n) = decode_context_object_id(payload, 0)?;
+    at += n;
+    let (property, n) = decode_context_unsigned(payload.get(at..).ok_or_else(err_short)?, 1)?;
+    at += n;
+
+    let mut array_index = None;
+    let t = decode_tag(payload.get(at..).ok_or_else(err_short)?)?;
+    if t.context && !t.opening && !t.closing && t.number == 2 {
+        let (idx, n) = decode_context_unsigned(&payload[at..], 2)?;
+        array_index = Some(idx as u32);
+        at += n;
+    }
+
+    // context 3: result-flags BIT STRING (first-item, last-item, more-items).
+    let t = decode_tag(payload.get(at..).ok_or_else(err_short)?)?;
+    if !(t.context && !t.opening && !t.closing && t.number == 3) {
+        return Err("ReadRange-ACK: expected result-flags tag 3".into());
+    }
+    let content = payload
+        .get(at + t.header_len..at + t.header_len + t.lvt as usize)
+        .ok_or_else(err_short)?;
+    let bit = |i: usize| content.get(1 + i / 8).map(|b| (b >> (7 - (i % 8))) & 1 == 1).unwrap_or(false);
+    let (first_item, last_item, more_items) = (bit(0), bit(1), bit(2));
+    at += t.header_len + t.lvt as usize;
+
+    // context 4: item-count Unsigned.
+    let (item_count, n) = decode_context_unsigned(payload.get(at..).ok_or_else(err_short)?, 4)?;
+    at += n;
+
+    // context 5: itemData (opening .. closing).
+    let t = decode_tag(payload.get(at..).ok_or_else(err_short)?)?;
+    if !(t.opening && t.context && t.number == 5) {
+        return Err("ReadRange-ACK: expected opening tag 5".into());
+    }
+    at += t.header_len;
+    let body = payload.get(at..).ok_or_else(err_short)?;
+    let end = find_closing(body, 5)?;
+    let item_data = body[..end].to_vec();
+    at += end;
+    let closing = decode_tag(payload.get(at..).ok_or_else(err_short)?)?;
+    at += closing.header_len;
+
+    // optional context 6: first-sequence-number.
+    let mut first_sequence = None;
+    if let Some(rest) = payload.get(at..) {
+        if !rest.is_empty() {
+            let t = decode_tag(rest)?;
+            if t.context && !t.opening && !t.closing && t.number == 6 {
+                let (seq, _) = decode_context_unsigned(rest, 6)?;
+                first_sequence = Some(seq as u32);
+            }
+        }
+    }
+
+    Ok(ReadRangeAck {
+        object,
+        property: property as u32,
+        array_index,
+        first_item,
+        last_item,
+        more_items,
+        item_count: item_count as u32,
+        item_data,
+        first_sequence,
+    })
+}
+
+/// One decoded trend-log record: a timestamp and the logged datum.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogRecord {
+    pub date: Option<BacnetValue>,
+    pub time: Option<BacnetValue>,
+    pub datum: BacnetValue,
+    /// status-flags as raised bit names, when present.
+    pub status: Option<String>,
+}
+
+/// Interprets a context-tagged logDatum CHOICE value into a BacnetValue.
+/// Tags (clause 21 BACnetLogRecord.logDatum): 0 log-status (bitstring),
+/// 1 boolean, 2 real, 3 enumerated, 4 unsigned, 5 signed, 6 bitstring, 7 null.
+fn decode_log_datum(number: u8, content: &[u8]) -> BacnetValue {
+    match number {
+        1 => BacnetValue::Boolean { value: content.first().map(|b| *b != 0).unwrap_or(false) },
+        2 if content.len() == 4 => {
+            BacnetValue::Real { value: f32::from_be_bytes([content[0], content[1], content[2], content[3]]) }
+        }
+        3 => BacnetValue::Enumerated { value: decode_unsigned_content(content).unwrap_or(0) as u32 },
+        4 => BacnetValue::Unsigned { value: decode_unsigned_content(content).unwrap_or(0) },
+        5 => BacnetValue::Signed { value: decode_signed_content(content).unwrap_or(0) },
+        0 | 6 if !content.is_empty() => {
+            let unused = content[0].min(7);
+            let total = (content.len() - 1) * 8;
+            let usable = total.saturating_sub(unused as usize);
+            let mut bits = String::with_capacity(usable);
+            for i in 0..usable {
+                bits.push(if (content[1 + i / 8] >> (7 - (i % 8))) & 1 == 1 { '1' } else { '0' });
+            }
+            BacnetValue::BitString { unused_bits: unused, bits }
+        }
+        7 => BacnetValue::Null,
+        n => BacnetValue::Unknown { tag: n, hex: hex_string(content) },
+    }
+}
+
+/// Decodes a list of BACnetLogRecords from itemData bytes (best-effort: stops at
+/// the first malformed record rather than erroring, so a partial buffer still
+/// yields the records it could parse).
+pub fn decode_log_records(item_data: &[u8]) -> Vec<LogRecord> {
+    let mut records = Vec::new();
+    let mut at = 0usize;
+    while at < item_data.len() {
+        match decode_one_log_record(&item_data[at..]) {
+            Ok((rec, n)) if n > 0 => {
+                records.push(rec);
+                at += n;
+            }
+            _ => break,
+        }
+    }
+    records
+}
+
+fn decode_one_log_record(buf: &[u8]) -> Result<(LogRecord, usize), String> {
+    let mut at = 0usize;
+    let mut date = None;
+    let mut time = None;
+
+    // [0] timestamp = BACnetDateTime { date, time } (constructed).
+    let t = decode_tag(buf.get(at..).ok_or_else(err_short)?)?;
+    if t.opening && t.context && t.number == 0 {
+        at += t.header_len;
+        let end = find_closing(buf.get(at..).ok_or_else(err_short)?, 0)?;
+        let inner = &buf[at..at + end];
+        let mut i = 0usize;
+        if let Ok((d, n)) = decode_application_value(&inner[i..]) {
+            i += n;
+            date = Some(d);
+        }
+        if i < inner.len() {
+            if let Ok((tm, _)) = decode_application_value(&inner[i..]) {
+                time = Some(tm);
+            }
+        }
+        at += end;
+        at += decode_tag(buf.get(at..).ok_or_else(err_short)?)?.header_len; // closing 0
+    }
+
+    // [1] logDatum = CHOICE (constructed wrapper around one context value).
+    let t = decode_tag(buf.get(at..).ok_or_else(err_short)?)?;
+    if !(t.opening && t.context && t.number == 1) {
+        return Err("log record: expected opening tag 1 (logDatum)".into());
+    }
+    at += t.header_len;
+    let datum_tag = decode_tag(buf.get(at..).ok_or_else(err_short)?)?;
+    let datum = if datum_tag.opening {
+        // any-value (tag 10) wraps an application value.
+        let inner_start = at + datum_tag.header_len;
+        let (v, _) = decode_application_value(buf.get(inner_start..).ok_or_else(err_short)?)
+            .unwrap_or((BacnetValue::Null, 0));
+        v
+    } else {
+        let cstart = at + datum_tag.header_len;
+        let content = buf.get(cstart..cstart + datum_tag.lvt as usize).ok_or_else(err_short)?;
+        decode_log_datum(datum_tag.number, content)
+    };
+    // Skip to the closing tag 1.
+    let after = find_closing(buf.get(at..).ok_or_else(err_short)?, 1)?;
+    at += after;
+    at += decode_tag(buf.get(at..).ok_or_else(err_short)?)?.header_len; // closing 1
+
+    // optional [2] statusFlags (primitive bitstring).
+    let mut status = None;
+    if let Some(rest) = buf.get(at..) {
+        if !rest.is_empty() {
+            let t = decode_tag(rest)?;
+            if t.context && !t.opening && !t.closing && t.number == 2 {
+                let content = rest
+                    .get(t.header_len..t.header_len + t.lvt as usize)
+                    .ok_or_else(err_short)?;
+                if let BacnetValue::BitString { bits, .. } = decode_log_datum(6, content) {
+                    let names = ["in-alarm", "fault", "overridden", "out-of-service"];
+                    let raised: Vec<&str> = bits
+                        .chars()
+                        .enumerate()
+                        .filter(|(_, c)| *c == '1')
+                        .filter_map(|(i, _)| names.get(i).copied())
+                        .collect();
+                    status = Some(if raised.is_empty() { "normal".into() } else { raised.join(", ") });
+                }
+                at += t.header_len + t.lvt as usize;
+            }
+        }
+    }
+
+    Ok((LogRecord { date, time, datum, status }, at))
 }
 
 /// Pulls the object identifiers out of a decoded object-list value set.
@@ -1886,11 +2220,13 @@ mod tests {
 
     #[test]
     fn read_property_request_reference_frame() {
-        // ReadProperty analog-input 1 present-value, invoke 1 (bacnet-stack rp.c).
+        // ReadProperty analog-input 1 present-value, invoke 1 (bacnet-stack rp.c
+        // body), with our header advertising segmentation acceptance (0x02 SA,
+        // 0x45 = 16 segs / max-APDU 1476).
         let apdu = encode_read_property(1, ObjectId::new(0, 1), PROP_PRESENT_VALUE, None);
         assert_eq!(
             apdu,
-            vec![0x00, 0x05, 0x01, 0x0C, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x19, 0x55]
+            vec![0x02, 0x45, 0x01, 0x0C, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x19, 0x55]
         );
     }
 
@@ -1909,7 +2245,7 @@ mod tests {
             0x90, 0x00, 0x00, 0x3F,
         ];
         let parsed = decode_apdu(&apdu).unwrap();
-        let Apdu::ComplexAck { invoke_id, service, segmented, payload_offset } = parsed else {
+        let Apdu::ComplexAck { invoke_id, service, segmented, payload_offset, .. } = parsed else {
             panic!("expected complex ack");
         };
         assert_eq!((invoke_id, service, segmented), (1, SERVICE_READ_PROPERTY, false));
@@ -1950,7 +2286,7 @@ mod tests {
         assert_eq!(
             apdu,
             vec![
-                0x00, 0x05, 0x02, 0x0F, 0x0C, 0x00, 0x80, 0x00, 0x01, 0x19, 0x55, 0x3E,
+                0x02, 0x45, 0x02, 0x0F, 0x0C, 0x00, 0x80, 0x00, 0x01, 0x19, 0x55, 0x3E,
                 0x44, 0x42, 0x90, 0x00, 0x00, 0x3F, 0x49, 0x08
             ]
         );
@@ -1999,13 +2335,23 @@ mod tests {
 
     #[test]
     fn segmented_complex_ack_flagged() {
-        // SEG bit set: [0x38][invoke][seq][window][service]...
-        let parsed = decode_apdu(&[0x38, 0x09, 0x00, 0x01, 0x0C]).unwrap();
-        let Apdu::ComplexAck { segmented, invoke_id, service, .. } = parsed else {
+        // SEG+MOR set: [0x3C][invoke][seq=0][window=1][service]...
+        let parsed = decode_apdu(&[0x3C, 0x09, 0x00, 0x01, 0x0C, 0xAB]).unwrap();
+        let Apdu::ComplexAck { segmented, more, sequence, window, invoke_id, service, payload_offset } = parsed
+        else {
             panic!("expected complex ack");
         };
-        assert!(segmented);
-        assert_eq!((invoke_id, service), (9, SERVICE_READ_PROPERTY));
+        assert!(segmented && more);
+        assert_eq!((invoke_id, service, sequence, window), (9, SERVICE_READ_PROPERTY, 0, 1));
+        assert_eq!(payload_offset, 5);
+    }
+
+    #[test]
+    fn segment_ack_encode() {
+        // Ack segments up to seq 2, grant window 8 to a response we're receiving.
+        assert_eq!(encode_segment_ack(false, false, 5, 2, 8), vec![0x40, 5, 2, 8]);
+        // Negative ack (request retransmit) sets the NAK bit.
+        assert_eq!(encode_segment_ack(true, false, 5, 2, 8), vec![0x42, 5, 2, 8]);
     }
 
     #[test]
@@ -2024,7 +2370,7 @@ mod tests {
             },
         ];
         let apdu = encode_read_property_multiple(7, &specs);
-        assert_eq!(&apdu[..4], &[0x00, 0x05, 0x07, 0x0E]);
+        assert_eq!(&apdu[..4], &[0x02, 0x45, 0x07, 0x0E]);
 
         // Build the matching ACK: AI-1 name + value, device object-list[0] error.
         let mut payload = Vec::new();
@@ -2072,7 +2418,7 @@ mod tests {
         assert_eq!(
             apdu,
             vec![
-                0x00, 0x05, 0x01, 0x05, // confirmed, max-seg/apdu, invoke 1, SubscribeCOV
+                0x02, 0x45, 0x01, 0x05, // confirmed+SA, max-seg/apdu, invoke 1, SubscribeCOV
                 0x09, 0x01, // context 0 unsigned 1 (process id)
                 0x1C, 0x00, 0x00, 0x00, 0x00, // context 1 object-id AI-0
                 0x29, 0x01, // context 2 boolean true (confirmed)
@@ -2087,7 +2433,7 @@ mod tests {
         // process 7, object AV-5, then nothing else.
         assert_eq!(
             apdu,
-            vec![0x00, 0x05, 0x02, 0x05, 0x09, 0x07, 0x1C, 0x00, 0x80, 0x00, 0x05]
+            vec![0x02, 0x45, 0x02, 0x05, 0x09, 0x07, 0x1C, 0x00, 0x80, 0x00, 0x05]
         );
     }
 
@@ -2146,6 +2492,104 @@ mod tests {
         assert_eq!(n.values.len(), 1);
         assert_eq!(n.values[0].array_index, Some(1));
         assert_eq!(n.values[0].values, vec![BacnetValue::Real { value: 9.0 }]);
+    }
+
+    #[test]
+    fn read_range_by_position_request() {
+        // Read the 10 most recent records of trend-log 1's log-buffer.
+        let apdu = encode_read_range_by_position(
+            4,
+            ObjectId::new(OBJECT_TYPE_TREND_LOG, 1),
+            PROP_LOG_BUFFER,
+            None,
+            9999,
+            -10,
+        );
+        // header + confirmed ReadRange, object TL-1, property 131, opening-3...
+        assert_eq!(&apdu[..4], &[0x02, 0x45, 0x04, 0x1A]);
+        // ...context-1 property 131 (0x83) appears; opening tag 3 (0x3E) present.
+        assert!(apdu.contains(&0x3E) && apdu.contains(&0x3F));
+    }
+
+    #[test]
+    fn read_range_ack_and_log_records_roundtrip() {
+        // Build a ReadRange-ACK for trend-log 1 with two Real records.
+        fn log_record(date: BacnetValue, time: BacnetValue, value: f32, out: &mut Vec<u8>) {
+            encode_opening_tag(out, 0); // timestamp
+            encode_application_value(out, &date);
+            encode_application_value(out, &time);
+            encode_closing_tag(out, 0);
+            encode_opening_tag(out, 1); // logDatum
+            // real-value is context tag 2, 4 content octets.
+            encode_tag(out, 2, true, 4);
+            out.extend_from_slice(&value.to_be_bytes());
+            encode_closing_tag(out, 1);
+            // statusFlags (normal).
+            encode_tag(out, 2, true, 2);
+            out.extend_from_slice(&[0x04, 0x00]);
+        }
+
+        let mut item_data = Vec::new();
+        log_record(
+            BacnetValue::Date { year: 2026, month: 6, day: 12, weekday: 5 },
+            BacnetValue::Time { hour: 9, minute: 0, second: 0, hundredths: 0 },
+            70.5,
+            &mut item_data,
+        );
+        log_record(
+            BacnetValue::Date { year: 2026, month: 6, day: 12, weekday: 5 },
+            BacnetValue::Time { hour: 9, minute: 15, second: 0, hundredths: 0 },
+            71.0,
+            &mut item_data,
+        );
+
+        let mut payload = Vec::new();
+        encode_context_object_id(&mut payload, 0, ObjectId::new(OBJECT_TYPE_TREND_LOG, 1));
+        encode_context_unsigned(&mut payload, 1, PROP_LOG_BUFFER as u64);
+        // result-flags: first+last set (context 3 bitstring, 5 unused bits).
+        encode_tag(&mut payload, 3, true, 2);
+        payload.extend_from_slice(&[0x05, 0b1100_0000]);
+        encode_context_unsigned(&mut payload, 4, 2); // item-count
+        encode_opening_tag(&mut payload, 5);
+        payload.extend_from_slice(&item_data);
+        encode_closing_tag(&mut payload, 5);
+        encode_context_unsigned(&mut payload, 6, 1); // first-sequence
+
+        let ack = decode_read_range_ack(&payload).unwrap();
+        assert_eq!(ack.object, ObjectId::new(OBJECT_TYPE_TREND_LOG, 1));
+        assert_eq!(ack.property, PROP_LOG_BUFFER);
+        assert!(ack.first_item && ack.last_item && !ack.more_items);
+        assert_eq!(ack.item_count, 2);
+        assert_eq!(ack.first_sequence, Some(1));
+
+        let records = decode_log_records(&ack.item_data);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].datum, BacnetValue::Real { value: 70.5 });
+        assert_eq!(records[1].datum, BacnetValue::Real { value: 71.0 });
+        assert_eq!(records[0].status.as_deref(), Some("normal"));
+        assert_eq!(
+            records[0].time,
+            Some(BacnetValue::Time { hour: 9, minute: 0, second: 0, hundredths: 0 })
+        );
+    }
+
+    #[test]
+    fn log_record_datum_types() {
+        // enumerated, unsigned, boolean datums decode by their CHOICE tag.
+        let mut buf = Vec::new();
+        encode_opening_tag(&mut buf, 0);
+        encode_application_value(&mut buf, &BacnetValue::Date { year: 2026, month: 1, day: 1, weekday: 4 });
+        encode_application_value(&mut buf, &BacnetValue::Time { hour: 0, minute: 0, second: 0, hundredths: 0 });
+        encode_closing_tag(&mut buf, 0);
+        encode_opening_tag(&mut buf, 1);
+        encode_tag(&mut buf, 4, true, 1); // unsigned-value choice (tag 4)
+        buf.push(42);
+        encode_closing_tag(&mut buf, 1);
+
+        let records = decode_log_records(&buf);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].datum, BacnetValue::Unsigned { value: 42 });
+        assert_eq!(records[0].status, None);
     }
 
     #[test]

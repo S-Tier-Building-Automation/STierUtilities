@@ -105,6 +105,24 @@ struct ObjectsProgress {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct TrendRecord {
+    timestamp: String,
+    value: String,
+    status: String,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TrendResult {
+    object_type: u16,
+    instance: u32,
+    record_count: u32,
+    records: Vec<TrendRecord>,
+    truncated: bool,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct ObjectName {
     key: String,
     name: String,
@@ -160,6 +178,32 @@ struct Target {
     route: Option<(u16, Vec<u8>)>,
 }
 
+/// Accumulates a segmented ComplexAck reply across datagrams, keyed by invoke id.
+struct SegmentBuffer {
+    service: u8,
+    data: Vec<u8>,
+    /// The next in-order sequence number we expect.
+    next_seq: u8,
+    /// Segments accepted so far (bounds round-trips independent of total bytes).
+    count: usize,
+}
+
+/// Granted segment window — how many segments the device may send before it must
+/// wait for our next SegmentACK. We still ack every in-order segment, so this is
+/// just the streaming depth.
+const SEGMENT_WINDOW: u8 = 16;
+
+/// Max segments accepted in one reply. We advertise 16; allow slack for
+/// retransmits but refuse a device that streams far past the contract.
+const MAX_SEGMENTS: usize = 64;
+
+/// Count of segmented replies successfully reassembled — for live verification.
+static SEGMENTED_REPLIES: AtomicUsize = AtomicUsize::new(0);
+
+/// Cap on a reassembled reply, so a misbehaving device can't grow the buffer
+/// without bound. 16 segments × 1476 ≈ 23 KB; allow generous headroom.
+const MAX_SEGMENTED_BYTES: usize = 256 * 1024;
+
 /// An active COV subscription, keyed by its subscriber-process id. Holds just
 /// enough to route incoming notifications back to the right device pane and to
 /// keep the subscription alive past its lifetime.
@@ -184,12 +228,15 @@ struct CovEvent {
 
 struct Client {
     socket: UdpSocket,
-    /// invoke-id -> (peer we sent to, reply channel). The peer address lets the
-    /// reader reject a stale/duplicate reply whose source doesn't match the
-    /// request that currently owns this invoke id (the u8 id space is reused).
-    pending: Mutex<HashMap<u8, (SocketAddr, mpsc::Sender<Outcome>)>>,
+    /// invoke-id -> (peer IP we sent to, the routed source SNET/SADR we expect,
+    /// reply channel). Matching both lets the reader reject a stale/duplicate
+    /// reply that belongs to a different transaction reusing this invoke id —
+    /// including routed devices that share a router IP but differ by SNET/SADR.
+    pending: Mutex<HashMap<u8, (SocketAddr, Option<(u16, Vec<u8>)>, mpsc::Sender<Outcome>)>>,
     next_invoke: Mutex<u8>,
     discovery: Mutex<Option<Discovery>>,
+    /// In-flight segmented-reply reassembly buffers, keyed by invoke id.
+    segments: Mutex<HashMap<u8, SegmentBuffer>>,
     cov: Mutex<HashMap<u32, CovEntry>>,
     next_process: Mutex<u32>,
     /// Bumped each time a device's objects are read; a detached name-enrichment
@@ -226,6 +273,7 @@ impl Client {
             pending: Mutex::new(HashMap::new()),
             next_invoke: Mutex::new(1),
             discovery: Mutex::new(None),
+            segments: Mutex::new(HashMap::new()),
             cov: Mutex::new(HashMap::new()),
             next_process: Mutex::new(1),
             objects_gen: AtomicUsize::new(0),
@@ -270,7 +318,10 @@ impl Client {
         let frame = codec::bvlc_encode(codec::BVLC_ORIGINAL_UNICAST, &payload);
 
         let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(invoke_id, (target.sa, tx));
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(invoke_id, (target.sa, target.route.clone(), tx));
         let result = (|| {
             for _ in 0..APDU_ATTEMPTS {
                 self.socket
@@ -288,17 +339,126 @@ impl Client {
             ))
         })();
         self.pending.lock().unwrap().remove(&invoke_id);
+        // Drop any partial reassembly so a late stray segment can't seed a buffer
+        // that outlives the transaction.
+        self.segments.lock().unwrap().remove(&invoke_id);
         result
     }
 
+    /// True when there's a pending transaction for `invoke_id` whose peer IP and
+    /// routed source both match the reply — used to gate accepting a segment.
+    fn pending_peer_matches(&self, invoke_id: u8, src: SocketAddr, route: &Option<(u16, Vec<u8>)>) -> bool {
+        self.pending
+            .lock()
+            .unwrap()
+            .get(&invoke_id)
+            .map(|(peer, stored_route, _)| peer.ip() == src.ip() && stored_route == route)
+            .unwrap_or(false)
+    }
+
+    /// Sends a positive SegmentACK for `sequence` to `src` (routed-aware).
+    fn send_segment_ack(&self, invoke_id: u8, sequence: u8, src: SocketAddr, route: &Option<(u16, Vec<u8>)>) {
+        let seg_ack = codec::encode_segment_ack(false, false, invoke_id, sequence, SEGMENT_WINDOW);
+        let dest = route.as_ref().map(|(net, mac)| (*net, mac.as_slice()));
+        let mut npdu = codec::encode_npdu(false, dest);
+        npdu.extend_from_slice(&seg_ack);
+        let _ = self
+            .socket
+            .send_to(&codec::bvlc_encode(codec::BVLC_ORIGINAL_UNICAST, &npdu), src);
+    }
+
+    /// Feeds one segment of a segmented ComplexAck into reassembly: accumulates
+    /// in-order data, sends a SegmentACK, and on the final segment delivers the
+    /// reassembled `Outcome::Complex` to the waiting transaction. `route` carries
+    /// the source SNET/SADR so the ack reaches a routed device via its router.
+    fn handle_segment(
+        &self,
+        invoke_id: u8,
+        service: u8,
+        sequence: u8,
+        more: bool,
+        payload: &[u8],
+        src: SocketAddr,
+        route: Option<(u16, Vec<u8>)>,
+    ) {
+        // Only accept segments for a transaction we're actually running, from the
+        // peer (and routed source) that owns it.
+        if !self.pending_peer_matches(invoke_id, src, &route) {
+            return;
+        }
+
+        enum Step {
+            /// Ack `sequence` and keep waiting.
+            Ack(u8),
+            /// Ack `sequence` and deliver the reassembled reply.
+            Deliver(u8, Outcome),
+            /// Abandon the transaction WITHOUT acking the offending segment.
+            Fail(String),
+            /// Ignore (out of order before we've received anything).
+            Drop,
+        }
+
+        let step = {
+            let mut bufs = self.segments.lock().unwrap();
+            let buf = bufs.entry(invoke_id).or_insert_with(|| SegmentBuffer {
+                service,
+                data: Vec::new(),
+                next_seq: 0,
+                count: 0,
+            });
+            if sequence == buf.next_seq {
+                if buf.count + 1 > MAX_SEGMENTS {
+                    bufs.remove(&invoke_id);
+                    Step::Fail(format!("segmented reply exceeded {MAX_SEGMENTS} segments"))
+                } else if buf.data.len() + payload.len() > MAX_SEGMENTED_BYTES {
+                    bufs.remove(&invoke_id);
+                    Step::Fail("segmented reply exceeded size cap".into())
+                } else {
+                    buf.data.extend_from_slice(payload);
+                    buf.next_seq = buf.next_seq.wrapping_add(1);
+                    buf.count += 1;
+                    if more {
+                        Step::Ack(sequence)
+                    } else {
+                        let done = bufs.remove(&invoke_id).unwrap();
+                        SEGMENTED_REPLIES.fetch_add(1, Ordering::Relaxed);
+                        Step::Deliver(sequence, Outcome::Complex { service: done.service, payload: done.data })
+                    }
+                }
+            } else if buf.next_seq > 0 {
+                // Out of order, but we have in-order data: re-ack the last good
+                // sequence (a valid number) to nudge a retransmit.
+                Step::Ack(buf.next_seq.wrapping_sub(1))
+            } else {
+                // Out of order before segment 0 arrived — don't ack a sequence we
+                // never received (that would falsely confirm it); let the device
+                // retransmit from the start on its own timer.
+                Step::Drop
+            }
+        };
+
+        match step {
+            Step::Ack(seq) => self.send_segment_ack(invoke_id, seq, src, &route),
+            Step::Deliver(seq, outcome) => {
+                self.send_segment_ack(invoke_id, seq, src, &route);
+                self.complete(invoke_id, src, &route, outcome);
+            }
+            // Fail locally without acking the abandoned segment.
+            Step::Fail(e) => self.complete(invoke_id, src, &route, Outcome::Failed(e)),
+            Step::Drop => {}
+        }
+    }
+
     /// Delivers a reply to the pending transaction for `invoke_id`, but only if
-    /// it came from the peer that transaction is talking to — so a delayed reply
-    /// to a finished transaction can't be mismatched to a different device that
-    /// has since been handed the same (reused) invoke id. Compared by IP, since
-    /// a BACnet device replies from its B/IP port regardless of our source port.
-    fn complete(&self, invoke_id: u8, src: SocketAddr, outcome: Outcome) {
-        if let Some((peer, tx)) = self.pending.lock().unwrap().get(&invoke_id) {
-            if peer.ip() == src.ip() {
+    /// it came from the same peer (IP) AND the same routed source (SNET/SADR)
+    /// that transaction is talking to — so a delayed reply to a finished
+    /// transaction can't be mismatched to a different device that has since been
+    /// handed the same (reused) invoke id, including two routed devices sharing a
+    /// router IP. Compared by IP (a BACnet device replies from its B/IP port
+    /// regardless of our source port) plus the NPDU source for routed peers.
+    fn complete(&self, invoke_id: u8, src: SocketAddr, route: &Option<(u16, Vec<u8>)>, outcome: Outcome) {
+        if let Some((peer, stored_route, tx)) = self.pending.lock().unwrap().get(&invoke_id) {
+            if peer.ip() == src.ip() && stored_route == route {
                 let _ = tx.send(outcome);
             }
         }
@@ -507,23 +667,36 @@ fn handle_frame(client: &Client, frame: &[u8], src: SocketAddr) {
                 }
             }
         }
-        Apdu::SimpleAck { invoke_id, .. } => client.complete(invoke_id, effective_src, Outcome::Simple),
-        Apdu::ComplexAck { invoke_id, service, segmented, payload_offset } => {
-            let outcome = if segmented {
-                // We advertise no segmentation support; treat as a failure so
-                // callers fall back to smaller reads.
-                Outcome::Failed("device sent a segmented response".into())
-            } else {
-                Outcome::Complex {
+        Apdu::SimpleAck { invoke_id, .. } => {
+            client.complete(invoke_id, effective_src, &npdu.source, Outcome::Simple)
+        }
+        Apdu::ComplexAck { invoke_id, service, segmented, more, sequence, payload_offset, .. } => {
+            let payload = apdu.get(payload_offset..).unwrap_or_default();
+            if segmented {
+                // Reassemble across datagrams, acking each segment back to the
+                // (possibly routed) source.
+                client.handle_segment(
+                    invoke_id,
                     service,
-                    payload: apdu.get(payload_offset..).unwrap_or_default().to_vec(),
-                }
-            };
-            client.complete(invoke_id, effective_src, outcome);
+                    sequence,
+                    more,
+                    payload,
+                    effective_src,
+                    npdu.source.clone(),
+                );
+            } else {
+                client.complete(
+                    invoke_id,
+                    effective_src,
+                    &npdu.source,
+                    Outcome::Complex { service, payload: payload.to_vec() },
+                );
+            }
         }
         Apdu::Error { invoke_id, error_class, error_code, .. } => client.complete(
             invoke_id,
             effective_src,
+            &npdu.source,
             Outcome::Failed(format!(
                 "device error: {} / {}",
                 codec::error_class_name(error_class),
@@ -533,11 +706,13 @@ fn handle_frame(client: &Client, frame: &[u8], src: SocketAddr) {
         Apdu::Reject { invoke_id, reason } => client.complete(
             invoke_id,
             effective_src,
+            &npdu.source,
             Outcome::Failed(format!("request rejected: {}", codec::reject_reason_name(reason))),
         ),
         Apdu::Abort { invoke_id, reason } => client.complete(
             invoke_id,
             effective_src,
+            &npdu.source,
             Outcome::Failed(format!("request aborted: {}", codec::abort_reason_name(reason))),
         ),
         _ => {}
@@ -676,6 +851,43 @@ fn write_property_core(
     match client.request(target, &apdu, invoke)? {
         Outcome::Simple => Ok(()),
         Outcome::Complex { .. } => Err("unexpected complex ack for WriteProperty".into()),
+        Outcome::Failed(e) => Err(e),
+    }
+}
+
+/// Reads a range of a list/array property (used for trend-log log-buffer reads)
+/// by position.
+fn read_range_core(
+    client: &Client,
+    target: &Target,
+    object: ObjectId,
+    reference_index: u32,
+    count: i32,
+) -> Result<codec::ReadRangeAck, String> {
+    let invoke = client.alloc_invoke();
+    let apdu = codec::encode_read_range_by_position(
+        invoke,
+        object,
+        codec::PROP_LOG_BUFFER,
+        None,
+        reference_index,
+        count,
+    );
+    match client.request(target, &apdu, invoke)? {
+        Outcome::Complex { service: codec::SERVICE_READ_RANGE, payload } => {
+            let ack = codec::decode_read_range_ack(&payload)?;
+            // Guard against a stale reply on a reused invoke id: the ACK must
+            // describe the object+property we asked for.
+            if ack.object != object || ack.property != codec::PROP_LOG_BUFFER {
+                return Err(format!(
+                    "ReadRange response mismatch: asked {}:{}, got {}:{} prop {}",
+                    object.object_type, object.instance, ack.object.object_type, ack.object.instance, ack.property
+                ));
+            }
+            Ok(ack)
+        }
+        Outcome::Complex { service, .. } => Err(format!("unexpected ack for service {service}")),
+        Outcome::Simple => Err("unexpected simple ack for ReadRange".into()),
         Outcome::Failed(e) => Err(e),
     }
 }
@@ -1434,6 +1646,144 @@ pub async fn bacnet_write_property(
     .map_err(|e| format!("write task panicked: {e}"))?
 }
 
+/// Records per ReadRange request — kept under a 480-byte device's APDU budget so
+/// even un-segmented trend logs answer (records are ~12-20 bytes each).
+const TREND_CHUNK: i32 = 20;
+/// Hard cap on records fetched in one trend read.
+const TREND_MAX: u32 = 2000;
+
+fn format_log_timestamp(rec: &codec::LogRecord) -> String {
+    let d = rec.date.as_ref().map(render_value).unwrap_or_default();
+    let t = rec.time.as_ref().map(render_value).unwrap_or_default();
+    format!("{d} {t}").trim().to_string()
+}
+
+fn to_trend_records(recs: &[codec::LogRecord]) -> Vec<TrendRecord> {
+    recs.iter()
+        .map(|r| TrendRecord {
+            timestamp: format_log_timestamp(r),
+            value: render_value(&r.datum),
+            status: r.status.clone().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Reads the most-recent records from a trend log's `log-buffer`, returned in
+/// chronological order. With a known `record-count` it pages BACKWARD from the
+/// newest position using negative ReadRange counts, so an unknown or stale count
+/// can't make it return the oldest records or drop the newest. When the device
+/// omits `record-count` it reads forward (bounded) and keeps the newest `want`.
+/// Records come in `TREND_CHUNK` batches so even un-segmented 480-byte devices
+/// answer. (byPosition is inherently relative to current buffer contents;
+/// bySequenceNumber would be fully race-proof and is a future enhancement.)
+fn read_trend_core(
+    client: &Client,
+    target: &Target,
+    object: ObjectId,
+    max_records: u32,
+) -> Result<TrendResult, String> {
+    let want = max_records.clamp(1, TREND_MAX);
+
+    // How many records exist? (best-effort — some devices omit record-count.)
+    let total = match read_property(client, target, object, codec::PROP_RECORD_COUNT, None) {
+        Ok(values) => match values.first() {
+            Some(BacnetValue::Unsigned { value }) => *value as u32,
+            _ => 0,
+        },
+        Err(_) => 0,
+    };
+
+    let mut records: Vec<TrendRecord> = Vec::new();
+    let mut truncated = false;
+    let max_iters = want / TREND_CHUNK as u32 + 4;
+
+    if total > 0 {
+        // Backward paging from the newest record (negative count ends at `anchor`).
+        let mut anchor = total;
+        let mut guard = 0u32;
+        while (records.len() as u32) < want && anchor >= 1 {
+            guard += 1;
+            if guard > max_iters {
+                break;
+            }
+            let remaining = want as usize - records.len();
+            let chunk = remaining.min(TREND_CHUNK as usize) as i32;
+            let ack = read_range_core(client, target, object, anchor, -chunk)?;
+            let mut batch = to_trend_records(&codec::decode_log_records(&ack.item_data));
+            let got = batch.len() as u32;
+            if got == 0 {
+                break;
+            }
+            // This batch is older than what we've collected — prepend to keep
+            // the overall order chronological (ascending).
+            batch.extend(records.drain(..));
+            records = batch;
+            if ack.first_item || got >= anchor {
+                break;
+            }
+            anchor -= got;
+        }
+        truncated = total > records.len() as u32;
+    } else {
+        // Unknown count: read forward (bounded), keep the newest `want`.
+        let mut pos = 1u32;
+        let mut guard = 0u32;
+        loop {
+            if records.len() >= TREND_MAX as usize {
+                truncated = true;
+                break;
+            }
+            guard += 1;
+            if guard > TREND_MAX / TREND_CHUNK as u32 + 4 {
+                break;
+            }
+            let ack = read_range_core(client, target, object, pos, TREND_CHUNK)?;
+            let batch = to_trend_records(&codec::decode_log_records(&ack.item_data));
+            let got = batch.len() as u32;
+            if got == 0 {
+                break;
+            }
+            records.extend(batch);
+            if ack.last_item {
+                break;
+            }
+            pos += got;
+        }
+        if records.len() > want as usize {
+            // Keep the newest `want` (drop from the front).
+            let excess = records.len() - want as usize;
+            records.drain(0..excess);
+            truncated = true;
+        }
+    }
+
+    Ok(TrendResult {
+        object_type: object.object_type,
+        instance: object.instance,
+        record_count: total,
+        records,
+        truncated,
+    })
+}
+
+/// Reads recent records from a Trend Log object's buffer (ReadRange byPosition).
+#[tauri::command]
+pub async fn bacnet_read_trend(
+    device: DeviceRef,
+    object_type: u16,
+    instance: u32,
+    max_records: Option<u32>,
+) -> Result<TrendResult, String> {
+    let client = client()?;
+    let target = resolve_device(&device)?;
+    let want = max_records.unwrap_or(200);
+    tauri::async_runtime::spawn_blocking(move || {
+        read_trend_core(&client, &target, ObjectId::new(object_type, instance), want)
+    })
+    .await
+    .map_err(|e| format!("trend read task panicked: {e}"))?
+}
+
 /// Default COV subscription lifetime, and how often to resubscribe (well before
 /// expiry). Devices cap lifetime; 300 s with a ~180 s refresh is conservative.
 const COV_LIFETIME_SECS: u32 = 300;
@@ -1841,6 +2191,104 @@ mod tests {
     }
 
     #[test]
+    fn read_property_reassembles_segmented_reply() {
+        // A device returns a ReadProperty-ACK split across 3 segments; the client
+        // must ack each and reassemble the full value.
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            let (frame, src) = recv_frame(&fake);
+            let bvlc = codec::bvlc_decode(&frame).unwrap();
+            let npdu = codec::decode_npdu(&frame[bvlc.payload_offset..]).unwrap();
+            let apdu = &frame[bvlc.payload_offset + npdu.apdu_offset..];
+            let Apdu::ConfirmedRequest { invoke_id, service, .. } = codec::decode_apdu(apdu).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(service, codec::SERVICE_READ_PROPERTY);
+
+            // The complete RP-ACK service data for AI-1 present-value = 72.0.
+            let body: Vec<u8> = {
+                let mut b = Vec::new();
+                codec::encode_context_object_id(&mut b, 0, ObjectId::new(0, 1));
+                codec::encode_context_unsigned(&mut b, 1, codec::PROP_PRESENT_VALUE as u64);
+                codec::encode_opening_tag(&mut b, 3);
+                codec::encode_application_value(&mut b, &BacnetValue::Real { value: 72.0 });
+                codec::encode_closing_tag(&mut b, 3);
+                b
+            };
+            // Split into 3 chunks.
+            let chunks: Vec<&[u8]> = vec![&body[0..5], &body[5..10], &body[10..]];
+            let send_segment = |seq: u8, more: bool, chunk: &[u8]| {
+                let mut octet0 = codec::PDU_COMPLEX_ACK | codec::APDU_FLAG_SEGMENTED;
+                if more {
+                    octet0 |= codec::APDU_FLAG_MORE;
+                }
+                let mut apdu = vec![octet0, invoke_id, seq, 16, codec::SERVICE_READ_PROPERTY];
+                apdu.extend_from_slice(chunk);
+                fake.send_to(&unicast_reply(&apdu), src).unwrap();
+            };
+            // Send each segment, waiting for the client's SegmentACK between them.
+            for (i, chunk) in chunks.iter().enumerate() {
+                let more = i + 1 < chunks.len();
+                send_segment(i as u8, more, chunk);
+                let (ack_frame, _) = recv_frame(&fake);
+                let ab = codec::bvlc_decode(&ack_frame).unwrap();
+                let an = codec::decode_npdu(&ack_frame[ab.payload_offset..]).unwrap();
+                let aapdu = &ack_frame[ab.payload_offset + an.apdu_offset..];
+                assert!(matches!(codec::decode_apdu(aapdu).unwrap(), Apdu::SegmentAck { .. }));
+            }
+        });
+
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let target = Target { sa: fake_addr, route: None };
+        let values =
+            read_property(&client, &target, ObjectId::new(0, 1), codec::PROP_PRESENT_VALUE, None)
+                .unwrap();
+        t.join().unwrap();
+        assert_eq!(values, vec![BacnetValue::Real { value: 72.0 }]);
+    }
+
+    #[test]
+    fn segment_out_of_order_before_first_is_not_acked() {
+        // An out-of-order segment arriving before sequence 0 must be dropped, not
+        // positively acked (which would falsely confirm a never-received segment).
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let peer: SocketAddr = "127.0.0.1:47808".parse().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        client.pending.lock().unwrap().insert(9, (peer, None, tx));
+        // Feed segment seq=3 first (peer matches, but next_seq is 0).
+        client.handle_segment(9, codec::SERVICE_READ_PROPERTY, 3, true, &[0xAA], peer, None);
+        // The out-of-order segment must NOT be accepted: the buffer (if present)
+        // still expects sequence 0 with no data — proving the Drop branch ran and
+        // no false ack for sequence 255 was emitted.
+        let bufs = client.segments.lock().unwrap();
+        if let Some(b) = bufs.get(&9) {
+            assert_eq!(b.next_seq, 0);
+            assert!(b.data.is_empty());
+            assert_eq!(b.count, 0);
+        }
+    }
+
+    #[test]
+    fn segment_count_cap_fails_without_acking() {
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let peer: SocketAddr = "127.0.0.1:47808".parse().unwrap();
+        let (tx, rx) = mpsc::channel();
+        client.pending.lock().unwrap().insert(4, (peer, None, tx));
+        // Pre-seed a buffer already at the cap so the next in-order segment trips it.
+        let seq = MAX_SEGMENTS as u8; // next expected sequence after `count` segments
+        client.segments.lock().unwrap().insert(
+            4,
+            SegmentBuffer { service: codec::SERVICE_READ_PROPERTY, data: vec![0; 10], next_seq: seq, count: MAX_SEGMENTS },
+        );
+        client.handle_segment(4, codec::SERVICE_READ_PROPERTY, seq, true, &[0xBB], peer, None);
+        // Transaction failed locally and the buffer was dropped.
+        assert!(!client.segments.lock().unwrap().contains_key(&4));
+        assert!(matches!(rx.try_recv(), Ok(Outcome::Failed(_))));
+    }
+
+    #[test]
     fn read_property_rejects_wrong_object_reply() {
         // A device that answers with a DIFFERENT object than asked (the stale
         // reused-invoke-id case, same peer) must be rejected, not shown as the
@@ -1881,14 +2329,18 @@ mod tests {
         let client = Client::new("127.0.0.1:0").unwrap();
         let (tx, rx) = mpsc::channel();
         let peer: SocketAddr = "10.0.0.5:47808".parse().unwrap();
-        client.pending.lock().unwrap().insert(7, (peer, tx));
+        client.pending.lock().unwrap().insert(7, (peer, None, tx));
 
         // Wrong source IP -> dropped.
-        client.complete(7, "10.0.0.9:47808".parse().unwrap(), Outcome::Simple);
+        client.complete(7, "10.0.0.9:47808".parse().unwrap(), &None, Outcome::Simple);
         assert!(rx.try_recv().is_err(), "reply from wrong source should be dropped");
 
-        // Correct source IP (any port) -> delivered.
-        client.complete(7, "10.0.0.5:12345".parse().unwrap(), Outcome::Simple);
+        // Right IP but a routed source we didn't expect -> dropped.
+        client.complete(7, "10.0.0.5:47808".parse().unwrap(), &Some((2001, vec![0x0C])), Outcome::Simple);
+        assert!(rx.try_recv().is_err(), "reply with unexpected route should be dropped");
+
+        // Correct source IP (any port) and matching route (none) -> delivered.
+        client.complete(7, "10.0.0.5:12345".parse().unwrap(), &None, Outcome::Simple);
         assert!(matches!(rx.try_recv(), Ok(Outcome::Simple)), "matching-source reply should deliver");
     }
 
@@ -1953,6 +2405,84 @@ mod tests {
         let target = Target { sa: fake_addr, route: None };
         subscribe_cov_core(&client, &target, 7, ObjectId::new(0, 0), false, Some(60)).unwrap();
         t.join().unwrap();
+    }
+
+    #[test]
+    fn read_trend_over_loopback() {
+        // Fake trend log: record-count = 2, then a ReadRange-ACK with 2 records.
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            // 1) ReadProperty record-count -> 2.
+            let (frame, src) = recv_frame(&fake);
+            let bvlc = codec::bvlc_decode(&frame).unwrap();
+            let npdu = codec::decode_npdu(&frame[bvlc.payload_offset..]).unwrap();
+            let Apdu::ConfirmedRequest { invoke_id, service, .. } =
+                codec::decode_apdu(&frame[bvlc.payload_offset + npdu.apdu_offset..]).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(service, codec::SERVICE_READ_PROPERTY);
+            let mut reply = vec![codec::PDU_COMPLEX_ACK, invoke_id, codec::SERVICE_READ_PROPERTY];
+            codec::encode_context_object_id(&mut reply, 0, ObjectId::new(20, 1));
+            codec::encode_context_unsigned(&mut reply, 1, codec::PROP_RECORD_COUNT as u64);
+            codec::encode_opening_tag(&mut reply, 3);
+            codec::encode_application_value(&mut reply, &BacnetValue::Unsigned { value: 2 });
+            codec::encode_closing_tag(&mut reply, 3);
+            fake.send_to(&unicast_reply(&reply), src).unwrap();
+
+            // 2) ReadRange -> 2 real records.
+            let (frame2, src2) = recv_frame(&fake);
+            let bvlc2 = codec::bvlc_decode(&frame2).unwrap();
+            let npdu2 = codec::decode_npdu(&frame2[bvlc2.payload_offset..]).unwrap();
+            let Apdu::ConfirmedRequest { invoke_id: inv2, service: svc2, .. } =
+                codec::decode_apdu(&frame2[bvlc2.payload_offset + npdu2.apdu_offset..]).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(svc2, codec::SERVICE_READ_RANGE);
+
+            let mut item_data = Vec::new();
+            for (min, val) in [(0u8, 70.5f32), (15, 71.0)] {
+                codec::encode_opening_tag(&mut item_data, 0);
+                codec::encode_application_value(
+                    &mut item_data,
+                    &BacnetValue::Date { year: 2026, month: 6, day: 12, weekday: 5 },
+                );
+                codec::encode_application_value(
+                    &mut item_data,
+                    &BacnetValue::Time { hour: 9, minute: min, second: 0, hundredths: 0 },
+                );
+                codec::encode_closing_tag(&mut item_data, 0);
+                codec::encode_opening_tag(&mut item_data, 1);
+                let mut datum = Vec::new();
+                codec::encode_tag(&mut datum, 2, true, 4);
+                datum.extend_from_slice(&val.to_be_bytes());
+                item_data.extend_from_slice(&datum);
+                codec::encode_closing_tag(&mut item_data, 1);
+            }
+            let mut ack = vec![codec::PDU_COMPLEX_ACK, inv2, codec::SERVICE_READ_RANGE];
+            codec::encode_context_object_id(&mut ack, 0, ObjectId::new(20, 1));
+            codec::encode_context_unsigned(&mut ack, 1, codec::PROP_LOG_BUFFER as u64);
+            codec::encode_tag(&mut ack, 3, true, 2);
+            ack.extend_from_slice(&[0x05, 0b1100_0000]); // first+last
+            codec::encode_context_unsigned(&mut ack, 4, 2);
+            codec::encode_opening_tag(&mut ack, 5);
+            ack.extend_from_slice(&item_data);
+            codec::encode_closing_tag(&mut ack, 5);
+            fake.send_to(&unicast_reply(&ack), src2).unwrap();
+        });
+
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let target = Target { sa: fake_addr, route: None };
+        let result = read_trend_core(&client, &target, ObjectId::new(20, 1), 200).unwrap();
+        t.join().unwrap();
+        assert_eq!(result.record_count, 2);
+        assert_eq!(result.records.len(), 2);
+        assert_eq!(result.records[0].value, "70.5");
+        assert_eq!(result.records[1].value, "71");
+        assert!(result.records[0].timestamp.contains("2026-06-12"));
+        assert!(result.records[0].timestamp.contains("09:00:00"));
     }
 
     #[test]
@@ -2484,6 +3014,44 @@ mod tests {
         assert!(count >= 1, "no COV notifications received (device may not support COV)");
     }
 
+    /// Live trend read (read-only): discover, find a device that hosts a
+    /// trend-log object, and read its recent records via ReadRange.
+    ///
+    ///   cargo test live_read_trend -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_read_trend() {
+        let target = std::env::var("BACNET_TARGET").unwrap_or_else(|_| "192.168.1.255".into());
+        let client = Client::new("0.0.0.0:0").unwrap();
+        let devices = discover_core(&client, &target, None, None, Duration::from_secs(5), |_| {}).unwrap();
+        println!("scanning {} devices for a trend-log…", devices.len());
+
+        // Check up to 40 devices for a trend-log (type 20) object.
+        for dev in devices.iter().take(40) {
+            let Ok(t) = resolve_device(&DeviceRef {
+                address: dev.address.clone(),
+                network: dev.network,
+                mac: dev.mac.clone(),
+            }) else { continue };
+            let Ok(objects) = read_object_ids_core(&client, &t, dev.instance, |_, _| {}) else { continue };
+            let Some(tl) = objects.iter().find(|o| o.object_type == 20) else { continue };
+            let object = ObjectId::new(tl.object_type, tl.instance);
+            println!("found trend-log {}:{} on device {} ({})", tl.object_type, tl.instance, dev.instance, dev.address);
+            match read_trend_core(&client, &t, object, 20) {
+                Ok(res) => {
+                    println!("  record-count {}, read {} records:", res.record_count, res.records.len());
+                    for r in res.records.iter().take(10) {
+                        println!("    {} = {} [{}]", r.timestamp, r.value, r.status);
+                    }
+                    assert!(res.record_count > 0 || !res.records.is_empty(), "trend log returned nothing");
+                    return;
+                }
+                Err(e) => println!("  read failed: {e}"),
+            }
+        }
+        println!("no readable trend-log object found in the first 40 devices (not a failure).");
+    }
+
     #[test]
     #[ignore]
     fn live_network_survey() {
@@ -2580,6 +3148,10 @@ mod tests {
         println!("full object-list one RP: {full_ok}/{n} (rest exercised indexed fallback)");
         println!("objects fully read:      {sampled} ({props} property values)");
         println!("priority-array reads:    {pa_ok} ok / {pa_err} err");
+        println!(
+            "segmented replies:       {} (reassembled across multiple datagrams)",
+            SEGMENTED_REPLIES.load(Ordering::Relaxed)
+        );
 
         let mut err_histo: HashMap<String, usize> = HashMap::new();
         for r in reports.iter() {

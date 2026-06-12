@@ -1771,6 +1771,7 @@ let bac = {
   props: [],              // PropertyEntry[] for the selected object
   propsLoading: false,
   cov: { processId: null, objectKey: null, busy: false, updates: 0, lastAt: null },
+  trend: { loading: false, records: [], recordCount: 0, truncated: false, objectKey: null, max: "200" },
   write: { propertyId: "85", kind: "real", value: "", priority: "", arrayIndex: "" },
   target: "255.255.255.255",
   lowLimit: "",
@@ -1923,6 +1924,9 @@ async function bacSelectDevice(key) {
 async function bacSelectObject(key) {
   // Drop any live subscription tied to the previously-viewed object.
   if (bac.cov.processId != null && bac.cov.objectKey !== key) await bacCovStop();
+  if (bac.trend.objectKey !== key) {
+    bac.trend = { loading: false, records: [], recordCount: 0, truncated: false, objectKey: null, max: bac.trend.max };
+  }
   bac.selectedObjectKey = key;
   bac.props = [];
   const dev = bacSelectedDevice();
@@ -2203,7 +2207,7 @@ function bacDevicesToCsv() {
   const rows = bacVisibleDevices();
   const esc = (v) => {
     const s = String(v ?? "");
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const header = ["instance", "name", "address", "network", "mac", "vendorId", "vendorName", "model", "maxApdu", "segmentation"];
   const lines = [header.join(",")];
@@ -2362,6 +2366,119 @@ function bacPropRows(flashIds) {
       el("td", { class: "bac-prop-value" }, p.display),
     );
   });
+}
+
+// ---- trend logs (ReadRange) ----
+
+function bacObjectIsTrendLog(obj) {
+  return obj && (obj.objectType === 20 || obj.objectType === 27); // trend-log / trend-log-multiple
+}
+
+async function bacReadTrend() {
+  const dev = bacSelectedDevice();
+  const obj = bacSelectedObject();
+  if (!dev || !obj) return;
+  const max = Math.max(1, Math.min(2000, parseInt(bac.trend.max, 10) || 200));
+  bac.trend.loading = true;
+  bac.trend.objectKey = bacObjectKey(obj);
+  renderAll();
+  try {
+    const result = await invoke("bacnet_read_trend", {
+      device: bacDeviceRef(dev),
+      objectType: obj.objectType,
+      instance: obj.instance,
+      maxRecords: max,
+    });
+    // Ignore if the user navigated away mid-read.
+    if (bac.selectedObjectKey !== bacObjectKey(obj)) return;
+    bac.trend.records = result.records;
+    bac.trend.recordCount = result.recordCount;
+    bac.trend.truncated = result.truncated;
+    logTo("bacnet", `Read ${result.records.length} trend record${result.records.length === 1 ? "" : "s"} from ${obj.typeName}:${obj.instance}.`, "ok");
+  } catch (err) {
+    if (bac.selectedObjectKey !== bacObjectKey(obj)) return;
+    logTo("bacnet", `Trend read failed for ${obj.typeName}:${obj.instance}: ${err}`, "error");
+  } finally {
+    if (bac.selectedObjectKey === bacObjectKey(obj)) {
+      bac.trend.loading = false;
+      renderAll();
+    }
+  }
+}
+
+function bacTrendToCsv() {
+  const esc = (v) => {
+    const s = String(v ?? "");
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = ["timestamp,value,status"];
+  for (const r of bac.trend.records) {
+    lines.push([r.timestamp, r.value, r.status].map(esc).join(","));
+  }
+  return lines.join("\r\n");
+}
+
+function bacExportTrend() {
+  const obj = bacSelectedObject();
+  const csv = bacTrendToCsv();
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = el("a", { href: url, download: `trend-${obj ? `${obj.typeName}-${obj.instance}` : "log"}-${bacTimestamp()}.csv` });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  logTo("bacnet", `Exported ${bac.trend.records.length} trend records to CSV.`, "ok");
+}
+
+function bacTrendPanel() {
+  const recs = bac.trend.records;
+  const rows = recs.length === 0
+    ? [el("tr", {}, el("td", { class: "muted small", colspan: "3" },
+        bac.trend.loading ? "Reading trend log…" : "No records read yet — click Read trend."))]
+    : recs.map((r) => el("tr", {},
+        el("td", { class: "bac-mono" }, r.timestamp),
+        el("td", { class: "bac-prop-value" }, r.value),
+        el("td", {}, r.status || el("span", { class: "muted" }, "—")),
+      ));
+
+  const maxInput = el("input", {
+    type: "text", class: "nm-input bac-trend-max",
+    title: "Max records to read",
+    value: bac.trend.max,
+    oninput: (e) => { bac.trend.max = e.target.value; },
+  });
+
+  return el("div", { class: "bac-trend" },
+    el("div", { class: "section-head" },
+      el("h4", {}, "Trend log"),
+      bac.trend.recordCount
+        ? el("span", { class: "muted small" }, `${bac.trend.recordCount} records on device${bac.trend.truncated ? ` · showing ${recs.length}` : ""}`)
+        : null,
+    ),
+    el("div", { class: "action-row bac-trend-controls" },
+      el("label", { class: "nm-field bac-trend-field" },
+        el("span", { class: "nm-field-label" }, "Max records"), maxInput),
+      el("button", {
+        class: "btn btn-primary",
+        disabled: bac.trend.loading ? "disabled" : undefined,
+        onclick: bacReadTrend,
+      }, bac.trend.loading ? "Reading…" : "Read trend"),
+      el("button", {
+        class: "btn-ghost",
+        disabled: recs.length === 0 ? "disabled" : undefined,
+        onclick: bacExportTrend,
+      }, "Export CSV"),
+    ),
+    el("table", { class: "bac-table bac-trend-table" },
+      el("thead", {}, el("tr", {},
+        el("th", {}, "Timestamp"),
+        el("th", {}, "Value"),
+        el("th", {}, "Status"),
+      )),
+      el("tbody", {}, ...rows),
+    ),
+  );
 }
 
 function bacWritePanel() {
@@ -2622,6 +2739,7 @@ function renderBacnetPage() {
       )),
       el("tbody", { id: "bac-props-body" }, ...bacPropRows()),
     ),
+    bacObjectIsTrendLog(obj) ? bacTrendPanel() : null,
     bacWritePanel(),
   );
 
