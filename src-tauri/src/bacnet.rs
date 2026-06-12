@@ -160,6 +160,26 @@ struct Target {
     route: Option<(u16, Vec<u8>)>,
 }
 
+/// Accumulates a segmented ComplexAck reply across datagrams, keyed by invoke id.
+struct SegmentBuffer {
+    service: u8,
+    data: Vec<u8>,
+    /// The next in-order sequence number we expect.
+    next_seq: u8,
+}
+
+/// Granted segment window — how many segments the device may send before it must
+/// wait for our next SegmentACK. We still ack every in-order segment, so this is
+/// just the streaming depth.
+const SEGMENT_WINDOW: u8 = 16;
+
+/// Count of segmented replies successfully reassembled — for live verification.
+static SEGMENTED_REPLIES: AtomicUsize = AtomicUsize::new(0);
+
+/// Cap on a reassembled reply, so a misbehaving device can't grow the buffer
+/// without bound. 16 segments × 1476 ≈ 23 KB; allow generous headroom.
+const MAX_SEGMENTED_BYTES: usize = 256 * 1024;
+
 /// An active COV subscription, keyed by its subscriber-process id. Holds just
 /// enough to route incoming notifications back to the right device pane and to
 /// keep the subscription alive past its lifetime.
@@ -190,6 +210,8 @@ struct Client {
     pending: Mutex<HashMap<u8, (SocketAddr, mpsc::Sender<Outcome>)>>,
     next_invoke: Mutex<u8>,
     discovery: Mutex<Option<Discovery>>,
+    /// In-flight segmented-reply reassembly buffers, keyed by invoke id.
+    segments: Mutex<HashMap<u8, SegmentBuffer>>,
     cov: Mutex<HashMap<u32, CovEntry>>,
     next_process: Mutex<u32>,
     /// Bumped each time a device's objects are read; a detached name-enrichment
@@ -226,6 +248,7 @@ impl Client {
             pending: Mutex::new(HashMap::new()),
             next_invoke: Mutex::new(1),
             discovery: Mutex::new(None),
+            segments: Mutex::new(HashMap::new()),
             cov: Mutex::new(HashMap::new()),
             next_process: Mutex::new(1),
             objects_gen: AtomicUsize::new(0),
@@ -288,7 +311,87 @@ impl Client {
             ))
         })();
         self.pending.lock().unwrap().remove(&invoke_id);
+        // Drop any partial reassembly so a late stray segment can't seed a buffer
+        // that outlives the transaction.
+        self.segments.lock().unwrap().remove(&invoke_id);
         result
+    }
+
+    /// True when there's a pending transaction for `invoke_id` whose peer IP
+    /// matches `src` — used to gate accepting a segment.
+    fn pending_peer_matches(&self, invoke_id: u8, src: SocketAddr) -> bool {
+        self.pending
+            .lock()
+            .unwrap()
+            .get(&invoke_id)
+            .map(|(peer, _)| peer.ip() == src.ip())
+            .unwrap_or(false)
+    }
+
+    /// Feeds one segment of a segmented ComplexAck into reassembly: accumulates
+    /// in-order data, sends a SegmentACK, and on the final segment delivers the
+    /// reassembled `Outcome::Complex` to the waiting transaction. `route` carries
+    /// the source SNET/SADR so the ack reaches a routed device via its router.
+    fn handle_segment(
+        &self,
+        invoke_id: u8,
+        service: u8,
+        sequence: u8,
+        more: bool,
+        payload: &[u8],
+        src: SocketAddr,
+        route: Option<(u16, Vec<u8>)>,
+    ) {
+        // Only accept segments for a transaction we're actually running, from the
+        // peer that owns it.
+        if !self.pending_peer_matches(invoke_id, src) {
+            return;
+        }
+
+        let mut delivered: Option<Outcome> = None;
+        {
+            let mut bufs = self.segments.lock().unwrap();
+            let buf = bufs.entry(invoke_id).or_insert_with(|| SegmentBuffer {
+                service,
+                data: Vec::new(),
+                next_seq: 0,
+            });
+            if sequence == buf.next_seq {
+                if buf.data.len() + payload.len() > MAX_SEGMENTED_BYTES {
+                    // Runaway reply — abandon reassembly and fail the transaction.
+                    bufs.remove(&invoke_id);
+                    delivered = Some(Outcome::Failed("segmented reply exceeded size cap".into()));
+                } else {
+                    buf.data.extend_from_slice(payload);
+                    buf.next_seq = buf.next_seq.wrapping_add(1);
+                    if !more {
+                        let done = bufs.remove(&invoke_id).unwrap();
+                        SEGMENTED_REPLIES.fetch_add(1, Ordering::Relaxed);
+                        delivered = Some(Outcome::Complex { service: done.service, payload: done.data });
+                    }
+                }
+            }
+            // For an out-of-order/duplicate segment we fall through and just
+            // re-ack the last in-order sequence below, nudging a retransmit.
+        }
+
+        // Acknowledge everything received in order so far (the segment just below
+        // next_seq), granting the device a streaming window.
+        let ack_seq = {
+            let bufs = self.segments.lock().unwrap();
+            bufs.get(&invoke_id).map(|b| b.next_seq.wrapping_sub(1)).unwrap_or(sequence)
+        };
+        let seg_ack = codec::encode_segment_ack(false, false, invoke_id, ack_seq, SEGMENT_WINDOW);
+        let dest = route.as_ref().map(|(net, mac)| (*net, mac.as_slice()));
+        let mut npdu = codec::encode_npdu(false, dest);
+        npdu.extend_from_slice(&seg_ack);
+        let _ = self
+            .socket
+            .send_to(&codec::bvlc_encode(codec::BVLC_ORIGINAL_UNICAST, &npdu), src);
+
+        if let Some(outcome) = delivered {
+            self.complete(invoke_id, src, outcome);
+        }
     }
 
     /// Delivers a reply to the pending transaction for `invoke_id`, but only if
@@ -508,18 +611,27 @@ fn handle_frame(client: &Client, frame: &[u8], src: SocketAddr) {
             }
         }
         Apdu::SimpleAck { invoke_id, .. } => client.complete(invoke_id, effective_src, Outcome::Simple),
-        Apdu::ComplexAck { invoke_id, service, segmented, payload_offset } => {
-            let outcome = if segmented {
-                // We advertise no segmentation support; treat as a failure so
-                // callers fall back to smaller reads.
-                Outcome::Failed("device sent a segmented response".into())
-            } else {
-                Outcome::Complex {
+        Apdu::ComplexAck { invoke_id, service, segmented, more, sequence, payload_offset, .. } => {
+            let payload = apdu.get(payload_offset..).unwrap_or_default();
+            if segmented {
+                // Reassemble across datagrams, acking each segment back to the
+                // (possibly routed) source.
+                client.handle_segment(
+                    invoke_id,
                     service,
-                    payload: apdu.get(payload_offset..).unwrap_or_default().to_vec(),
-                }
-            };
-            client.complete(invoke_id, effective_src, outcome);
+                    sequence,
+                    more,
+                    payload,
+                    effective_src,
+                    npdu.source.clone(),
+                );
+            } else {
+                client.complete(
+                    invoke_id,
+                    effective_src,
+                    Outcome::Complex { service, payload: payload.to_vec() },
+                );
+            }
         }
         Apdu::Error { invoke_id, error_class, error_code, .. } => client.complete(
             invoke_id,
@@ -1841,6 +1953,65 @@ mod tests {
     }
 
     #[test]
+    fn read_property_reassembles_segmented_reply() {
+        // A device returns a ReadProperty-ACK split across 3 segments; the client
+        // must ack each and reassemble the full value.
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            let (frame, src) = recv_frame(&fake);
+            let bvlc = codec::bvlc_decode(&frame).unwrap();
+            let npdu = codec::decode_npdu(&frame[bvlc.payload_offset..]).unwrap();
+            let apdu = &frame[bvlc.payload_offset + npdu.apdu_offset..];
+            let Apdu::ConfirmedRequest { invoke_id, service, .. } = codec::decode_apdu(apdu).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(service, codec::SERVICE_READ_PROPERTY);
+
+            // The complete RP-ACK service data for AI-1 present-value = 72.0.
+            let body: Vec<u8> = {
+                let mut b = Vec::new();
+                codec::encode_context_object_id(&mut b, 0, ObjectId::new(0, 1));
+                codec::encode_context_unsigned(&mut b, 1, codec::PROP_PRESENT_VALUE as u64);
+                codec::encode_opening_tag(&mut b, 3);
+                codec::encode_application_value(&mut b, &BacnetValue::Real { value: 72.0 });
+                codec::encode_closing_tag(&mut b, 3);
+                b
+            };
+            // Split into 3 chunks.
+            let chunks: Vec<&[u8]> = vec![&body[0..5], &body[5..10], &body[10..]];
+            let send_segment = |seq: u8, more: bool, chunk: &[u8]| {
+                let mut octet0 = codec::PDU_COMPLEX_ACK | codec::APDU_FLAG_SEGMENTED;
+                if more {
+                    octet0 |= codec::APDU_FLAG_MORE;
+                }
+                let mut apdu = vec![octet0, invoke_id, seq, 16, codec::SERVICE_READ_PROPERTY];
+                apdu.extend_from_slice(chunk);
+                fake.send_to(&unicast_reply(&apdu), src).unwrap();
+            };
+            // Send each segment, waiting for the client's SegmentACK between them.
+            for (i, chunk) in chunks.iter().enumerate() {
+                let more = i + 1 < chunks.len();
+                send_segment(i as u8, more, chunk);
+                let (ack_frame, _) = recv_frame(&fake);
+                let ab = codec::bvlc_decode(&ack_frame).unwrap();
+                let an = codec::decode_npdu(&ack_frame[ab.payload_offset..]).unwrap();
+                let aapdu = &ack_frame[ab.payload_offset + an.apdu_offset..];
+                assert!(matches!(codec::decode_apdu(aapdu).unwrap(), Apdu::SegmentAck { .. }));
+            }
+        });
+
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let target = Target { sa: fake_addr, route: None };
+        let values =
+            read_property(&client, &target, ObjectId::new(0, 1), codec::PROP_PRESENT_VALUE, None)
+                .unwrap();
+        t.join().unwrap();
+        assert_eq!(values, vec![BacnetValue::Real { value: 72.0 }]);
+    }
+
+    #[test]
     fn read_property_rejects_wrong_object_reply() {
         // A device that answers with a DIFFERENT object than asked (the stale
         // reused-invoke-id case, same peer) must be rejected, not shown as the
@@ -2580,6 +2751,10 @@ mod tests {
         println!("full object-list one RP: {full_ok}/{n} (rest exercised indexed fallback)");
         println!("objects fully read:      {sampled} ({props} property values)");
         println!("priority-array reads:    {pa_ok} ok / {pa_err} err");
+        println!(
+            "segmented replies:       {} (reassembled across multiple datagrams)",
+            SEGMENTED_REPLIES.load(Ordering::Relaxed)
+        );
 
         let mut err_histo: HashMap<String, usize> = HashMap::new();
         for r in reports.iter() {

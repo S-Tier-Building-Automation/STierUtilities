@@ -54,10 +54,20 @@ pub const SERVICE_READ_PROPERTY: u8 = 12;
 pub const SERVICE_READ_PROPERTY_MULTIPLE: u8 = 14;
 pub const SERVICE_WRITE_PROPERTY: u8 = 15;
 
-/// `max-segments-accepted = unspecified, max-APDU-accepted = 1476` — the second
-/// octet of every confirmed request this client sends (we do not accept
-/// segmented responses; conformant devices abort instead, and callers fall back).
-pub const MAX_SEGS_MAX_APDU: u8 = 0x05;
+// Confirmed-request octet-0 flag bits (clause 20.1.2).
+/// SEG — this request is itself segmented (we never send segmented requests).
+pub const APDU_FLAG_SEGMENTED: u8 = 0x08;
+/// MOR — more segments follow.
+pub const APDU_FLAG_MORE: u8 = 0x04;
+/// SA — segmented-response-accepted: we can receive a segmented reply.
+pub const APDU_FLAG_SA: u8 = 0x02;
+
+/// Octet 1 of a confirmed request: `max-segments-accepted = 16` (code 4) in bits
+/// 6-4, `max-APDU-accepted = 1476` (code 5) in bits 3-0. Paired with the SA flag
+/// in octet 0, this tells a device it may segment a large reply to us (up to 16
+/// segments). Devices that can't fit a reply in one APDU now segment instead of
+/// aborting; the index-by-index / RPM-shrink fallbacks remain for ones that still do.
+pub const MAX_SEGS_MAX_APDU: u8 = 0x45;
 
 /// NPDU global-broadcast network number.
 pub const BROADCAST_NETWORK: u16 = 0xFFFF;
@@ -804,7 +814,18 @@ pub enum Apdu {
     ConfirmedRequest { invoke_id: u8, service: u8, payload_offset: usize },
     Unconfirmed { service: u8, payload_offset: usize },
     SimpleAck { invoke_id: u8, service: u8 },
-    ComplexAck { invoke_id: u8, service: u8, segmented: bool, payload_offset: usize },
+    ComplexAck {
+        invoke_id: u8,
+        service: u8,
+        segmented: bool,
+        /// More-follows: another segment is coming (only meaningful when segmented).
+        more: bool,
+        /// Segment sequence number (only meaningful when segmented).
+        sequence: u8,
+        /// Proposed window size (only meaningful when segmented).
+        window: u8,
+        payload_offset: usize,
+    },
     SegmentAck { invoke_id: u8 },
     Error { invoke_id: u8, service: u8, error_class: u32, error_code: u32 },
     Reject { invoke_id: u8, reason: u8 },
@@ -832,11 +853,25 @@ pub fn decode_apdu(buf: &[u8]) -> Result<Apdu, String> {
             service: *buf.get(2).ok_or_else(err_short)?,
         }),
         PDU_COMPLEX_ACK => {
-            let segmented = first & 0x08 != 0;
+            // [0]=type/flags [1]=invoke [if SEG: 2=seq 3=window] [n]=service [n+1..]=data
+            let segmented = first & APDU_FLAG_SEGMENTED != 0;
+            let more = first & APDU_FLAG_MORE != 0;
             let invoke_id = *buf.get(1).ok_or_else(err_short)?;
-            let svc_at = if segmented { 4 } else { 2 };
+            let (sequence, window, svc_at) = if segmented {
+                (*buf.get(2).ok_or_else(err_short)?, *buf.get(3).ok_or_else(err_short)?, 4)
+            } else {
+                (0, 0, 2)
+            };
             let service = *buf.get(svc_at).ok_or_else(err_short)?;
-            Ok(Apdu::ComplexAck { invoke_id, service, segmented, payload_offset: svc_at + 1 })
+            Ok(Apdu::ComplexAck {
+                invoke_id,
+                service,
+                segmented,
+                more,
+                sequence,
+                window,
+                payload_offset: svc_at + 1,
+            })
         }
         PDU_SEGMENT_ACK => Ok(Apdu::SegmentAck { invoke_id: *buf.get(1).ok_or_else(err_short)? }),
         PDU_ERROR => {
@@ -879,7 +914,24 @@ pub fn decode_apdu(buf: &[u8]) -> Result<Apdu, String> {
 }
 
 fn confirmed_header(invoke_id: u8, service: u8) -> Vec<u8> {
-    vec![PDU_CONFIRMED, MAX_SEGS_MAX_APDU, invoke_id, service]
+    // SA flag set so the device may segment a large reply back to us.
+    vec![PDU_CONFIRMED | APDU_FLAG_SA, MAX_SEGS_MAX_APDU, invoke_id, service]
+}
+
+/// Encodes a SegmentACK acknowledging segments up to `sequence`, granting the
+/// sender `window` more segments before the next ack. `negative` requests
+/// retransmission; `server` is set when we're the segment receiver of a
+/// confirmed *request* (always false for our client, which only receives
+/// segmented *responses*).
+pub fn encode_segment_ack(negative: bool, server: bool, invoke_id: u8, sequence: u8, window: u8) -> Vec<u8> {
+    let mut octet0 = PDU_SEGMENT_ACK;
+    if negative {
+        octet0 |= 0x02; // NAK
+    }
+    if server {
+        octet0 |= 0x01; // SRV
+    }
+    vec![octet0, invoke_id, sequence, window]
 }
 
 // ---------------------------------------------------------------------------
@@ -1886,11 +1938,13 @@ mod tests {
 
     #[test]
     fn read_property_request_reference_frame() {
-        // ReadProperty analog-input 1 present-value, invoke 1 (bacnet-stack rp.c).
+        // ReadProperty analog-input 1 present-value, invoke 1 (bacnet-stack rp.c
+        // body), with our header advertising segmentation acceptance (0x02 SA,
+        // 0x45 = 16 segs / max-APDU 1476).
         let apdu = encode_read_property(1, ObjectId::new(0, 1), PROP_PRESENT_VALUE, None);
         assert_eq!(
             apdu,
-            vec![0x00, 0x05, 0x01, 0x0C, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x19, 0x55]
+            vec![0x02, 0x45, 0x01, 0x0C, 0x0C, 0x00, 0x00, 0x00, 0x01, 0x19, 0x55]
         );
     }
 
@@ -1909,7 +1963,7 @@ mod tests {
             0x90, 0x00, 0x00, 0x3F,
         ];
         let parsed = decode_apdu(&apdu).unwrap();
-        let Apdu::ComplexAck { invoke_id, service, segmented, payload_offset } = parsed else {
+        let Apdu::ComplexAck { invoke_id, service, segmented, payload_offset, .. } = parsed else {
             panic!("expected complex ack");
         };
         assert_eq!((invoke_id, service, segmented), (1, SERVICE_READ_PROPERTY, false));
@@ -1950,7 +2004,7 @@ mod tests {
         assert_eq!(
             apdu,
             vec![
-                0x00, 0x05, 0x02, 0x0F, 0x0C, 0x00, 0x80, 0x00, 0x01, 0x19, 0x55, 0x3E,
+                0x02, 0x45, 0x02, 0x0F, 0x0C, 0x00, 0x80, 0x00, 0x01, 0x19, 0x55, 0x3E,
                 0x44, 0x42, 0x90, 0x00, 0x00, 0x3F, 0x49, 0x08
             ]
         );
@@ -1999,13 +2053,23 @@ mod tests {
 
     #[test]
     fn segmented_complex_ack_flagged() {
-        // SEG bit set: [0x38][invoke][seq][window][service]...
-        let parsed = decode_apdu(&[0x38, 0x09, 0x00, 0x01, 0x0C]).unwrap();
-        let Apdu::ComplexAck { segmented, invoke_id, service, .. } = parsed else {
+        // SEG+MOR set: [0x3C][invoke][seq=0][window=1][service]...
+        let parsed = decode_apdu(&[0x3C, 0x09, 0x00, 0x01, 0x0C, 0xAB]).unwrap();
+        let Apdu::ComplexAck { segmented, more, sequence, window, invoke_id, service, payload_offset } = parsed
+        else {
             panic!("expected complex ack");
         };
-        assert!(segmented);
-        assert_eq!((invoke_id, service), (9, SERVICE_READ_PROPERTY));
+        assert!(segmented && more);
+        assert_eq!((invoke_id, service, sequence, window), (9, SERVICE_READ_PROPERTY, 0, 1));
+        assert_eq!(payload_offset, 5);
+    }
+
+    #[test]
+    fn segment_ack_encode() {
+        // Ack segments up to seq 2, grant window 8 to a response we're receiving.
+        assert_eq!(encode_segment_ack(false, false, 5, 2, 8), vec![0x40, 5, 2, 8]);
+        // Negative ack (request retransmit) sets the NAK bit.
+        assert_eq!(encode_segment_ack(true, false, 5, 2, 8), vec![0x42, 5, 2, 8]);
     }
 
     #[test]
@@ -2024,7 +2088,7 @@ mod tests {
             },
         ];
         let apdu = encode_read_property_multiple(7, &specs);
-        assert_eq!(&apdu[..4], &[0x00, 0x05, 0x07, 0x0E]);
+        assert_eq!(&apdu[..4], &[0x02, 0x45, 0x07, 0x0E]);
 
         // Build the matching ACK: AI-1 name + value, device object-list[0] error.
         let mut payload = Vec::new();
@@ -2072,7 +2136,7 @@ mod tests {
         assert_eq!(
             apdu,
             vec![
-                0x00, 0x05, 0x01, 0x05, // confirmed, max-seg/apdu, invoke 1, SubscribeCOV
+                0x02, 0x45, 0x01, 0x05, // confirmed+SA, max-seg/apdu, invoke 1, SubscribeCOV
                 0x09, 0x01, // context 0 unsigned 1 (process id)
                 0x1C, 0x00, 0x00, 0x00, 0x00, // context 1 object-id AI-0
                 0x29, 0x01, // context 2 boolean true (confirmed)
@@ -2087,7 +2151,7 @@ mod tests {
         // process 7, object AV-5, then nothing else.
         assert_eq!(
             apdu,
-            vec![0x00, 0x05, 0x02, 0x05, 0x09, 0x07, 0x1C, 0x00, 0x80, 0x00, 0x05]
+            vec![0x02, 0x45, 0x02, 0x05, 0x09, 0x07, 0x1C, 0x00, 0x80, 0x00, 0x05]
         );
     }
 
