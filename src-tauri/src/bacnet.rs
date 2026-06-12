@@ -184,12 +184,18 @@ struct SegmentBuffer {
     data: Vec<u8>,
     /// The next in-order sequence number we expect.
     next_seq: u8,
+    /// Segments accepted so far (bounds round-trips independent of total bytes).
+    count: usize,
 }
 
 /// Granted segment window — how many segments the device may send before it must
 /// wait for our next SegmentACK. We still ack every in-order segment, so this is
 /// just the streaming depth.
 const SEGMENT_WINDOW: u8 = 16;
+
+/// Max segments accepted in one reply. We advertise 16; allow slack for
+/// retransmits but refuse a device that streams far past the contract.
+const MAX_SEGMENTS: usize = 64;
 
 /// Count of segmented replies successfully reassembled — for live verification.
 static SEGMENTED_REPLIES: AtomicUsize = AtomicUsize::new(0);
@@ -346,6 +352,17 @@ impl Client {
             .unwrap_or(false)
     }
 
+    /// Sends a positive SegmentACK for `sequence` to `src` (routed-aware).
+    fn send_segment_ack(&self, invoke_id: u8, sequence: u8, src: SocketAddr, route: &Option<(u16, Vec<u8>)>) {
+        let seg_ack = codec::encode_segment_ack(false, false, invoke_id, sequence, SEGMENT_WINDOW);
+        let dest = route.as_ref().map(|(net, mac)| (*net, mac.as_slice()));
+        let mut npdu = codec::encode_npdu(false, dest);
+        npdu.extend_from_slice(&seg_ack);
+        let _ = self
+            .socket
+            .send_to(&codec::bvlc_encode(codec::BVLC_ORIGINAL_UNICAST, &npdu), src);
+    }
+
     /// Feeds one segment of a segmented ComplexAck into reassembly: accumulates
     /// in-order data, sends a SegmentACK, and on the final segment delivers the
     /// reassembled `Outcome::Complex` to the waiting transaction. `route` carries
@@ -366,49 +383,65 @@ impl Client {
             return;
         }
 
-        let mut delivered: Option<Outcome> = None;
-        {
+        enum Step {
+            /// Ack `sequence` and keep waiting.
+            Ack(u8),
+            /// Ack `sequence` and deliver the reassembled reply.
+            Deliver(u8, Outcome),
+            /// Abandon the transaction WITHOUT acking the offending segment.
+            Fail(String),
+            /// Ignore (out of order before we've received anything).
+            Drop,
+        }
+
+        let step = {
             let mut bufs = self.segments.lock().unwrap();
             let buf = bufs.entry(invoke_id).or_insert_with(|| SegmentBuffer {
                 service,
                 data: Vec::new(),
                 next_seq: 0,
+                count: 0,
             });
             if sequence == buf.next_seq {
-                if buf.data.len() + payload.len() > MAX_SEGMENTED_BYTES {
-                    // Runaway reply — abandon reassembly and fail the transaction.
+                if buf.count + 1 > MAX_SEGMENTS {
                     bufs.remove(&invoke_id);
-                    delivered = Some(Outcome::Failed("segmented reply exceeded size cap".into()));
+                    Step::Fail(format!("segmented reply exceeded {MAX_SEGMENTS} segments"))
+                } else if buf.data.len() + payload.len() > MAX_SEGMENTED_BYTES {
+                    bufs.remove(&invoke_id);
+                    Step::Fail("segmented reply exceeded size cap".into())
                 } else {
                     buf.data.extend_from_slice(payload);
                     buf.next_seq = buf.next_seq.wrapping_add(1);
-                    if !more {
+                    buf.count += 1;
+                    if more {
+                        Step::Ack(sequence)
+                    } else {
                         let done = bufs.remove(&invoke_id).unwrap();
                         SEGMENTED_REPLIES.fetch_add(1, Ordering::Relaxed);
-                        delivered = Some(Outcome::Complex { service: done.service, payload: done.data });
+                        Step::Deliver(sequence, Outcome::Complex { service: done.service, payload: done.data })
                     }
                 }
+            } else if buf.next_seq > 0 {
+                // Out of order, but we have in-order data: re-ack the last good
+                // sequence (a valid number) to nudge a retransmit.
+                Step::Ack(buf.next_seq.wrapping_sub(1))
+            } else {
+                // Out of order before segment 0 arrived — don't ack a sequence we
+                // never received (that would falsely confirm it); let the device
+                // retransmit from the start on its own timer.
+                Step::Drop
             }
-            // For an out-of-order/duplicate segment we fall through and just
-            // re-ack the last in-order sequence below, nudging a retransmit.
-        }
-
-        // Acknowledge everything received in order so far (the segment just below
-        // next_seq), granting the device a streaming window.
-        let ack_seq = {
-            let bufs = self.segments.lock().unwrap();
-            bufs.get(&invoke_id).map(|b| b.next_seq.wrapping_sub(1)).unwrap_or(sequence)
         };
-        let seg_ack = codec::encode_segment_ack(false, false, invoke_id, ack_seq, SEGMENT_WINDOW);
-        let dest = route.as_ref().map(|(net, mac)| (*net, mac.as_slice()));
-        let mut npdu = codec::encode_npdu(false, dest);
-        npdu.extend_from_slice(&seg_ack);
-        let _ = self
-            .socket
-            .send_to(&codec::bvlc_encode(codec::BVLC_ORIGINAL_UNICAST, &npdu), src);
 
-        if let Some(outcome) = delivered {
-            self.complete(invoke_id, src, outcome);
+        match step {
+            Step::Ack(seq) => self.send_segment_ack(invoke_id, seq, src, &route),
+            Step::Deliver(seq, outcome) => {
+                self.send_segment_ack(invoke_id, seq, src, &route);
+                self.complete(invoke_id, src, outcome);
+            }
+            // Fail locally without acking the abandoned segment.
+            Step::Fail(e) => self.complete(invoke_id, src, Outcome::Failed(e)),
+            Step::Drop => {}
         }
     }
 
@@ -1604,9 +1637,24 @@ fn format_log_timestamp(rec: &codec::LogRecord) -> String {
     format!("{d} {t}").trim().to_string()
 }
 
-/// Reads recent records from a trend log's `log-buffer`. Reads `record-count`
-/// first, then pages forward from the oldest wanted position in `TREND_CHUNK`
-/// batches (so even un-segmented 480-byte devices answer), up to `max_records`.
+fn to_trend_records(recs: &[codec::LogRecord]) -> Vec<TrendRecord> {
+    recs.iter()
+        .map(|r| TrendRecord {
+            timestamp: format_log_timestamp(r),
+            value: render_value(&r.datum),
+            status: r.status.clone().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Reads the most-recent records from a trend log's `log-buffer`, returned in
+/// chronological order. With a known `record-count` it pages BACKWARD from the
+/// newest position using negative ReadRange counts, so an unknown or stale count
+/// can't make it return the oldest records or drop the newest. When the device
+/// omits `record-count` it reads forward (bounded) and keeps the newest `want`.
+/// Records come in `TREND_CHUNK` batches so even un-segmented 480-byte devices
+/// answer. (byPosition is inherently relative to current buffer contents;
+/// bySequenceNumber would be fully race-proof and is a future enhancement.)
 fn read_trend_core(
     client: &Client,
     target: &Target,
@@ -1615,7 +1663,7 @@ fn read_trend_core(
 ) -> Result<TrendResult, String> {
     let want = max_records.clamp(1, TREND_MAX);
 
-    // How many records exist? (best-effort — some devices omit record-count).
+    // How many records exist? (best-effort — some devices omit record-count.)
     let total = match read_property(client, target, object, codec::PROP_RECORD_COUNT, None) {
         Ok(values) => match values.first() {
             Some(BacnetValue::Unsigned { value }) => *value as u32,
@@ -1624,39 +1672,69 @@ fn read_trend_core(
         Err(_) => 0,
     };
 
-    // Start position: the oldest record we want (1-based). If total is unknown,
-    // start at 1 and rely on the result flags to stop.
-    let start = if total > want { total - want + 1 } else { 1 };
-
-    let mut records = Vec::new();
-    let mut pos = start;
+    let mut records: Vec<TrendRecord> = Vec::new();
     let mut truncated = false;
-    let mut guard = 0u32;
-    loop {
-        if records.len() as u32 >= want {
+    let max_iters = want / TREND_CHUNK as u32 + 4;
+
+    if total > 0 {
+        // Backward paging from the newest record (negative count ends at `anchor`).
+        let mut anchor = total;
+        let mut guard = 0u32;
+        while (records.len() as u32) < want && anchor >= 1 {
+            guard += 1;
+            if guard > max_iters {
+                break;
+            }
+            let remaining = want as usize - records.len();
+            let chunk = remaining.min(TREND_CHUNK as usize) as i32;
+            let ack = read_range_core(client, target, object, anchor, -chunk)?;
+            let mut batch = to_trend_records(&codec::decode_log_records(&ack.item_data));
+            let got = batch.len() as u32;
+            if got == 0 {
+                break;
+            }
+            // This batch is older than what we've collected — prepend to keep
+            // the overall order chronological (ascending).
+            batch.extend(records.drain(..));
+            records = batch;
+            if ack.first_item || got >= anchor {
+                break;
+            }
+            anchor -= got;
+        }
+        truncated = total > records.len() as u32;
+    } else {
+        // Unknown count: read forward (bounded), keep the newest `want`.
+        let mut pos = 1u32;
+        let mut guard = 0u32;
+        loop {
+            if records.len() >= TREND_MAX as usize {
+                truncated = true;
+                break;
+            }
+            guard += 1;
+            if guard > TREND_MAX / TREND_CHUNK as u32 + 4 {
+                break;
+            }
+            let ack = read_range_core(client, target, object, pos, TREND_CHUNK)?;
+            let batch = to_trend_records(&codec::decode_log_records(&ack.item_data));
+            let got = batch.len() as u32;
+            if got == 0 {
+                break;
+            }
+            records.extend(batch);
+            if ack.last_item {
+                break;
+            }
+            pos += got;
+        }
+        if records.len() > want as usize {
+            // Keep the newest `want` (drop from the front).
+            let excess = records.len() - want as usize;
+            records.drain(0..excess);
             truncated = true;
-            break;
         }
-        guard += 1;
-        if guard > (want / TREND_CHUNK as u32) + 4 {
-            break; // safety: never loop unbounded
-        }
-        let ack = read_range_core(client, target, object, pos, TREND_CHUNK)?;
-        let batch = codec::decode_log_records(&ack.item_data);
-        let got = batch.len() as u32;
-        for rec in batch {
-            records.push(TrendRecord {
-                timestamp: format_log_timestamp(&rec),
-                value: render_value(&rec.datum),
-                status: rec.status.clone().unwrap_or_default(),
-            });
-        }
-        if got == 0 || ack.last_item || !ack.more_items {
-            break;
-        }
-        pos += got;
     }
-    records.truncate(want as usize);
 
     Ok(TrendResult {
         object_type: object.object_type,
@@ -2148,6 +2226,45 @@ mod tests {
                 .unwrap();
         t.join().unwrap();
         assert_eq!(values, vec![BacnetValue::Real { value: 72.0 }]);
+    }
+
+    #[test]
+    fn segment_out_of_order_before_first_is_not_acked() {
+        // An out-of-order segment arriving before sequence 0 must be dropped, not
+        // positively acked (which would falsely confirm a never-received segment).
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let peer: SocketAddr = "127.0.0.1:47808".parse().unwrap();
+        let (tx, _rx) = mpsc::channel();
+        client.pending.lock().unwrap().insert(9, (peer, tx));
+        // Feed segment seq=3 first (peer matches, but next_seq is 0).
+        client.handle_segment(9, codec::SERVICE_READ_PROPERTY, 3, true, &[0xAA], peer, None);
+        // The out-of-order segment must NOT be accepted: the buffer (if present)
+        // still expects sequence 0 with no data — proving the Drop branch ran and
+        // no false ack for sequence 255 was emitted.
+        let bufs = client.segments.lock().unwrap();
+        if let Some(b) = bufs.get(&9) {
+            assert_eq!(b.next_seq, 0);
+            assert!(b.data.is_empty());
+            assert_eq!(b.count, 0);
+        }
+    }
+
+    #[test]
+    fn segment_count_cap_fails_without_acking() {
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let peer: SocketAddr = "127.0.0.1:47808".parse().unwrap();
+        let (tx, rx) = mpsc::channel();
+        client.pending.lock().unwrap().insert(4, (peer, tx));
+        // Pre-seed a buffer already at the cap so the next in-order segment trips it.
+        let seq = MAX_SEGMENTS as u8; // next expected sequence after `count` segments
+        client.segments.lock().unwrap().insert(
+            4,
+            SegmentBuffer { service: codec::SERVICE_READ_PROPERTY, data: vec![0; 10], next_seq: seq, count: MAX_SEGMENTS },
+        );
+        client.handle_segment(4, codec::SERVICE_READ_PROPERTY, seq, true, &[0xBB], peer, None);
+        // Transaction failed locally and the buffer was dropped.
+        assert!(!client.segments.lock().unwrap().contains_key(&4));
+        assert!(matches!(rx.try_recv(), Ok(Outcome::Failed(_))));
     }
 
     #[test]
