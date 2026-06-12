@@ -407,10 +407,10 @@ pub fn decode_application_value(buf: &[u8]) -> Result<(BacnetValue, usize), Stri
         return Ok((BacnetValue::Boolean { value: tag.lvt == 1 }, tag.header_len));
     }
     let len = tag.lvt as usize;
-    let content = buf
-        .get(tag.header_len..tag.header_len + len)
-        .ok_or_else(err_short)?;
-    let consumed = tag.header_len + len;
+    // checked_add so a hostile/huge length field can't overflow the index math
+    // (would only bite a 32-bit usize, but this is untrusted network input).
+    let consumed = tag.header_len.checked_add(len).ok_or_else(err_short)?;
+    let content = buf.get(tag.header_len..consumed).ok_or_else(err_short)?;
 
     let value = match tag.number {
         TAG_NULL => BacnetValue::Null,

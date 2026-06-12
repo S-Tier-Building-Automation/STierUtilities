@@ -811,7 +811,7 @@ a:hover { text-decoration: underline; }
 .bac-props-pane { min-width: 0; }
 .bac-props-table { margin-bottom: 12px; }
 .bac-prop-name { color: var(--text-dim); white-space: nowrap; }
-.bac-prop-value { word-break: break-word; }
+.bac-prop-value { overflow-wrap: break-word; }
 .bac-prop-error .bac-prop-value { color: var(--warn); }
 
 .bac-write { border-top: 1px solid var(--border); padding-top: 12px; }

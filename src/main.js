@@ -1899,17 +1899,24 @@ async function bacSelectDevice(key) {
   bac.objectsProgress = null;
   renderAll();
   try {
-    bac.objects = await invoke("bacnet_read_objects", {
+    const objects = await invoke("bacnet_read_objects", {
       device: bacDeviceRef(dev),
       deviceInstance: dev.instance,
     });
+    // A faster click may have switched devices while this was in flight; don't
+    // overwrite the newer selection with stale results.
+    if (bac.selectedDeviceKey !== key) return;
+    bac.objects = objects;
     logTo("bacnet", `Read ${bac.objects.length} objects from ${bacDeviceLabel(dev)}.`, "ok");
   } catch (err) {
+    if (bac.selectedDeviceKey !== key) return;
     logTo("bacnet", `Object list failed for ${bacDeviceLabel(dev)}: ${err}`, "error");
   } finally {
-    bac.objectsLoading = false;
-    bac.objectsProgress = null;
-    renderAll();
+    if (bac.selectedDeviceKey === key) {
+      bac.objectsLoading = false;
+      bac.objectsProgress = null;
+      renderAll();
+    }
   }
 }
 
@@ -1924,16 +1931,22 @@ async function bacSelectObject(key) {
   bac.propsLoading = true;
   renderAll();
   try {
-    bac.props = await invoke("bacnet_read_properties", {
+    const props = await invoke("bacnet_read_properties", {
       device: bacDeviceRef(dev),
       objectType: obj.objectType,
       instance: obj.instance,
     });
+    // Guard against a newer object selection resolving first.
+    if (bac.selectedObjectKey !== key) return;
+    bac.props = props;
   } catch (err) {
+    if (bac.selectedObjectKey !== key) return;
     logTo("bacnet", `Property read failed for ${obj.typeName}:${obj.instance}: ${err}`, "error");
   } finally {
-    bac.propsLoading = false;
-    renderAll();
+    if (bac.selectedObjectKey === key) {
+      bac.propsLoading = false;
+      renderAll();
+    }
   }
 }
 
@@ -2015,6 +2028,11 @@ function bacApplyCovUpdate(values) {
 function bacBuildWriteValue() {
   const kind = bac.write.kind;
   const raw = bac.write.value.trim();
+  // An empty field must never silently become 0 — writing 0 to a live setpoint
+  // is dangerous. Only Null (no value) and an intentional empty string are ok.
+  if (raw === "" && kind !== "null" && kind !== "characterString") {
+    throw new Error("Enter a value to write.");
+  }
   const safeInt = (allowNegative) => {
     const v = Number(raw);
     if (!Number.isInteger(v) || (!allowNegative && v < 0)) {
