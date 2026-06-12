@@ -1,3 +1,7 @@
+// BACnet/IP is plain UDP — portable, so not Windows-gated like the others.
+mod bacnet;
+mod bacnet_codec;
+
 #[cfg(windows)]
 mod clipboardtyper;
 #[cfg(windows)]
@@ -50,6 +54,11 @@ pub fn run() {
         networkmanager::networkmanager_open_profiles_dir,
         networkmanager::networkmanager_apply_profile,
         netscan::netscan_scan,
+        bacnet::bacnet_discover,
+        bacnet::bacnet_read_objects,
+        bacnet::bacnet_read_properties,
+        bacnet::bacnet_read_property,
+        bacnet::bacnet_write_property,
     ]);
 
     builder

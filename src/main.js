@@ -53,6 +53,22 @@ const TOOLS = [
     renderStatusPill: nmStatusPill,
     renderPage: renderNetworkManagerPage,
   },
+  {
+    id: "bacnet",
+    name: "BACnet Explorer",
+    emoji: "🏢",
+    tagline: "Discover BACnet/IP devices, browse objects, read & write points.",
+    description:
+      "A YABE-style BACnet/IP management tool. Broadcast a Who-Is to discover " +
+      "devices (including ones behind BACnet routers), browse each device's " +
+      "object list, read every property of a point, and write present-value " +
+      "with a command priority — including relinquishing a slot by writing " +
+      "Null. Uses an ephemeral UDP port, so it coexists with Niagara or any " +
+      "other BACnet stack running on this machine.",
+    repo: "https://github.com/S-Tier-Building-Automation/STierUtilities",
+    renderStatusPill: bacStatusPill,
+    renderPage: renderBacnetPage,
+  },
 ];
 
 function toolById(id) { return TOOLS.find((t) => t.id === id); }
@@ -1735,6 +1751,621 @@ function renderNetworkManagerPage() {
   );
 }
 
+
+// ============================================================================
+// BACnet Explorer (status pill + page)
+// ============================================================================
+
+let bac = {
+  discovering: false,
+  devices: [],            // BacnetDevice[] from the backend (key, address, instance, …)
+  selectedDeviceKey: null,
+  objects: [],            // BacnetObject[] for the selected device
+  objectsLoading: false,
+  objectsProgress: null,  // { done, total } during index-by-index walks
+  objectFilter: "",
+  selectedObjectKey: null, // "type:instance"
+  props: [],              // PropertyEntry[] for the selected object
+  propsLoading: false,
+  write: { propertyId: "85", kind: "real", value: "", priority: "", arrayIndex: "" },
+  target: "255.255.255.255",
+  lowLimit: "",
+  highLimit: "",
+  listenersReady: false,
+};
+
+function bacStatusPill() {
+  if (bac.discovering) return { label: "Discovering…", cls: "pill-running" };
+  const n = bac.devices.length;
+  if (n === 0) return { label: "Idle", cls: "pill-idle" };
+  return { label: `${n} device${n === 1 ? "" : "s"}`, cls: "pill-muted" };
+}
+
+function bacSelectedDevice() {
+  return bac.devices.find((d) => d.key === bac.selectedDeviceKey) || null;
+}
+
+// The DeviceRef the backend needs to reach a device (router addressing included).
+function bacDeviceRef(d) {
+  return { address: d.address, network: d.network ?? null, mac: d.mac ?? null };
+}
+
+function bacObjectKey(o) { return `${o.objectType}:${o.instance}`; }
+
+function bacSelectedObject() {
+  return bac.objects.find((o) => bacObjectKey(o) === bac.selectedObjectKey) || null;
+}
+
+function bacDeviceLabel(d) {
+  const route = d.network != null ? ` · net ${d.network}` : "";
+  return `${d.name || `device ${d.instance}`} (${d.instance})${route}`;
+}
+
+// ---- events ----
+
+function bacEnsureListeners() {
+  if (bac.listenersReady) return;
+  bac.listenersReady = true;
+  listen("bacnet:device", (e) => {
+    const d = e.payload;
+    if (!bac.devices.some((x) => x.key === d.key)) bac.devices.push(d);
+    bacScheduleDevicesRender();
+  });
+  listen("bacnet:device_update", (e) => {
+    const d = e.payload;
+    const i = bac.devices.findIndex((x) => x.key === d.key);
+    if (i >= 0) bac.devices[i] = d;
+    else bac.devices.push(d);
+    bacScheduleDevicesRender();
+  });
+  listen("bacnet:objects_progress", (e) => {
+    bac.objectsProgress = e.payload;
+    const node = document.getElementById("bac-objects-status");
+    if (node) node.textContent = `Walking object-list… ${e.payload.done}/${e.payload.total}`;
+  });
+  listen("bacnet:object_names", (e) => {
+    // Names stream from a detached pass; ignore batches for a device we've
+    // already navigated away from.
+    if (!e.payload || e.payload.deviceKey !== bac.selectedDeviceKey) return;
+    const map = new Map((e.payload.names || []).map((x) => [x.key, x.name]));
+    for (const o of bac.objects) {
+      const n = map.get(bacObjectKey(o));
+      if (n) o.name = n;
+    }
+    bacApplyObjectFilter();
+  });
+}
+
+// ---- actions ----
+
+async function bacDiscover() {
+  if (bac.discovering) return;
+  bacEnsureListeners();
+  bac.discovering = true;
+  bac.devices = [];
+  bac.selectedDeviceKey = null;
+  bac.objects = [];
+  bac.selectedObjectKey = null;
+  bac.props = [];
+  renderAll();
+  const low = parseInt(bac.lowLimit, 10);
+  const high = parseInt(bac.highLimit, 10);
+  try {
+    const devices = await invoke("bacnet_discover", {
+      target: bac.target.trim() || null,
+      lowLimit: Number.isFinite(low) ? low : null,
+      highLimit: Number.isFinite(high) ? high : null,
+      durationMs: null,
+    });
+    bac.devices = devices;
+    logTo("bacnet", `Discovery finished — ${devices.length} device${devices.length === 1 ? "" : "s"}.`, devices.length ? "ok" : "warn");
+  } catch (err) {
+    logTo("bacnet", `Discovery failed: ${err}`, "error");
+  } finally {
+    bac.discovering = false;
+    renderAll();
+  }
+}
+
+async function bacSelectDevice(key) {
+  if (bac.selectedDeviceKey === key) return;
+  bac.selectedDeviceKey = key;
+  bac.objects = [];
+  bac.selectedObjectKey = null;
+  bac.props = [];
+  bac.objectFilter = "";
+  const dev = bacSelectedDevice();
+  if (!dev) { renderAll(); return; }
+  bac.objectsLoading = true;
+  bac.objectsProgress = null;
+  renderAll();
+  try {
+    bac.objects = await invoke("bacnet_read_objects", {
+      device: bacDeviceRef(dev),
+      deviceInstance: dev.instance,
+    });
+    logTo("bacnet", `Read ${bac.objects.length} objects from ${bacDeviceLabel(dev)}.`, "ok");
+  } catch (err) {
+    logTo("bacnet", `Object list failed for ${bacDeviceLabel(dev)}: ${err}`, "error");
+  } finally {
+    bac.objectsLoading = false;
+    bac.objectsProgress = null;
+    renderAll();
+  }
+}
+
+async function bacSelectObject(key) {
+  bac.selectedObjectKey = key;
+  bac.props = [];
+  const dev = bacSelectedDevice();
+  const obj = bacSelectedObject();
+  if (!dev || !obj) { renderAll(); return; }
+  bac.propsLoading = true;
+  renderAll();
+  try {
+    bac.props = await invoke("bacnet_read_properties", {
+      device: bacDeviceRef(dev),
+      objectType: obj.objectType,
+      instance: obj.instance,
+    });
+  } catch (err) {
+    logTo("bacnet", `Property read failed for ${obj.typeName}:${obj.instance}: ${err}`, "error");
+  } finally {
+    bac.propsLoading = false;
+    renderAll();
+  }
+}
+
+async function bacRefreshProps() {
+  const key = bac.selectedObjectKey;
+  bac.selectedObjectKey = null; // force re-select to re-read
+  await bacSelectObject(key);
+}
+
+// Builds the typed value payload the backend expects ({ kind, ... }).
+function bacBuildWriteValue() {
+  const kind = bac.write.kind;
+  const raw = bac.write.value.trim();
+  switch (kind) {
+    case "null": return { kind: "null" };
+    case "real": {
+      const v = Number(raw);
+      if (!Number.isFinite(v)) throw new Error(`"${raw}" is not a number`);
+      return { kind: "real", value: v };
+    }
+    case "unsigned": {
+      const v = Number(raw);
+      if (!Number.isInteger(v) || v < 0) throw new Error(`"${raw}" is not a non-negative integer`);
+      return { kind: "unsigned", value: v };
+    }
+    case "signed": {
+      const v = Number(raw);
+      if (!Number.isInteger(v)) throw new Error(`"${raw}" is not an integer`);
+      return { kind: "signed", value: v };
+    }
+    case "enumerated": {
+      const v = Number(raw);
+      if (!Number.isInteger(v) || v < 0) throw new Error(`"${raw}" is not a non-negative integer`);
+      return { kind: "enumerated", value: v };
+    }
+    case "boolean": {
+      const t = raw.toLowerCase();
+      if (!["true", "false", "1", "0", "active", "inactive"].includes(t)) {
+        throw new Error(`"${raw}" is not a boolean (use true/false)`);
+      }
+      return { kind: "boolean", value: t === "true" || t === "1" || t === "active" };
+    }
+    case "characterString": return { kind: "characterString", value: bac.write.value };
+    default: throw new Error(`unsupported type ${kind}`);
+  }
+}
+
+async function bacWrite(relinquish = false) {
+  const dev = bacSelectedDevice();
+  const obj = bacSelectedObject();
+  if (!dev || !obj) return;
+  const propertyId = parseInt(bac.write.propertyId, 10);
+  if (!Number.isInteger(propertyId)) {
+    logTo("bacnet", "Pick a property number to write.", "warn");
+    return;
+  }
+  const priority = bac.write.priority === "" ? null : parseInt(bac.write.priority, 10);
+  if (relinquish && priority == null) {
+    logTo("bacnet", "Relinquish needs a priority (the slot to release).", "warn");
+    return;
+  }
+  const arrayIndex = bac.write.arrayIndex === "" ? null : parseInt(bac.write.arrayIndex, 10);
+  let value;
+  try {
+    value = relinquish ? { kind: "null" } : bacBuildWriteValue();
+  } catch (err) {
+    logTo("bacnet", `Invalid value: ${err.message}`, "warn");
+    return;
+  }
+  const what = relinquish
+    ? `relinquish p${priority}`
+    : `write ${JSON.stringify(value)}${priority != null ? ` @ p${priority}` : ""}`;
+  try {
+    await invoke("bacnet_write_property", {
+      device: bacDeviceRef(dev),
+      objectType: obj.objectType,
+      instance: obj.instance,
+      property: propertyId,
+      value,
+      priority,
+      arrayIndex,
+    });
+    logTo("bacnet", `OK — ${what} on ${obj.typeName}:${obj.instance}.`, "ok");
+    await bacRefreshProps();
+  } catch (err) {
+    logTo("bacnet", `Write failed on ${obj.typeName}:${obj.instance}: ${err}`, "error");
+  }
+}
+
+// ---- live render helpers (in-place, no focus stealing) ----
+
+// Coalesce bursts of device events (hundreds can arrive in one discovery
+// window) into at most ~7 table rebuilds per second.
+let bacDevicesRenderTimer = null;
+function bacScheduleDevicesRender() {
+  if (bacDevicesRenderTimer) return;
+  bacDevicesRenderTimer = setTimeout(() => {
+    bacDevicesRenderTimer = null;
+    bacRenderDevicesLive();
+  }, 150);
+}
+
+function bacRenderDevicesLive() {
+  if (currentPluginId() !== "bacnet") return;
+  const body = document.getElementById("bac-device-rows");
+  if (body) body.replaceChildren(...bacDeviceRows());
+  const count = document.getElementById("bac-device-count");
+  if (count) count.textContent = bacDeviceCountText();
+}
+
+function bacDeviceCountText() {
+  const n = bac.devices.length;
+  if (bac.discovering) return `Listening… ${n} device${n === 1 ? "" : "s"} so far`;
+  return `${n} device${n === 1 ? "" : "s"}`;
+}
+
+function bacFilteredObjects() {
+  const q = bac.objectFilter.trim().toLowerCase();
+  if (!q) return bac.objects;
+  return bac.objects.filter((o) =>
+    o.name.toLowerCase().includes(q) ||
+    o.typeName.toLowerCase().includes(q) ||
+    String(o.instance).includes(q));
+}
+
+function bacApplyObjectFilter() {
+  if (currentPluginId() !== "bacnet") return;
+  const list = document.getElementById("bac-object-list");
+  if (list) list.replaceChildren(...bacObjectRows());
+  const count = document.getElementById("bac-object-count");
+  if (count) count.textContent = bacObjectCountText();
+}
+
+function bacObjectCountText() {
+  const total = bac.objects.length;
+  if (!bac.objectFilter.trim()) return `${total} object${total === 1 ? "" : "s"}`;
+  return `${bacFilteredObjects().length} of ${total} shown`;
+}
+
+// ---- render ----
+
+function bacDeviceRows() {
+  if (bac.devices.length === 0) {
+    const msg = bac.discovering ? "Listening for I-Am replies…" : "No devices yet — run Discover.";
+    return [el("tr", {}, el("td", { class: "muted small", colspan: "6" }, msg))];
+  }
+  return bac.devices.map((d) => {
+    const active = d.key === bac.selectedDeviceKey;
+    return el("tr", {
+      class: `bac-device-row ${active ? "bac-row-active" : ""}`,
+      onclick: () => bacSelectDevice(d.key),
+    },
+      el("td", { class: "bac-num" }, String(d.instance)),
+      el("td", {}, d.name || el("span", { class: "muted" }, "—")),
+      el("td", { class: "bac-mono" },
+        d.network != null ? `${d.address} → net ${d.network}/${d.mac || "?"}` : d.address),
+      el("td", {}, d.vendorName || (d.vendorId ? `vendor ${d.vendorId}` : "—")),
+      el("td", {}, d.modelName || el("span", { class: "muted" }, "—")),
+      el("td", { class: "bac-num" }, `${d.maxApdu} · ${d.segmentation}`),
+    );
+  });
+}
+
+function bacObjectRows() {
+  const objects = bacFilteredObjects();
+  if (objects.length === 0) {
+    let msg;
+    if (bac.objects.length > 0) msg = "No objects match the filter.";
+    else if (bac.objectsLoading) msg = "Reading object list…";
+    else msg = "Select a device to list its objects.";
+    return [el("li", { class: "muted small bac-object-empty" }, msg)];
+  }
+  return objects.map((o) => {
+    const key = bacObjectKey(o);
+    const active = key === bac.selectedObjectKey;
+    return el("li", {
+      class: `bac-object-row ${active ? "bac-row-active" : ""}`,
+      role: "button",
+      tabindex: "0",
+      onclick: () => bacSelectObject(key),
+      onkeydown: (e) => {
+        if (e.key === "Enter" || e.key === " ") { e.preventDefault(); bacSelectObject(key); }
+      },
+    },
+      el("span", { class: "bac-object-type" }, `${o.typeName}:${o.instance}`),
+      el("span", { class: "bac-object-name" }, o.name || ""),
+    );
+  });
+}
+
+function bacPropRows() {
+  if (bac.props.length === 0) {
+    const msg = bac.propsLoading
+      ? "Reading properties…"
+      : "Select an object to read its properties.";
+    return [el("tr", {}, el("td", { class: "muted small", colspan: "2" }, msg))];
+  }
+  return bac.props.map((p) =>
+    el("tr", { class: p.error ? "bac-prop-error" : "" },
+      el("td", { class: "bac-prop-name", title: `property ${p.id}` }, p.name),
+      el("td", { class: "bac-prop-value" }, p.display),
+    ));
+}
+
+function bacWritePanel() {
+  const dev = bacSelectedDevice();
+  const obj = bacSelectedObject();
+  const disabled = !dev || !obj ? "disabled" : undefined;
+
+  const propInput = el("input", {
+    type: "text", class: "nm-input bac-write-prop", disabled,
+    title: "Property number (85 = present-value)",
+    value: bac.write.propertyId,
+    oninput: (e) => { bac.write.propertyId = e.target.value; },
+  });
+  const kindSelect = el("select", {
+    class: "nm-input bac-write-kind", disabled,
+    onchange: (e) => { bac.write.kind = e.target.value; },
+  },
+    ...[
+      ["real", "Real"],
+      ["unsigned", "Unsigned"],
+      ["signed", "Signed"],
+      ["enumerated", "Enumerated"],
+      ["boolean", "Boolean"],
+      ["characterString", "Text"],
+      ["null", "Null"],
+    ].map(([v, label]) => el("option", {
+      value: v,
+      selected: bac.write.kind === v ? "selected" : undefined,
+    }, label)),
+  );
+  const valueInput = el("input", {
+    type: "text", class: "nm-input bac-write-value", disabled,
+    placeholder: "value (e.g. 72.5)",
+    value: bac.write.value,
+    oninput: (e) => { bac.write.value = e.target.value; },
+  });
+  const prioritySelect = el("select", {
+    class: "nm-input bac-write-priority", disabled,
+    title: "Command priority (8 = manual operator)",
+    onchange: (e) => { bac.write.priority = e.target.value; },
+  },
+    el("option", { value: "" }, "no priority"),
+    ...Array.from({ length: 16 }, (_, i) => el("option", {
+      value: String(i + 1),
+      selected: bac.write.priority === String(i + 1) ? "selected" : undefined,
+    }, `priority ${i + 1}`)),
+  );
+
+  return el("div", { class: "bac-write" },
+    el("div", { class: "bac-write-row" },
+      el("label", { class: "nm-field bac-write-field" },
+        el("span", { class: "nm-field-label" }, "Property #"), propInput),
+      el("label", { class: "nm-field bac-write-field" },
+        el("span", { class: "nm-field-label" }, "Type"), kindSelect),
+      el("label", { class: "nm-field bac-write-field bac-write-grow" },
+        el("span", { class: "nm-field-label" }, "Value"), valueInput),
+      el("label", { class: "nm-field bac-write-field" },
+        el("span", { class: "nm-field-label" }, "Priority"), prioritySelect),
+    ),
+    el("div", { class: "action-row" },
+      el("button", { class: "btn btn-primary", disabled, onclick: () => bacWrite(false) }, "Write"),
+      el("button", {
+        class: "btn-ghost", disabled,
+        title: "Write Null at the selected priority to release the slot",
+        onclick: () => bacWrite(true),
+      }, "Relinquish"),
+      el("button", { class: "btn-ghost", disabled, onclick: bacRefreshProps }, "Refresh"),
+    ),
+  );
+}
+
+// Directed-broadcast address for an adapter (e.g. 192.168.7.255 for a /21),
+// derived from the Network Manager's live adapter state. Null when unusable.
+function bacDirectedBroadcastFor(adapterName) {
+  const st = nm.stateByAdapter[adapterName];
+  if (!st || !st.ipAddress) return null;
+  const prefix = nmMaskToPrefix(st.subnetMask);
+  if (prefix == null || prefix < 8 || prefix > 30) return null;
+  const p = st.ipAddress.split(".").map((n) => parseInt(n, 10));
+  if (p.length !== 4 || p.some((n) => Number.isNaN(n))) return null;
+  const ip = ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  const bcast = (ip | ~mask) >>> 0;
+  return [(bcast >>> 24) & 255, (bcast >>> 16) & 255, (bcast >>> 8) & 255, bcast & 255].join(".");
+}
+
+// Discovery target(s) for an adapter. For subnets wider than /24 this also
+// sweeps every /24 directed broadcast inside the range — flat BAS networks
+// often mix masks, and a /24-configured controller ignores the /21 broadcast.
+function bacSweepTargetFor(adapterName) {
+  const st = nm.stateByAdapter[adapterName];
+  if (!st || !st.ipAddress) return null;
+  const prefix = nmMaskToPrefix(st.subnetMask);
+  if (prefix == null || prefix < 16 || prefix > 30) return null;
+  const bcast = bacDirectedBroadcastFor(adapterName);
+  if (!bcast) return null;
+  if (prefix >= 24) return { value: bcast, label: bcast };
+  const p = st.ipAddress.split(".").map((n) => parseInt(n, 10));
+  const ip = ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+  const mask = (0xffffffff << (32 - prefix)) >>> 0;
+  const net = (ip & mask) >>> 0;
+  const count = Math.min(Math.pow(2, 24 - prefix), 32); // cap the sweep at 32 /24s
+  const targets = [bcast];
+  for (let i = 0; i < count; i++) {
+    const sub = (net + i * 256) >>> 0;
+    targets.push([(sub >>> 24) & 255, (sub >>> 16) & 255, (sub >>> 8) & 255, 255].join("."));
+  }
+  const netStr = [(net >>> 24) & 255, (net >>> 16) & 255, (net >>> 8) & 255, net & 255].join(".");
+  return { value: targets.join(","), label: `${netStr}/${prefix} sweep` };
+}
+
+// One clickable chip per adapter subnet, so multi-NIC machines (VPN, WSL,
+// Hyper-V) can aim the Who-Is at the right network in one click.
+function bacTargetChips() {
+  const chips = [];
+  const seen = new Set();
+  for (const a of nm.adapters) {
+    const t = bacSweepTargetFor(a.name);
+    if (!t || seen.has(t.value)) continue;
+    seen.add(t.value);
+    chips.push(el("button", {
+      class: `bac-chip ${bac.target === t.value ? "bac-chip-on" : ""}`,
+      title: `Who-Is target(s) for ${a.name}`,
+      disabled: bac.discovering ? "disabled" : undefined,
+      onclick: () => { bac.target = t.value; renderAll(); },
+    }, `${a.name} · ${t.label}`));
+  }
+  if (chips.length === 0) {
+    return el("p", { class: "muted small bac-chip-row" },
+      nm.loaded ? "" : "Reading adapters for subnet suggestions…");
+  }
+  return el("div", { class: "bac-chip-row" }, ...chips);
+}
+
+function renderBacnetPage() {
+  bacEnsureListeners();
+  nmEnsureLoaded(); // adapter state feeds the target suggestions
+
+  const targetInput = el("input", {
+    type: "text", class: "nm-input",
+    placeholder: "255.255.255.255 or 192.168.1.255 or a device IP",
+    disabled: bac.discovering ? "disabled" : undefined,
+    value: bac.target,
+    oninput: (e) => { bac.target = e.target.value; },
+  });
+  const lowInput = el("input", {
+    type: "text", class: "nm-input bac-range-input", placeholder: "low",
+    disabled: bac.discovering ? "disabled" : undefined,
+    value: bac.lowLimit,
+    oninput: (e) => { bac.lowLimit = e.target.value; },
+  });
+  const highInput = el("input", {
+    type: "text", class: "nm-input bac-range-input", placeholder: "high",
+    disabled: bac.discovering ? "disabled" : undefined,
+    value: bac.highLimit,
+    oninput: (e) => { bac.highLimit = e.target.value; },
+  });
+  const discoverBtn = el("button", {
+    class: "btn btn-primary",
+    disabled: bac.discovering ? "disabled" : undefined,
+    onclick: bacDiscover,
+  }, bac.discovering ? "Discovering…" : "Discover");
+
+  const discoverSection = el("section", { class: "plugin-section" },
+    el("div", { class: "nm-pane-head" },
+      el("div", { class: "nm-pane-head-text" },
+        el("h3", {}, "Discover devices"),
+        el("p", { class: "muted small nm-section-sub" },
+          "Broadcasts a Who-Is on UDP 47808. Use a directed broadcast (x.x.x.255) for a ",
+          "specific subnet, or a device's IP to probe it directly across subnets."),
+      ),
+    ),
+    el("div", { class: "bac-discover-controls" },
+      el("label", { class: "nm-field bac-target-field" },
+        el("span", { class: "nm-field-label" }, "Target"), targetInput),
+      el("label", { class: "nm-field" },
+        el("span", { class: "nm-field-label" }, "Instance range (optional)"),
+        el("div", { class: "bac-range-pair" }, lowInput, el("span", { class: "muted" }, "–"), highInput),
+      ),
+      discoverBtn,
+    ),
+    bacTargetChips(),
+  );
+
+  const devicesSection = el("section", { class: "plugin-section" },
+    el("div", { class: "section-head" },
+      el("h3", {}, "Devices"),
+      el("span", { id: "bac-device-count", class: "muted small" }, bacDeviceCountText()),
+    ),
+    el("table", { class: "bac-table" },
+      el("thead", {}, el("tr", {},
+        el("th", {}, "Instance"),
+        el("th", {}, "Name"),
+        el("th", {}, "Address"),
+        el("th", {}, "Vendor"),
+        el("th", {}, "Model"),
+        el("th", {}, "Max APDU · seg"),
+      )),
+      el("tbody", { id: "bac-device-rows" }, ...bacDeviceRows()),
+    ),
+  );
+
+  const dev = bacSelectedDevice();
+  const obj = bacSelectedObject();
+
+  const objectsPane = el("div", { class: "bac-objects-pane" },
+    el("div", { class: "section-head" },
+      el("h3", {}, dev ? `Objects — ${bacDeviceLabel(dev)}` : "Objects"),
+      el("span", { id: "bac-object-count", class: "muted small" }, bacObjectCountText()),
+    ),
+    el("input", {
+      type: "search", class: "nm-input bac-object-filter",
+      placeholder: "Filter objects…",
+      "aria-label": "Filter objects",
+      value: bac.objectFilter,
+      oninput: (e) => { bac.objectFilter = e.target.value; bacApplyObjectFilter(); },
+    }),
+    el("p", { id: "bac-objects-status", class: "muted small" },
+      bac.objectsLoading
+        ? (bac.objectsProgress
+            ? `Walking object-list… ${bac.objectsProgress.done}/${bac.objectsProgress.total}`
+            : "Reading object list…")
+        : ""),
+    el("ul", { id: "bac-object-list", class: "bac-object-list" }, ...bacObjectRows()),
+  );
+
+  const propsPane = el("div", { class: "bac-props-pane" },
+    el("div", { class: "section-head" },
+      el("h3", {}, obj ? `Properties — ${obj.typeName}:${obj.instance}` : "Properties"),
+      obj && obj.name ? el("span", { class: "muted small" }, obj.name) : null,
+    ),
+    el("table", { class: "bac-table bac-props-table" },
+      el("thead", {}, el("tr", {},
+        el("th", {}, "Property"),
+        el("th", {}, "Value"),
+      )),
+      el("tbody", {}, ...bacPropRows()),
+    ),
+    bacWritePanel(),
+  );
+
+  const browseSection = el("section", { class: "plugin-section" },
+    el("div", { class: "bac-browse" }, objectsPane, propsPane),
+  );
+
+  return el("div", { class: "plugin-controls" },
+    discoverSection,
+    devicesSection,
+    browseSection,
+  );
+}
 
 // ============================================================================
 // Library card (compact)
