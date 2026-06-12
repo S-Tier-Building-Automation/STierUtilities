@@ -829,3 +829,21 @@ a:hover { text-decoration: underline; }
 }
 .bac-chip:hover { color: var(--text); border-color: var(--accent); }
 .bac-chip-on { color: var(--accent-2); border-color: var(--accent); }
+
+.bac-device-toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
+.bac-device-filter { flex: 1; min-width: 0; }
+.bac-th { cursor: pointer; user-select: none; white-space: nowrap; }
+.bac-th:hover { color: var(--text); }
+.bac-th:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.bac-th-active { color: var(--accent); }
+.bac-sort-ind { margin-left: 5px; font-size: 9px; vertical-align: middle; }
+
+.bac-props-head-right { display: flex; align-items: center; gap: 10px; }
+.bac-cov-btn { white-space: nowrap; }
+.bac-cov-on { color: var(--ok); border-color: var(--ok); }
+.bac-cov-badge { font-variant-numeric: tabular-nums; }
+@keyframes bac-cov-flash {
+  0% { background: color-mix(in srgb, var(--accent) 38%, transparent); }
+  100% { background: transparent; }
+}
+.bac-prop-flash td { animation: bac-cov-flash 0.9s ease-out; }

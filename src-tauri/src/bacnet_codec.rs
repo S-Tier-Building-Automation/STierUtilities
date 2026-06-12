@@ -44,9 +44,12 @@ pub const PDU_ABORT: u8 = 0x70;
 
 // Unconfirmed service choices.
 pub const SERVICE_I_AM: u8 = 0;
+pub const SERVICE_UNCONFIRMED_COV_NOTIFICATION: u8 = 2;
 pub const SERVICE_WHO_IS: u8 = 8;
 
 // Confirmed service choices.
+pub const SERVICE_CONFIRMED_COV_NOTIFICATION: u8 = 1;
+pub const SERVICE_SUBSCRIBE_COV: u8 = 5;
 pub const SERVICE_READ_PROPERTY: u8 = 12;
 pub const SERVICE_READ_PROPERTY_MULTIPLE: u8 = 14;
 pub const SERVICE_WRITE_PROPERTY: u8 = 15;
@@ -1122,6 +1125,119 @@ pub fn encode_write_property(
     buf
 }
 
+/// Encodes a SubscribeCOV request APDU. `lifetime_seconds == None` issues a
+/// **cancellation** (process id + object only); `Some(secs)` subscribes with
+/// confirmed or unconfirmed notifications for that lifetime (0 = no automatic
+/// expiry, though many devices cap it).
+pub fn encode_subscribe_cov(
+    invoke_id: u8,
+    subscriber_process_id: u32,
+    monitored: ObjectId,
+    issue_confirmed: bool,
+    lifetime_seconds: Option<u32>,
+) -> Vec<u8> {
+    let mut buf = confirmed_header(invoke_id, SERVICE_SUBSCRIBE_COV);
+    encode_context_unsigned(&mut buf, 0, subscriber_process_id as u64);
+    encode_context_object_id(&mut buf, 1, monitored);
+    if let Some(lifetime) = lifetime_seconds {
+        // context 2 Boolean — note context-tagged booleans carry one content octet.
+        encode_tag(&mut buf, 2, true, 1);
+        buf.push(if issue_confirmed { 1 } else { 0 });
+        encode_context_unsigned(&mut buf, 3, lifetime as u64);
+    }
+    buf
+}
+
+/// One property's value(s) inside a COV notification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CovValue {
+    pub property: u32,
+    pub array_index: Option<u32>,
+    pub values: Vec<BacnetValue>,
+}
+
+/// A decoded (Un)ConfirmedCOVNotification.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CovNotification {
+    pub process_id: u32,
+    pub initiating_device: ObjectId,
+    pub monitored_object: ObjectId,
+    pub time_remaining: u32,
+    pub values: Vec<CovValue>,
+}
+
+/// Decodes a COVNotification service payload (bytes after the service choice).
+/// Shared by the confirmed (service 1) and unconfirmed (service 2) forms — the
+/// request bodies are identical.
+pub fn decode_cov_notification(payload: &[u8]) -> Result<CovNotification, String> {
+    let mut at = 0usize;
+    let (process_id, n) = decode_context_unsigned(payload, 0)?;
+    at += n;
+    let (initiating_device, n) = decode_context_object_id(payload.get(at..).ok_or_else(err_short)?, 1)?;
+    at += n;
+    let (monitored_object, n) = decode_context_object_id(payload.get(at..).ok_or_else(err_short)?, 2)?;
+    at += n;
+    let (time_remaining, n) = decode_context_unsigned(payload.get(at..).ok_or_else(err_short)?, 3)?;
+    at += n;
+
+    // listOfValues: opening tag 4 ... closing tag 4.
+    let t = decode_tag(payload.get(at..).ok_or_else(err_short)?)?;
+    if !(t.opening && t.context && t.number == 4) {
+        return Err("COVNotification: expected opening tag 4".into());
+    }
+    at += t.header_len;
+
+    let mut values = Vec::new();
+    loop {
+        let rest = payload.get(at..).ok_or_else(err_short)?;
+        let t = decode_tag(rest)?;
+        if t.closing && t.context && t.number == 4 {
+            break;
+        }
+        // BACnetPropertyValue: context 0 property, [context 1 index],
+        // context 2 (opening) value(s) (closing), [context 3 priority].
+        let (property, n) = decode_context_unsigned(rest, 0)?;
+        at += n;
+        let mut array_index = None;
+        let t = decode_tag(payload.get(at..).ok_or_else(err_short)?)?;
+        if t.context && !t.opening && !t.closing && t.number == 1 {
+            let (idx, n) = decode_context_unsigned(&payload[at..], 1)?;
+            array_index = Some(idx as u32);
+            at += n;
+        }
+        let t = decode_tag(payload.get(at..).ok_or_else(err_short)?)?;
+        if !(t.opening && t.context && t.number == 2) {
+            return Err("COVNotification: expected opening tag 2 (value)".into());
+        }
+        at += t.header_len;
+        let (vals, n) = decode_value_list(payload.get(at..).ok_or_else(err_short)?, 2)?;
+        at += n;
+        // optional context 3 priority — skip it.
+        let t = decode_tag(payload.get(at..).ok_or_else(err_short)?)?;
+        if t.context && !t.opening && !t.closing && t.number == 3 {
+            at += t.header_len + t.lvt as usize;
+        }
+        values.push(CovValue { property: property as u32, array_index, values: vals });
+    }
+
+    Ok(CovNotification {
+        process_id: process_id as u32,
+        initiating_device,
+        monitored_object,
+        time_remaining: time_remaining as u32,
+        values,
+    })
+}
+
+/// Encodes the listOfValues body (used by tests and any notifier path) for a
+/// single property — opening 2, value, closing 2, wrapped as a BACnetPropertyValue.
+pub fn encode_cov_property_value(buf: &mut Vec<u8>, property: u32, value: &BacnetValue) {
+    encode_context_unsigned(buf, 0, property as u64);
+    encode_opening_tag(buf, 2);
+    encode_application_value(buf, value);
+    encode_closing_tag(buf, 2);
+}
+
 /// Pulls the object identifiers out of a decoded object-list value set.
 pub fn object_ids_from_values(values: &[BacnetValue]) -> Vec<ObjectId> {
     values
@@ -1942,6 +2058,89 @@ mod tests {
         );
         assert_eq!(objects[1].properties[0].array_index, Some(0));
         assert_eq!(objects[1].properties[0].error, Some((2, 32)));
+    }
+
+    #[test]
+    fn subscribe_cov_request_frame() {
+        // Subscribe process 1 to analog-input 0, confirmed, lifetime 60s, invoke 1.
+        let apdu = encode_subscribe_cov(1, 1, ObjectId::new(0, 0), true, Some(60));
+        assert_eq!(
+            apdu,
+            vec![
+                0x00, 0x05, 0x01, 0x05, // confirmed, max-seg/apdu, invoke 1, SubscribeCOV
+                0x09, 0x01, // context 0 unsigned 1 (process id)
+                0x1C, 0x00, 0x00, 0x00, 0x00, // context 1 object-id AI-0
+                0x29, 0x01, // context 2 boolean true (confirmed)
+                0x39, 0x3C, // context 3 unsigned 60 (lifetime)
+            ]
+        );
+    }
+
+    #[test]
+    fn subscribe_cov_cancellation_omits_confirmed_and_lifetime() {
+        let apdu = encode_subscribe_cov(2, 7, ObjectId::new(2, 5), false, None);
+        // process 7, object AV-5, then nothing else.
+        assert_eq!(
+            apdu,
+            vec![0x00, 0x05, 0x02, 0x05, 0x09, 0x07, 0x1C, 0x00, 0x80, 0x00, 0x05]
+        );
+    }
+
+    #[test]
+    fn cov_notification_roundtrip() {
+        // Build an UnconfirmedCOVNotification: process 1, from device 1234,
+        // AI-0, 55s remaining, present-value 21.5 + status-flags normal.
+        let mut payload = Vec::new();
+        encode_context_unsigned(&mut payload, 0, 1);
+        encode_context_object_id(&mut payload, 1, ObjectId::new(8, 1234));
+        encode_context_object_id(&mut payload, 2, ObjectId::new(0, 0));
+        encode_context_unsigned(&mut payload, 3, 55);
+        encode_opening_tag(&mut payload, 4);
+        encode_cov_property_value(&mut payload, PROP_PRESENT_VALUE, &BacnetValue::Real { value: 21.5 });
+        encode_cov_property_value(
+            &mut payload,
+            111,
+            &BacnetValue::BitString { unused_bits: 4, bits: "0000".into() },
+        );
+        encode_closing_tag(&mut payload, 4);
+
+        let n = decode_cov_notification(&payload).unwrap();
+        assert_eq!(n.process_id, 1);
+        assert_eq!(n.initiating_device, ObjectId::new(8, 1234));
+        assert_eq!(n.monitored_object, ObjectId::new(0, 0));
+        assert_eq!(n.time_remaining, 55);
+        assert_eq!(n.values.len(), 2);
+        assert_eq!(n.values[0].property, PROP_PRESENT_VALUE);
+        assert_eq!(n.values[0].values, vec![BacnetValue::Real { value: 21.5 }]);
+        assert_eq!(n.values[1].property, 111);
+        assert_eq!(
+            n.values[1].values,
+            vec![BacnetValue::BitString { unused_bits: 4, bits: "0000".into() }]
+        );
+    }
+
+    #[test]
+    fn cov_notification_with_array_index_and_priority() {
+        // A property value that carries both an array index (context 1) and a
+        // trailing priority (context 3) — both must be handled.
+        let mut payload = Vec::new();
+        encode_context_unsigned(&mut payload, 0, 1);
+        encode_context_object_id(&mut payload, 1, ObjectId::new(8, 9));
+        encode_context_object_id(&mut payload, 2, ObjectId::new(1, 3));
+        encode_context_unsigned(&mut payload, 3, 0);
+        encode_opening_tag(&mut payload, 4);
+        encode_context_unsigned(&mut payload, 0, PROP_PRESENT_VALUE as u64);
+        encode_context_unsigned(&mut payload, 1, 1); // array index 1
+        encode_opening_tag(&mut payload, 2);
+        encode_application_value(&mut payload, &BacnetValue::Real { value: 9.0 });
+        encode_closing_tag(&mut payload, 2);
+        encode_context_unsigned(&mut payload, 3, 8); // priority 8
+        encode_closing_tag(&mut payload, 4);
+
+        let n = decode_cov_notification(&payload).unwrap();
+        assert_eq!(n.values.len(), 1);
+        assert_eq!(n.values[0].array_index, Some(1));
+        assert_eq!(n.values[0].values, vec![BacnetValue::Real { value: 9.0 }]);
     }
 
     #[test]

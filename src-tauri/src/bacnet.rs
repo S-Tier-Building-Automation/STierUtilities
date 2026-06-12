@@ -160,11 +160,41 @@ struct Target {
     route: Option<(u16, Vec<u8>)>,
 }
 
+/// An active COV subscription, keyed by its subscriber-process id. Holds just
+/// enough to route incoming notifications back to the right device pane and to
+/// keep the subscription alive past its lifetime.
+struct CovEntry {
+    device_key: String,
+    object: ObjectId,
+    active: Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Payload of a `bacnet:cov` event — one COV notification, scoped to the
+/// device + object so the frontend can update the right property rows.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct CovEvent {
+    device_key: String,
+    process_id: u32,
+    object_type: u16,
+    instance: u32,
+    values: Vec<PropertyEntry>,
+    time_remaining: u32,
+}
+
 struct Client {
     socket: UdpSocket,
     pending: Mutex<HashMap<u8, mpsc::Sender<Outcome>>>,
     next_invoke: Mutex<u8>,
     discovery: Mutex<Option<Discovery>>,
+    cov: Mutex<HashMap<u32, CovEntry>>,
+    next_process: Mutex<u32>,
+    /// COV notifications are forwarded as `CovEvent`s through this channel to a
+    /// dedicated emitter thread that owns the `AppHandle`. Keeping tauri types
+    /// out of `Client` (which lives in a `static`) matters: storing an
+    /// `AppHandle` in the static pulls the full Wry/WebView2 runtime into the
+    /// reader path and breaks the (headless) unit-test binary at load time.
+    cov_tx: Mutex<Option<mpsc::Sender<CovEvent>>>,
 }
 
 impl Client {
@@ -189,6 +219,9 @@ impl Client {
             pending: Mutex::new(HashMap::new()),
             next_invoke: Mutex::new(1),
             discovery: Mutex::new(None),
+            cov: Mutex::new(HashMap::new()),
+            next_process: Mutex::new(1),
+            cov_tx: Mutex::new(None),
         });
         let for_thread = Arc::clone(&client);
         thread::spawn(move || reader_loop(for_thread, reader));
@@ -277,6 +310,74 @@ impl Client {
             let _ = d.tx.send(DiscoveryEvent::Routers { router, networks });
         }
     }
+
+    /// Ensures a COV emitter is running: on first call it creates the channel
+    /// and spawns a thread that drains `CovEvent`s and emits them via the app.
+    /// The `AppHandle` is owned only by that thread, never by `Client` — see the
+    /// `cov_tx` field note for why this matters.
+    fn ensure_cov_emitter(&self, app: &AppHandle) {
+        let mut guard = self.cov_tx.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+        let (tx, rx) = mpsc::channel::<CovEvent>();
+        *guard = Some(tx);
+        let app = app.clone();
+        thread::spawn(move || {
+            while let Ok(ev) = rx.recv() {
+                let _ = app.emit("bacnet:cov", ev);
+            }
+        });
+    }
+
+    /// Allocates a subscriber-process id not currently in use.
+    fn alloc_process(&self) -> u32 {
+        let mut next = self.next_process.lock().unwrap();
+        let cov = self.cov.lock().unwrap();
+        for _ in 0..u32::MAX {
+            let id = *next;
+            *next = next.wrapping_add(1).max(1);
+            if !cov.contains_key(&id) {
+                return id;
+            }
+        }
+        *next
+    }
+
+    /// Routes an incoming COV notification to a `bacnet:cov` event. Drops
+    /// notifications for an unknown process id, or whose object doesn't match
+    /// the subscription (guards against subscriber-process-id reuse).
+    fn note_cov(&self, n: codec::CovNotification) {
+        let (device_key, tx) = {
+            let cov = self.cov.lock().unwrap();
+            let Some(entry) = cov.get(&n.process_id) else { return };
+            if entry.object != n.monitored_object {
+                return;
+            }
+            (entry.device_key.clone(), self.cov_tx.lock().unwrap().clone())
+        };
+        let Some(tx) = tx else { return };
+        let _ = tx.send(build_cov_event(device_key, n));
+    }
+}
+
+/// Renders a decoded COV notification into the frontend event payload (pure, so
+/// it's unit-testable without an AppHandle).
+fn build_cov_event(device_key: String, n: codec::CovNotification) -> CovEvent {
+    let object_type = n.monitored_object.object_type;
+    let values: Vec<PropertyEntry> = n
+        .values
+        .into_iter()
+        .map(|v| make_entry(object_type, v.property, Some(v.values), None))
+        .collect();
+    CovEvent {
+        device_key,
+        process_id: n.process_id,
+        object_type,
+        instance: n.monitored_object.instance,
+        values,
+        time_remaining: n.time_remaining,
+    }
 }
 
 /// Receive-buffer target. A flat BAS network can answer one Who-Is burst with
@@ -361,6 +462,33 @@ fn handle_frame(client: &Client, frame: &[u8], src: SocketAddr) {
                         None => (None, None),
                     };
                     client.note_i_am(RawDevice { address: effective_src, network, mac, iam });
+                }
+            }
+        }
+        Apdu::Unconfirmed { service: codec::SERVICE_UNCONFIRMED_COV_NOTIFICATION, payload_offset } => {
+            if let Some(payload) = apdu.get(payload_offset..) {
+                if let Ok(n) = codec::decode_cov_notification(payload) {
+                    client.note_cov(n);
+                }
+            }
+        }
+        Apdu::ConfirmedRequest { invoke_id, service: codec::SERVICE_CONFIRMED_COV_NOTIFICATION, payload_offset } => {
+            // The device expects a SimpleACK before it considers the notification
+            // delivered; ack first (echo any routing back to the source), then route.
+            let ack = vec![
+                codec::PDU_SIMPLE_ACK,
+                invoke_id,
+                codec::SERVICE_CONFIRMED_COV_NOTIFICATION,
+            ];
+            let dest = npdu.source.as_ref().map(|(snet, sadr)| (*snet, sadr.as_slice()));
+            let mut reply = codec::encode_npdu(false, dest);
+            reply.extend_from_slice(&ack);
+            let _ = client
+                .socket
+                .send_to(&codec::bvlc_encode(codec::BVLC_ORIGINAL_UNICAST, &reply), effective_src);
+            if let Some(payload) = apdu.get(payload_offset..) {
+                if let Ok(n) = codec::decode_cov_notification(payload) {
+                    client.note_cov(n);
                 }
             }
         }
@@ -521,6 +649,25 @@ fn write_property_core(
     match client.request(target, &apdu, invoke)? {
         Outcome::Simple => Ok(()),
         Outcome::Complex { .. } => Err("unexpected complex ack for WriteProperty".into()),
+        Outcome::Failed(e) => Err(e),
+    }
+}
+
+/// Sends a SubscribeCOV (or, with `lifetime == None`, a cancellation) and waits
+/// for the SimpleACK.
+fn subscribe_cov_core(
+    client: &Client,
+    target: &Target,
+    process_id: u32,
+    object: ObjectId,
+    confirmed: bool,
+    lifetime: Option<u32>,
+) -> Result<(), String> {
+    let invoke = client.alloc_invoke();
+    let apdu = codec::encode_subscribe_cov(invoke, process_id, object, confirmed, lifetime);
+    match client.request(target, &apdu, invoke)? {
+        Outcome::Simple => Ok(()),
+        Outcome::Complex { .. } => Err("unexpected complex ack for SubscribeCOV".into()),
         Outcome::Failed(e) => Err(e),
     }
 }
@@ -1259,6 +1406,94 @@ pub async fn bacnet_write_property(
     .map_err(|e| format!("write task panicked: {e}"))?
 }
 
+/// Default COV subscription lifetime, and how often to resubscribe (well before
+/// expiry). Devices cap lifetime; 300 s with a ~180 s refresh is conservative.
+const COV_LIFETIME_SECS: u32 = 300;
+const COV_RESUBSCRIBE_SECS: u64 = 180;
+
+/// Subscribes to COV notifications for one object. Returns the subscriber
+/// process id; notifications then stream as `bacnet:cov` events until
+/// `bacnet_unsubscribe_cov` is called. A background thread resubscribes before
+/// the lifetime expires so the stream doesn't lapse.
+#[tauri::command]
+pub async fn bacnet_subscribe_cov(
+    app: AppHandle,
+    device: DeviceRef,
+    object_type: u16,
+    instance: u32,
+    confirmed: Option<bool>,
+) -> Result<u32, String> {
+    let client = client()?;
+    client.ensure_cov_emitter(&app);
+    let target = resolve_device(&device)?;
+    let object = ObjectId::new(object_type, instance);
+    let confirmed = confirmed.unwrap_or(false);
+    let dev_key = device_key(&device.address, device.network, device.mac.as_deref(), instance);
+    let process_id = client.alloc_process();
+
+    let client_run = Arc::clone(&client);
+    tauri::async_runtime::spawn_blocking(move || {
+        subscribe_cov_core(&client_run, &target, process_id, object, confirmed, Some(COV_LIFETIME_SECS))?;
+
+        // Register and start the resubscribe keep-alive.
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        client_run.cov.lock().unwrap().insert(
+            process_id,
+            CovEntry { device_key: dev_key, object, active: Arc::clone(&active) },
+        );
+        let client_bg = Arc::clone(&client_run);
+        thread::spawn(move || {
+            while active.load(Ordering::Relaxed) {
+                // Sleep in short slices so unsubscribe takes effect promptly.
+                for _ in 0..(COV_RESUBSCRIBE_SECS * 2) {
+                    if !active.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+                if !active.load(Ordering::Relaxed) {
+                    return;
+                }
+                let _ = subscribe_cov_core(
+                    &client_bg,
+                    &target,
+                    process_id,
+                    object,
+                    confirmed,
+                    Some(COV_LIFETIME_SECS),
+                );
+            }
+        });
+        Ok(process_id)
+    })
+    .await
+    .map_err(|e| format!("subscribe task panicked: {e}"))?
+}
+
+/// Cancels a COV subscription created by [`bacnet_subscribe_cov`].
+#[tauri::command]
+pub async fn bacnet_unsubscribe_cov(
+    device: DeviceRef,
+    object_type: u16,
+    instance: u32,
+    process_id: u32,
+) -> Result<(), String> {
+    let client = client()?;
+    let target = resolve_device(&device)?;
+    // Stop the keep-alive and drop the registry entry first, so a late
+    // notification can't re-arm anything.
+    if let Some(entry) = client.cov.lock().unwrap().remove(&process_id) {
+        entry.active.store(false, Ordering::Relaxed);
+    }
+    let object = ObjectId::new(object_type, instance);
+    tauri::async_runtime::spawn_blocking(move || {
+        // Best-effort cancellation — the device also drops us at lifetime expiry.
+        subscribe_cov_core(&client, &target, process_id, object, false, None)
+    })
+    .await
+    .map_err(|e| format!("unsubscribe task panicked: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1593,6 +1828,141 @@ mod tests {
         )
         .unwrap();
         t.join().unwrap();
+    }
+
+    #[test]
+    fn subscribe_cov_simple_ack_over_loopback() {
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            let (frame, src) = recv_frame(&fake);
+            let bvlc = codec::bvlc_decode(&frame).unwrap();
+            let npdu = codec::decode_npdu(&frame[bvlc.payload_offset..]).unwrap();
+            let apdu = &frame[bvlc.payload_offset + npdu.apdu_offset..];
+            let Apdu::ConfirmedRequest { invoke_id, service, .. } = codec::decode_apdu(apdu).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(service, codec::SERVICE_SUBSCRIBE_COV);
+            fake.send_to(
+                &unicast_reply(&[codec::PDU_SIMPLE_ACK, invoke_id, codec::SERVICE_SUBSCRIBE_COV]),
+                src,
+            )
+            .unwrap();
+        });
+
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let target = Target { sa: fake_addr, route: None };
+        subscribe_cov_core(&client, &target, 7, ObjectId::new(0, 0), false, Some(60)).unwrap();
+        t.join().unwrap();
+    }
+
+    #[test]
+    fn confirmed_cov_notification_is_acked_by_reader() {
+        // A device pushing a ConfirmedCOVNotification must get a SimpleACK back
+        // from our reader thread, or it stops sending. Drive that end-to-end:
+        // the fake sends the notification to the client's socket and waits for
+        // the ack.
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let client_addr = client.socket.local_addr().unwrap();
+
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        fake.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+        // Build a ConfirmedCOVNotification APDU (invoke 5), AI-0 present-value 42.
+        let mut apdu = vec![
+            codec::PDU_CONFIRMED,
+            codec::MAX_SEGS_MAX_APDU,
+            5,
+            codec::SERVICE_CONFIRMED_COV_NOTIFICATION,
+        ];
+        codec::encode_context_unsigned(&mut apdu, 0, 1);
+        codec::encode_context_object_id(&mut apdu, 1, ObjectId::new(8, 1234));
+        codec::encode_context_object_id(&mut apdu, 2, ObjectId::new(0, 0));
+        codec::encode_context_unsigned(&mut apdu, 3, 120);
+        codec::encode_opening_tag(&mut apdu, 4);
+        codec::encode_cov_property_value(&mut apdu, codec::PROP_PRESENT_VALUE, &BacnetValue::Real { value: 42.0 });
+        codec::encode_closing_tag(&mut apdu, 4);
+        let mut payload = codec::encode_npdu(false, None);
+        payload.extend_from_slice(&apdu);
+        fake.send_to(&codec::bvlc_encode(codec::BVLC_ORIGINAL_UNICAST, &payload), client_addr)
+            .unwrap();
+
+        // The reader must have sent a SimpleACK for invoke 5 / service 1.
+        let mut buf = [0u8; 512];
+        let (n, _) = fake.recv_from(&mut buf).expect("no SimpleACK from reader");
+        let bvlc = codec::bvlc_decode(&buf[..n]).unwrap();
+        let npdu = codec::decode_npdu(&buf[bvlc.payload_offset..]).unwrap();
+        let ack = codec::decode_apdu(&buf[bvlc.payload_offset + npdu.apdu_offset..]).unwrap();
+        assert_eq!(
+            ack,
+            Apdu::SimpleAck { invoke_id: 5, service: codec::SERVICE_CONFIRMED_COV_NOTIFICATION }
+        );
+    }
+
+    #[test]
+    fn cov_event_rendering() {
+        // build_cov_event renders values like the property grid does.
+        let ev = build_cov_event(
+            "dev-key".into(),
+            codec::CovNotification {
+                process_id: 9,
+                initiating_device: ObjectId::new(8, 1),
+                monitored_object: ObjectId::new(0, 5),
+                time_remaining: 100,
+                values: vec![
+                    codec::CovValue {
+                        property: codec::PROP_PRESENT_VALUE,
+                        array_index: None,
+                        values: vec![BacnetValue::Real { value: 21.5 }],
+                    },
+                    codec::CovValue {
+                        property: 111,
+                        array_index: None,
+                        values: vec![BacnetValue::BitString { unused_bits: 4, bits: "1000".into() }],
+                    },
+                ],
+            },
+        );
+        assert_eq!(ev.device_key, "dev-key");
+        assert_eq!(ev.object_type, 0);
+        assert_eq!(ev.instance, 5);
+        assert_eq!(ev.values.len(), 2);
+        assert_eq!(ev.values[0].name, "present-value");
+        assert_eq!(ev.values[0].display, "21.5");
+        assert_eq!(ev.values[1].name, "status-flags");
+        assert_eq!(ev.values[1].display, "in-alarm");
+    }
+
+    #[test]
+    fn cov_routing_guards_object_mismatch() {
+        // note_cov with no AppHandle must not panic, and must respect the
+        // object-match guard (process-id reuse safety).
+        let client = Client::new("127.0.0.1:0").unwrap();
+        client.cov.lock().unwrap().insert(
+            9,
+            CovEntry {
+                device_key: "dev".into(),
+                object: ObjectId::new(0, 5),
+                active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            },
+        );
+        client.note_cov(codec::CovNotification {
+            process_id: 9,
+            initiating_device: ObjectId::new(8, 1),
+            monitored_object: ObjectId::new(0, 6), // mismatched -> dropped
+            time_remaining: 100,
+            values: vec![],
+        });
+        // Unknown process id -> dropped.
+        client.note_cov(codec::CovNotification {
+            process_id: 999,
+            initiating_device: ObjectId::new(8, 1),
+            monitored_object: ObjectId::new(0, 5),
+            time_remaining: 100,
+            values: vec![],
+        });
+        assert!(client.cov.lock().unwrap().contains_key(&9));
     }
 
     #[test]
@@ -1937,6 +2307,83 @@ mod tests {
                 Err(e) => panic!("property read failed on {}:{}: {e}", id.object_type, id.instance),
             }
         }
+    }
+
+    /// Live COV check (read-only): discover, find an analog input/value on a
+    /// device, subscribe, and watch real Change-of-Value notifications stream in
+    /// for ~15 s. SubscribeCOV changes nothing on the device.
+    ///
+    ///   cargo test live_cov_watch -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_cov_watch() {
+        let target = std::env::var("BACNET_TARGET").unwrap_or_else(|_| "192.168.1.255".into());
+        let client = Client::new("0.0.0.0:0").unwrap();
+
+        let devices = discover_core(&client, &target, None, None, Duration::from_secs(5), |_| {}).unwrap();
+        println!("discovered {} devices", devices.len());
+        assert!(!devices.is_empty(), "no devices found");
+
+        // Find a device that exposes an analog-input or analog-value object.
+        let mut chosen: Option<(BacnetDevice, ObjectId)> = None;
+        'outer: for dev in &devices {
+            let Ok(t) = resolve_device(&DeviceRef {
+                address: dev.address.clone(),
+                network: dev.network,
+                mac: dev.mac.clone(),
+            }) else { continue };
+            let Ok(objects) = read_object_ids_core(&client, &t, dev.instance, |_, _| {}) else { continue };
+            if let Some(o) = objects.iter().find(|o| matches!(o.object_type, 0 | 2)) {
+                chosen = Some((dev.clone(), ObjectId::new(o.object_type, o.instance)));
+                break 'outer;
+            }
+        }
+        let (dev, object) = chosen.expect("no device with an analog-input/value object");
+        let t = resolve_device(&DeviceRef {
+            address: dev.address.clone(),
+            network: dev.network,
+            mac: dev.mac.clone(),
+        })
+        .unwrap();
+        println!(
+            "subscribing COV: device {} {}:{} via {}",
+            dev.instance, codec::object_type_name(object.object_type), object.instance, dev.address
+        );
+
+        // Install a test channel where the app's emitter would be, register the
+        // subscription, and subscribe.
+        let (tx, rx) = mpsc::channel::<CovEvent>();
+        *client.cov_tx.lock().unwrap() = Some(tx);
+        let process_id = client.alloc_process();
+        client.cov.lock().unwrap().insert(
+            process_id,
+            CovEntry {
+                device_key: "live".into(),
+                object,
+                active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            },
+        );
+        subscribe_cov_core(&client, &t, process_id, object, false, Some(120)).unwrap();
+        println!("subscribed (process {process_id}); watching 15 s…");
+
+        let deadline = Instant::now() + Duration::from_secs(15);
+        let mut count = 0;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(ev) => {
+                    count += 1;
+                    let summary: Vec<String> =
+                        ev.values.iter().map(|v| format!("{}={}", v.name, v.display)).collect();
+                    println!("  COV #{count}: {} (t-{}s)", summary.join(", "), ev.time_remaining);
+                }
+                Err(_) => {}
+            }
+        }
+        let _ = subscribe_cov_core(&client, &t, process_id, object, false, None); // cancel
+        println!("== received {count} COV notification(s) ==");
+        // The initial notification fires on subscribe regardless of change, so
+        // we expect at least one.
+        assert!(count >= 1, "no COV notifications received (device may not support COV)");
     }
 
     #[test]

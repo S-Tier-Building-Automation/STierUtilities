@@ -59,6 +59,8 @@ pub fn run() {
         bacnet::bacnet_read_properties,
         bacnet::bacnet_read_property,
         bacnet::bacnet_write_property,
+        bacnet::bacnet_subscribe_cov,
+        bacnet::bacnet_unsubscribe_cov,
     ]);
 
     builder
