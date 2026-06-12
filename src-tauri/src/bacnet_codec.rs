@@ -91,7 +91,9 @@ pub const PROP_RECORD_COUNT: u32 = 141;
 
 /// Device object type number.
 pub const OBJECT_TYPE_DEVICE: u16 = 8;
-/// Trend-log object type number.
+/// Trend-log object type number (the UI gates the trend panel on this; kept
+/// here as the canonical constant and used by the codec tests).
+#[allow(dead_code)]
 pub const OBJECT_TYPE_TREND_LOG: u16 = 20;
 
 // ---------------------------------------------------------------------------
