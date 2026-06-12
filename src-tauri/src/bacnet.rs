@@ -228,10 +228,11 @@ struct CovEvent {
 
 struct Client {
     socket: UdpSocket,
-    /// invoke-id -> (peer we sent to, reply channel). The peer address lets the
-    /// reader reject a stale/duplicate reply whose source doesn't match the
-    /// request that currently owns this invoke id (the u8 id space is reused).
-    pending: Mutex<HashMap<u8, (SocketAddr, mpsc::Sender<Outcome>)>>,
+    /// invoke-id -> (peer IP we sent to, the routed source SNET/SADR we expect,
+    /// reply channel). Matching both lets the reader reject a stale/duplicate
+    /// reply that belongs to a different transaction reusing this invoke id —
+    /// including routed devices that share a router IP but differ by SNET/SADR.
+    pending: Mutex<HashMap<u8, (SocketAddr, Option<(u16, Vec<u8>)>, mpsc::Sender<Outcome>)>>,
     next_invoke: Mutex<u8>,
     discovery: Mutex<Option<Discovery>>,
     /// In-flight segmented-reply reassembly buffers, keyed by invoke id.
@@ -317,7 +318,10 @@ impl Client {
         let frame = codec::bvlc_encode(codec::BVLC_ORIGINAL_UNICAST, &payload);
 
         let (tx, rx) = mpsc::channel();
-        self.pending.lock().unwrap().insert(invoke_id, (target.sa, tx));
+        self.pending
+            .lock()
+            .unwrap()
+            .insert(invoke_id, (target.sa, target.route.clone(), tx));
         let result = (|| {
             for _ in 0..APDU_ATTEMPTS {
                 self.socket
@@ -341,14 +345,14 @@ impl Client {
         result
     }
 
-    /// True when there's a pending transaction for `invoke_id` whose peer IP
-    /// matches `src` — used to gate accepting a segment.
-    fn pending_peer_matches(&self, invoke_id: u8, src: SocketAddr) -> bool {
+    /// True when there's a pending transaction for `invoke_id` whose peer IP and
+    /// routed source both match the reply — used to gate accepting a segment.
+    fn pending_peer_matches(&self, invoke_id: u8, src: SocketAddr, route: &Option<(u16, Vec<u8>)>) -> bool {
         self.pending
             .lock()
             .unwrap()
             .get(&invoke_id)
-            .map(|(peer, _)| peer.ip() == src.ip())
+            .map(|(peer, stored_route, _)| peer.ip() == src.ip() && stored_route == route)
             .unwrap_or(false)
     }
 
@@ -378,8 +382,8 @@ impl Client {
         route: Option<(u16, Vec<u8>)>,
     ) {
         // Only accept segments for a transaction we're actually running, from the
-        // peer that owns it.
-        if !self.pending_peer_matches(invoke_id, src) {
+        // peer (and routed source) that owns it.
+        if !self.pending_peer_matches(invoke_id, src, &route) {
             return;
         }
 
@@ -437,22 +441,24 @@ impl Client {
             Step::Ack(seq) => self.send_segment_ack(invoke_id, seq, src, &route),
             Step::Deliver(seq, outcome) => {
                 self.send_segment_ack(invoke_id, seq, src, &route);
-                self.complete(invoke_id, src, outcome);
+                self.complete(invoke_id, src, &route, outcome);
             }
             // Fail locally without acking the abandoned segment.
-            Step::Fail(e) => self.complete(invoke_id, src, Outcome::Failed(e)),
+            Step::Fail(e) => self.complete(invoke_id, src, &route, Outcome::Failed(e)),
             Step::Drop => {}
         }
     }
 
     /// Delivers a reply to the pending transaction for `invoke_id`, but only if
-    /// it came from the peer that transaction is talking to — so a delayed reply
-    /// to a finished transaction can't be mismatched to a different device that
-    /// has since been handed the same (reused) invoke id. Compared by IP, since
-    /// a BACnet device replies from its B/IP port regardless of our source port.
-    fn complete(&self, invoke_id: u8, src: SocketAddr, outcome: Outcome) {
-        if let Some((peer, tx)) = self.pending.lock().unwrap().get(&invoke_id) {
-            if peer.ip() == src.ip() {
+    /// it came from the same peer (IP) AND the same routed source (SNET/SADR)
+    /// that transaction is talking to — so a delayed reply to a finished
+    /// transaction can't be mismatched to a different device that has since been
+    /// handed the same (reused) invoke id, including two routed devices sharing a
+    /// router IP. Compared by IP (a BACnet device replies from its B/IP port
+    /// regardless of our source port) plus the NPDU source for routed peers.
+    fn complete(&self, invoke_id: u8, src: SocketAddr, route: &Option<(u16, Vec<u8>)>, outcome: Outcome) {
+        if let Some((peer, stored_route, tx)) = self.pending.lock().unwrap().get(&invoke_id) {
+            if peer.ip() == src.ip() && stored_route == route {
                 let _ = tx.send(outcome);
             }
         }
@@ -661,7 +667,9 @@ fn handle_frame(client: &Client, frame: &[u8], src: SocketAddr) {
                 }
             }
         }
-        Apdu::SimpleAck { invoke_id, .. } => client.complete(invoke_id, effective_src, Outcome::Simple),
+        Apdu::SimpleAck { invoke_id, .. } => {
+            client.complete(invoke_id, effective_src, &npdu.source, Outcome::Simple)
+        }
         Apdu::ComplexAck { invoke_id, service, segmented, more, sequence, payload_offset, .. } => {
             let payload = apdu.get(payload_offset..).unwrap_or_default();
             if segmented {
@@ -680,6 +688,7 @@ fn handle_frame(client: &Client, frame: &[u8], src: SocketAddr) {
                 client.complete(
                     invoke_id,
                     effective_src,
+                    &npdu.source,
                     Outcome::Complex { service, payload: payload.to_vec() },
                 );
             }
@@ -687,6 +696,7 @@ fn handle_frame(client: &Client, frame: &[u8], src: SocketAddr) {
         Apdu::Error { invoke_id, error_class, error_code, .. } => client.complete(
             invoke_id,
             effective_src,
+            &npdu.source,
             Outcome::Failed(format!(
                 "device error: {} / {}",
                 codec::error_class_name(error_class),
@@ -696,11 +706,13 @@ fn handle_frame(client: &Client, frame: &[u8], src: SocketAddr) {
         Apdu::Reject { invoke_id, reason } => client.complete(
             invoke_id,
             effective_src,
+            &npdu.source,
             Outcome::Failed(format!("request rejected: {}", codec::reject_reason_name(reason))),
         ),
         Apdu::Abort { invoke_id, reason } => client.complete(
             invoke_id,
             effective_src,
+            &npdu.source,
             Outcome::Failed(format!("request aborted: {}", codec::abort_reason_name(reason))),
         ),
         _ => {}
@@ -863,7 +875,16 @@ fn read_range_core(
     );
     match client.request(target, &apdu, invoke)? {
         Outcome::Complex { service: codec::SERVICE_READ_RANGE, payload } => {
-            codec::decode_read_range_ack(&payload)
+            let ack = codec::decode_read_range_ack(&payload)?;
+            // Guard against a stale reply on a reused invoke id: the ACK must
+            // describe the object+property we asked for.
+            if ack.object != object || ack.property != codec::PROP_LOG_BUFFER {
+                return Err(format!(
+                    "ReadRange response mismatch: asked {}:{}, got {}:{} prop {}",
+                    object.object_type, object.instance, ack.object.object_type, ack.object.instance, ack.property
+                ));
+            }
+            Ok(ack)
         }
         Outcome::Complex { service, .. } => Err(format!("unexpected ack for service {service}")),
         Outcome::Simple => Err("unexpected simple ack for ReadRange".into()),
@@ -2235,7 +2256,7 @@ mod tests {
         let client = Client::new("127.0.0.1:0").unwrap();
         let peer: SocketAddr = "127.0.0.1:47808".parse().unwrap();
         let (tx, _rx) = mpsc::channel();
-        client.pending.lock().unwrap().insert(9, (peer, tx));
+        client.pending.lock().unwrap().insert(9, (peer, None, tx));
         // Feed segment seq=3 first (peer matches, but next_seq is 0).
         client.handle_segment(9, codec::SERVICE_READ_PROPERTY, 3, true, &[0xAA], peer, None);
         // The out-of-order segment must NOT be accepted: the buffer (if present)
@@ -2254,7 +2275,7 @@ mod tests {
         let client = Client::new("127.0.0.1:0").unwrap();
         let peer: SocketAddr = "127.0.0.1:47808".parse().unwrap();
         let (tx, rx) = mpsc::channel();
-        client.pending.lock().unwrap().insert(4, (peer, tx));
+        client.pending.lock().unwrap().insert(4, (peer, None, tx));
         // Pre-seed a buffer already at the cap so the next in-order segment trips it.
         let seq = MAX_SEGMENTS as u8; // next expected sequence after `count` segments
         client.segments.lock().unwrap().insert(
@@ -2308,14 +2329,18 @@ mod tests {
         let client = Client::new("127.0.0.1:0").unwrap();
         let (tx, rx) = mpsc::channel();
         let peer: SocketAddr = "10.0.0.5:47808".parse().unwrap();
-        client.pending.lock().unwrap().insert(7, (peer, tx));
+        client.pending.lock().unwrap().insert(7, (peer, None, tx));
 
         // Wrong source IP -> dropped.
-        client.complete(7, "10.0.0.9:47808".parse().unwrap(), Outcome::Simple);
+        client.complete(7, "10.0.0.9:47808".parse().unwrap(), &None, Outcome::Simple);
         assert!(rx.try_recv().is_err(), "reply from wrong source should be dropped");
 
-        // Correct source IP (any port) -> delivered.
-        client.complete(7, "10.0.0.5:12345".parse().unwrap(), Outcome::Simple);
+        // Right IP but a routed source we didn't expect -> dropped.
+        client.complete(7, "10.0.0.5:47808".parse().unwrap(), &Some((2001, vec![0x0C])), Outcome::Simple);
+        assert!(rx.try_recv().is_err(), "reply with unexpected route should be dropped");
+
+        // Correct source IP (any port) and matching route (none) -> delivered.
+        client.complete(7, "10.0.0.5:12345".parse().unwrap(), &None, Outcome::Simple);
         assert!(matches!(rx.try_recv(), Ok(Outcome::Simple)), "matching-source reply should deliver");
     }
 

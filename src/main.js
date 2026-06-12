@@ -2207,7 +2207,7 @@ function bacDevicesToCsv() {
   const rows = bacVisibleDevices();
   const esc = (v) => {
     const s = String(v ?? "");
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const header = ["instance", "name", "address", "network", "mac", "vendorId", "vendorName", "model", "maxApdu", "segmentation"];
   const lines = [header.join(",")];
@@ -2409,7 +2409,7 @@ async function bacReadTrend() {
 function bacTrendToCsv() {
   const esc = (v) => {
     const s = String(v ?? "");
-    return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
   };
   const lines = ["timestamp,value,status"];
   for (const r of bac.trend.records) {
