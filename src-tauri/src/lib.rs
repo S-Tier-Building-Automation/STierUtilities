@@ -11,6 +11,25 @@ mod netscan;
 #[cfg(windows)]
 mod networkmanager;
 
+/// Open the app's data/config directory — where tool settings and saved
+/// profiles live (e.g. clipboardtyper.json, networkmanager/profiles.json) — in
+/// the system file manager. Backed by the same opener plugin the other
+/// folder-open commands use.
+#[cfg(windows)]
+#[tauri::command]
+fn app_open_data_dir(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    use tauri_plugin_opener::OpenerExt;
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("could not resolve app data dir: {e}"))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("could not create app data dir: {e}"))?;
+    app.opener()
+        .open_path(dir.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|e| format!("could not open folder: {e}"))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Self-elevation: when this exe is re-launched elevated by the Network Manager
@@ -32,6 +51,7 @@ pub fn run() {
 
     #[cfg(windows)]
     let builder = builder.invoke_handler(tauri::generate_handler![
+        app_open_data_dir,
         clipboardtyper::clipboardtyper_start,
         clipboardtyper::clipboardtyper_stop,
         clipboardtyper::clipboardtyper_set_armed,

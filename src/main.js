@@ -93,6 +93,7 @@ function loadUserState() {
     hidden: stored.hidden || {},
     showHidden: Boolean(stored.showHidden),
     view: typeof stored.view === "string" ? stored.view : "library",
+    sidebarCollapsed: Boolean(stored.sidebarCollapsed),
   };
 }
 
@@ -133,6 +134,22 @@ function setView(view) {
   userState.view = view;
   saveUserState();
   renderAll();
+}
+
+function applySidebarCollapsed() {
+  const app = document.querySelector(".app");
+  if (app) app.classList.toggle("sidebar-collapsed", userState.sidebarCollapsed);
+  const toggle = document.getElementById("sidebar-toggle");
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", String(!userState.sidebarCollapsed));
+    toggle.title = userState.sidebarCollapsed ? "Expand sidebar" : "Collapse sidebar";
+  }
+}
+
+function setSidebarCollapsed(on) {
+  userState.sidebarCollapsed = on;
+  saveUserState();
+  applySidebarCollapsed();
 }
 
 function currentView() {
@@ -221,6 +238,74 @@ async function openExternal(url) {
   } catch (err) {
     console.warn("openExternal failed:", err);
   }
+}
+
+// ============================================================================
+// App header (sidebar toggle + Files / Docs / Settings / About)
+// ============================================================================
+
+const REPO_URL = "https://github.com/S-Tier-Building-Automation/STierUtilities";
+
+async function openAppDataDir() {
+  try {
+    await invoke("app_open_data_dir");
+  } catch (err) {
+    console.warn("openAppDataDir failed:", err);
+    alert(`Could not open the app data folder:\n${err}`);
+  }
+}
+
+// --- About popover ---
+
+function aboutMenuEl() { return document.getElementById("about-menu"); }
+function aboutBtnEl() { return document.getElementById("header-about"); }
+
+function buildAboutMenu() {
+  return el("div", { class: "header-menu", id: "about-menu", role: "menu", hidden: true },
+    el("h4", {}, "S-Tier Utilities"),
+    el("p", { class: "menu-ver" }, `Version ${APP_VERSION}`),
+    el("button", {
+      class: "btn btn-primary",
+      onclick: () => { closeAboutMenu(); checkForUpdates({ manual: true }); },
+    }, "Check for updates"),
+    el("a", {
+      class: "menu-link", href: "#",
+      onclick: (e) => { e.preventDefault(); closeAboutMenu(); openExternal(REPO_URL); },
+    }, "GitHub repository"),
+  );
+}
+
+function onAboutOutside(e) {
+  const m = aboutMenuEl();
+  if (!m || m.hidden) return;
+  if (m.contains(e.target) || aboutBtnEl()?.contains(e.target)) return;
+  closeAboutMenu();
+}
+function onAboutKey(e) { if (e.key === "Escape") closeAboutMenu(); }
+
+function openAboutMenu() {
+  const m = aboutMenuEl();
+  if (!m) return;
+  m.hidden = false;
+  aboutBtnEl()?.setAttribute("aria-expanded", "true");
+  // Defer so the click that opened the menu doesn't immediately close it.
+  setTimeout(() => {
+    document.addEventListener("click", onAboutOutside, true);
+    document.addEventListener("keydown", onAboutKey);
+  }, 0);
+}
+function closeAboutMenu() {
+  const m = aboutMenuEl();
+  if (!m || m.hidden) return;
+  m.hidden = true;
+  aboutBtnEl()?.setAttribute("aria-expanded", "false");
+  document.removeEventListener("click", onAboutOutside, true);
+  document.removeEventListener("keydown", onAboutKey);
+}
+function toggleAboutMenu() {
+  const m = aboutMenuEl();
+  if (m && m.hidden) openAboutMenu();
+  else closeAboutMenu();
 }
 
 // ============================================================================
@@ -3012,6 +3097,11 @@ async function checkForUpdates({ manual = false, silent = false } = {}) {
     const update = await updater.check();
     if (!update) {
       if (!silent) setUpdateStatus(`You're on the latest version (v${APP_VERSION}).`, "ok");
+      // When triggered off the Settings page (e.g. the header About popover),
+      // there's no status line to update — surface the result directly.
+      if (manual && !document.getElementById("update-status")) {
+        alert(`You're on the latest version (v${APP_VERSION}).`);
+      }
       return;
     }
     setUpdateStatus(`Update available: v${update.version}. Download will start when confirmed.`, "warn");
@@ -3106,9 +3196,33 @@ function renderSidebar() {
 // Top-level render
 // ============================================================================
 
+function renderHeaderBreadcrumb() {
+  const bc = document.getElementById("header-breadcrumb");
+  if (!bc) return;
+  bc.replaceChildren();
+  const view = currentView();
+  if (view === "settings") {
+    bc.appendChild(el("span", { class: "crumb-current" }, "Settings"));
+  } else if (view.startsWith("plugin:")) {
+    const id = view.slice("plugin:".length);
+    const tool = TOOLS.find((t) => t.id === id);
+    bc.appendChild(el("a", {
+      class: "crumb-link", href: "#",
+      onclick: (e) => { e.preventDefault(); setView("library"); },
+    }, "Library"));
+    bc.appendChild(el("span", { class: "crumb-sep" }, "›"));
+    bc.appendChild(el("span", { class: "crumb-current" },
+      tool ? `${tool.emoji} ${tool.name}` : id));
+  } else {
+    bc.appendChild(el("span", { class: "crumb-current" }, "Library"));
+  }
+}
+
 function renderAll() {
   renderSidebar();
   const view = currentView();
+  renderHeaderBreadcrumb();
+  document.getElementById("header-settings")?.classList.toggle("active", view === "settings");
   if (view === "settings") renderSettings();
   else if (view.startsWith("plugin:")) renderPluginPage(view.slice("plugin:".length));
   else renderLibrary();
@@ -3163,6 +3277,47 @@ window.addEventListener("DOMContentLoaded", async () => {
   for (const btn of document.querySelectorAll(".sidebar-nav-item")) {
     btn.addEventListener("click", () => setView(btn.dataset.view));
   }
+
+  document
+    .getElementById("sidebar-toggle")
+    ?.addEventListener("click", () => setSidebarCollapsed(!userState.sidebarCollapsed));
+  applySidebarCollapsed();
+
+  // App-header actions
+  document.querySelector(".app-header")?.appendChild(buildAboutMenu());
+  document.getElementById("header-files")?.addEventListener("click", openAppDataDir);
+  document.getElementById("header-docs")?.addEventListener("click", () => openExternal(REPO_URL));
+  document.getElementById("header-settings")?.addEventListener("click", () => setView("settings"));
+  document.getElementById("header-about")?.addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleAboutMenu();
+  });
+
+  // Custom titlebar window controls (native window decorations are disabled,
+  // so the app header doubles as the titlebar — drag via data-tauri-drag-region).
+  const appWindow = window.__TAURI__.window.getCurrentWindow();
+  const MAX_ICON =
+    '<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" stroke-width="1"/></svg>';
+  const RESTORE_ICON =
+    '<svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x="0.5" y="2.5" width="7" height="7" fill="none" stroke="currentColor" stroke-width="1"/><path d="M2.5 2.5V0.5H9.5V7.5H7.5" fill="none" stroke="currentColor" stroke-width="1"/></svg>';
+  async function syncMaxButton() {
+    try {
+      const maxed = await appWindow.isMaximized();
+      const btn = document.getElementById("win-max");
+      if (!btn) return;
+      btn.innerHTML = maxed ? RESTORE_ICON : MAX_ICON;
+      btn.title = maxed ? "Restore" : "Maximize";
+      btn.setAttribute("aria-label", btn.title);
+    } catch (_) {}
+  }
+  document.getElementById("win-min")?.addEventListener("click", () => appWindow.minimize());
+  document.getElementById("win-max")?.addEventListener("click", async () => {
+    await appWindow.toggleMaximize();
+    syncMaxButton();
+  });
+  document.getElementById("win-close")?.addEventListener("click", () => appWindow.close());
+  appWindow.onResized(() => syncMaxButton());
+  syncMaxButton();
 
   try {
     const s = await invoke("clipboardtyper_get_state");

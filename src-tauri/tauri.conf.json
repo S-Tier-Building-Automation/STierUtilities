@@ -11,6 +11,7 @@
     "windows": [
       {
         "title": "S-Tier Utilities",
+        "decorations": false,
         "width": 960,
         "height": 700,
         "minWidth": 720,
