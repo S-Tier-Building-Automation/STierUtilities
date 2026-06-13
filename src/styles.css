@@ -903,6 +903,15 @@ a:hover { text-decoration: underline; }
 .nm-scan-th:hover { color: var(--text); }
 .nm-scan-th:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .nm-scan-th-active { color: var(--accent); }
+
+/* Observability page — key/value buffer stats */
+.kv-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+  gap: 8px 18px;
+}
+.kv-row { display: flex; flex-direction: column; gap: 2px; }
+.kv-row > span:last-child { font-variant-numeric: tabular-nums; font-size: 15px; }
 .nm-scan-sort-ind { margin-left: 5px; font-size: 9px; vertical-align: middle; }
 .nm-scan-table td { padding: 7px 10px; border-bottom: 1px solid var(--border); }
 .nm-scan-row:hover { background: var(--bg-elev-2); }

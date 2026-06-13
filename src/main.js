@@ -1,3 +1,13 @@
+import { TOOL_MANIFESTS } from "./tools/manifests.js";
+import { createKernel } from "./platform/host.js";
+import { buildFactories } from "./tools/capabilities.js";
+import { createTimeseries } from "./platform/services/timeseries.js";
+import { createScheduler } from "./platform/services/scheduler.js";
+import { createPackController } from "./platform/services/pack-controller.js";
+import { validateManifest } from "./platform/manifest.js";
+import { grantsFromInstall, approveInstall } from "./platform/mcp-loader.js";
+import { buildMcpFactories } from "./platform/services/mcp-client.js";
+
 const { invoke, convertFileSrc } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const opener = window.__TAURI__.opener;
@@ -7,71 +17,71 @@ const tauriProcess = window.__TAURI__.process;
 const APP_VERSION = "0.5.4";
 
 // ============================================================================
-// Tool catalog
+// Tool catalog — derived from manifests (the single source of truth) plus the
+// per-tool UI renderers. The platform kernel boots from the same manifests, so
+// "registering a tool" means adding a manifest, not editing this list.
 // ============================================================================
 
-const TOOLS = [
-  {
-    id: "clipboardtyper",
-    name: "ClipboardTyper",
-    emoji: "⌨️",
-    tagline: "Middle-click your mouse to auto-type your clipboard.",
-    description:
-      "Useful for local password fields, some remote-desktop login screens, " +
-      "VMs, and anywhere Ctrl+V is blocked. ClipboardTyper installs a low-level " +
-      "mouse hook while enabled; middle-clicks are intercepted and your clipboard " +
-      "contents are sent with Windows SendInput scan codes. Some remote tools, including " +
-      "DeskIn in certain modes, may ignore or refuse to forward injected input.",
-    repo: "https://github.com/stier1ba/ClipboardTyper",
-    renderStatusPill: ctStatusPill,
-    renderPage: renderClipboardTyperPage,
-  },
-  {
-    id: "heicmov",
-    name: "HEIC & MOV",
-    emoji: "🖼️",
-    tagline: "Preview and convert iPhone photos and videos on Windows.",
-    description:
-      "Open HEIC, HEIF, and MOV files from your phone or cloud sync folder. " +
-      "Preview them in the app, then convert images to JPEG (or PNG) and videos " +
-      "to MP4. FFmpeg is bundled — no separate install required.",
-    repo: "https://github.com/S-Tier-Building-Automation/STierUtilities",
-    renderStatusPill: hmStatusPill,
-    renderPage: renderHeicMovPage,
-  },
-  {
-    id: "networkmanager",
-    name: "Network Manager",
-    emoji: "🌐",
-    tagline: "Save network profiles and see which one Windows is using.",
-    description:
-      "Save reusable IPv4 + DNS profiles for your network adapters and see at a " +
-      "glance whether Windows currently matches one (\"drift\"). Capture the live " +
-      "settings of any adapter into a new profile, then apply a profile to switch " +
-      "an adapter's IPv4/DNS settings. Applying prompts for administrator approval.",
-    repo: "https://github.com/S-Tier-Building-Automation/STierUtilities",
-    renderStatusPill: nmStatusPill,
-    renderPage: renderNetworkManagerPage,
-  },
-  {
-    id: "bacnet",
-    name: "BACnet Explorer",
-    emoji: "🏢",
-    tagline: "Discover BACnet/IP devices, browse objects, read & write points.",
-    description:
-      "A YABE-style BACnet/IP management tool. Broadcast a Who-Is to discover " +
-      "devices (including ones behind BACnet routers), browse each device's " +
-      "object list, read every property of a point, and write present-value " +
-      "with a command priority — including relinquishing a slot by writing " +
-      "Null. Uses an ephemeral UDP port, so it coexists with Niagara or any " +
-      "other BACnet stack running on this machine.",
-    repo: "https://github.com/S-Tier-Building-Automation/STierUtilities",
-    renderStatusPill: bacStatusPill,
-    renderPage: renderBacnetPage,
-  },
-];
+// Renderers keyed by manifest id. The referenced functions are hoisted
+// declarations defined later in this file.
+const TOOL_RENDERERS = {
+  clipboardtyper: { renderStatusPill: ctStatusPill, renderPage: renderClipboardTyperPage },
+  heicmov: { renderStatusPill: hmStatusPill, renderPage: renderHeicMovPage },
+  networkmanager: { renderStatusPill: nmStatusPill, renderPage: renderNetworkManagerPage },
+  bacnet: { renderStatusPill: bacStatusPill, renderPage: renderBacnetPage },
+  observability: { renderStatusPill: obsStatusPill, renderPage: renderObservabilityPage },
+  "bacnet-historian": { renderStatusPill: histStatusPill, renderPage: renderHistorianPage },
+};
+
+// Map a manifest to a catalog entry. First-party tools use their dedicated
+// renderer; installed kind:"mcp" tools get a generic MCP page.
+function manifestToTool(m) {
+  let renderers = TOOL_RENDERERS[m.id];
+  if (!renderers && m.kind === "mcp") {
+    renderers = { renderStatusPill: () => mcpStatusPill(m), renderPage: () => renderMcpToolPage(m) };
+  }
+  renderers = renderers || {};
+  return {
+    id: m.id,
+    name: m.name,
+    emoji: (m.ui && m.ui.emoji) || "🧩",
+    tagline: (m.ui && m.ui.tagline) || "",
+    description: (m.ui && m.ui.description) || "",
+    repo: m.ui && m.ui.repo,
+    manifest: m,
+    ...renderers,
+  };
+}
+
+// The full manifest set = first-party + installed third-party (mcp) tools, and
+// the catalog derived from it. Both are rebuilt (rebuildCatalog) once user state
+// is loaded and after any install/remove. The kernel boots from ALL_MANIFESTS.
+let ALL_MANIFESTS = [...TOOL_MANIFESTS];
+let TOOLS = ALL_MANIFESTS.map(manifestToTool);
+
+function rebuildCatalog() {
+  const installed = (userState.installedTools || []).filter((m) => validateManifest(m).valid);
+  ALL_MANIFESTS = [...TOOL_MANIFESTS, ...installed];
+  TOOLS = ALL_MANIFESTS.map(manifestToTool);
+}
 
 function toolById(id) { return TOOLS.find((t) => t.id === id); }
+
+// The platform kernel. Booted once in bootstrap(); tool pages reach shared
+// capabilities through platformHost(toolId) once it's up.
+let platform = null;
+// The shared timeseries service instance (passed into the kernel factories so
+// every tool writes to the same buffer/ring), the scheduler, and the
+// Observability Pack controller.
+let telemetry = null;
+let scheduler = null;
+let pack = null;
+
+/** Scoped host for a tool's page, or null if the kernel isn't booted. */
+function platformHost(toolId) {
+  try { return platform ? platform.hostFor(toolId) : null; }
+  catch (_) { return null; }
+}
 
 // ============================================================================
 // Persistent UI state
@@ -80,6 +90,7 @@ function toolById(id) { return TOOLS.find((t) => t.id === id); }
 const STORAGE_KEY = "microtools.user_state.v2";
 
 const userState = loadUserState();
+rebuildCatalog(); // fold installed third-party (mcp) tools into the catalog
 
 function loadUserState() {
   let stored = {};
@@ -94,6 +105,9 @@ function loadUserState() {
     showHidden: Boolean(stored.showHidden),
     view: typeof stored.view === "string" ? stored.view : "library",
     sidebarCollapsed: Boolean(stored.sidebarCollapsed),
+    historian: stored.historian || null,
+    installedTools: Array.isArray(stored.installedTools) ? stored.installedTools : [],
+    installedGrants: stored.installedGrants || {},
   };
 }
 
@@ -1941,6 +1955,33 @@ function bacEnsureListeners() {
 
 // ---- actions ----
 
+// Inter-tool dependency in action: BACnet Explorer borrows Network Manager's
+// subnet scanner (the `netscan` capability) to find live hosts to aim discovery
+// at — instead of reimplementing an ICMP sweep. Only offered when the kernel
+// resolved the optional dependency, so it degrades cleanly if Network Manager
+// is unavailable.
+async function bacSuggestTargets() {
+  const netscan = platformHost("bacnet")?.tryUse("netscan.v1");
+  if (!netscan) { logTo("bacnet", "Network scan capability unavailable.", "warn"); return; }
+  if (!nm.loaded) { try { await nmRefresh(); } catch (_) {} }
+  let subnet = null;
+  for (const a of nm.adapters) {
+    const s = nmScanSubnetFor(a.name);
+    if (s) { subnet = s; break; }
+  }
+  if (!subnet) { logTo("bacnet", "No adapter with a scannable IPv4 subnet to search.", "warn"); return; }
+  logTo("bacnet", `Scanning ${subnet.network}/${subnet.prefix} for live hosts (via Network Manager)…`, "info");
+  try {
+    const result = await netscan.scan(`${subnet.ip}/${subnet.prefix}`);
+    const hosts = result?.hosts || [];
+    if (hosts.length === 0) { logTo("bacnet", "No live hosts found on the subnet.", "warn"); return; }
+    const preview = hosts.slice(0, 12).map((h) => h.ip).join(", ");
+    logTo("bacnet", `Found ${hosts.length} live host${hosts.length === 1 ? "" : "s"}: ${preview}${hosts.length > 12 ? "…" : ""}`, "ok");
+  } catch (err) {
+    logTo("bacnet", `Host scan failed: ${err}`, "error");
+  }
+}
+
 async function bacDiscover() {
   if (bac.discovering) return;
   bacEnsureListeners();
@@ -2727,6 +2768,17 @@ function renderBacnetPage() {
     onclick: bacDiscover,
   }, bac.discovering ? "Discovering…" : "Discover");
 
+  // Offered only when the platform kernel resolved BACnet's optional dependency
+  // on the netscan capability (i.e. Network Manager is present).
+  const scanBtn = platformHost("bacnet")?.has("netscan.v1")
+    ? el("button", {
+        class: "btn btn-ghost",
+        disabled: bac.discovering ? "disabled" : undefined,
+        title: "Use Network Manager's scanner to list live hosts on your subnet",
+        onclick: bacSuggestTargets,
+      }, "Find live hosts")
+    : null;
+
   const discoverSection = el("section", { class: "plugin-section" },
     el("div", { class: "nm-pane-head" },
       el("div", { class: "nm-pane-head-text" },
@@ -2744,6 +2796,7 @@ function renderBacnetPage() {
         el("div", { class: "bac-range-pair" }, lowInput, el("span", { class: "muted" }, "–"), highInput),
       ),
       discoverBtn,
+      scanBtn,
     ),
     bacTargetChips(),
   );
@@ -2837,6 +2890,334 @@ function renderBacnetPage() {
     devicesSection,
     browseSection,
   );
+}
+
+// ============================================================================
+// Observability (platform service page)
+// ============================================================================
+
+// Pack UI state.
+let obsBusy = false;
+let obsStep = "";
+let obsHealth = null;
+
+function obsStatusPill() {
+  if (obsHealth && obsHealth.influxReady) return { label: "Live", cls: "pill-running" };
+  if (obsHealth && obsHealth.influxUp) return { label: "Starting", cls: "pill-muted" };
+  const s = telemetry ? telemetry.stats() : null;
+  if (s && s.backend && s.degraded) return { label: "Reconnecting", cls: "pill-muted" };
+  return { label: "Local", cls: "pill-idle" };
+}
+
+async function obsRefreshHealth() {
+  if (!pack) return;
+  try { obsHealth = await pack.health(); }
+  catch (_) { obsHealth = null; }
+  renderAll();
+}
+
+async function obsBringUp() {
+  if (!pack || obsBusy) return;
+  obsBusy = true; obsStep = "starting"; renderAll();
+  try {
+    logTo("observability", "Bringing up the Observability Pack… (first run downloads ~400 MB)", "info");
+    const cfg = await pack.bringUp((s) => { obsStep = s; renderAll(); });
+    logTo("observability", `Pack up — InfluxDB :${cfg.influxPort}, Grafana :${cfg.grafanaPort}.`, "ok");
+    await obsRefreshHealth();
+  } catch (err) {
+    logTo("observability", `Bring-up failed: ${err}`, "error");
+  } finally {
+    obsBusy = false; obsStep = ""; renderAll();
+  }
+}
+
+async function obsStop() {
+  if (!pack) return;
+  try { await pack.stop(); logTo("observability", "Stopped pack services.", "info"); await obsRefreshHealth(); }
+  catch (err) { logTo("observability", `Stop failed: ${err}`, "error"); }
+}
+
+async function obsWriteConfigs() {
+  if (!pack) return;
+  try { const dir = await pack.writeConfigs(); logTo("observability", `Wrote pack config files to ${dir}.`, "ok"); }
+  catch (err) { logTo("observability", `Could not write configs: ${err}`, "error"); }
+}
+
+function renderObservabilityPage() {
+  const stats = telemetry ? telemetry.stats() : null;
+  const recent = telemetry ? telemetry.recent(15) : [];
+  const cfg = pack ? pack.getConfig() : null;
+
+  const healthLine = obsHealth
+    ? `InfluxDB: ${obsHealth.influxReady ? "ready" : obsHealth.influxUp ? "starting" : "down"} · Grafana: ${obsHealth.grafanaUp ? "up" : "down"}`
+    : "Health unknown — click Check health.";
+
+  const statusCard = el("section", { class: "plugin-section" },
+    el("h3", {}, "Observability Pack"),
+    el("p", { class: "muted small" },
+      "Telegraf + InfluxDB + Grafana run locally on 127.0.0.1. The first install downloads ~400 MB; " +
+      "until then, tool metrics are kept in an in-memory ring buffer (still visible below)."),
+    el("p", { class: "muted small" }, obsBusy ? `Working… ${obsStep}` : healthLine),
+    el("div", { class: "tool-actions" },
+      el("button", {
+        class: "btn btn-primary",
+        disabled: obsBusy ? "disabled" : undefined,
+        onclick: obsBringUp,
+      }, obsBusy ? `Working… ${obsStep}` : "Install & start pack"),
+      el("button", { class: "btn-ghost", disabled: obsBusy ? "disabled" : undefined, onclick: obsStop }, "Stop"),
+      el("button", { class: "btn-ghost", onclick: obsRefreshHealth }, "Check health"),
+      el("button", { class: "btn-ghost", disabled: obsBusy ? "disabled" : undefined, onclick: obsWriteConfigs }, "Write configs"),
+      obsHealth && obsHealth.grafanaUp && cfg
+        ? el("button", { class: "btn-ghost", onclick: () => openExternal(`http://127.0.0.1:${cfg.grafanaPort}`) }, "Open Grafana")
+        : null,
+    ),
+  );
+
+  const statRow = (label, val) => el("div", { class: "kv-row" },
+    el("span", { class: "muted small" }, label), el("span", {}, String(val)));
+  const statsCard = el("section", { class: "plugin-section" },
+    el("h3", {}, "Buffer"),
+    stats
+      ? el("div", { class: "kv-grid" },
+          statRow("Recent (ring)", stats.ring),
+          statRow("Buffered", stats.buffered),
+          statRow("Written", stats.written),
+          statRow("Dropped", stats.dropped),
+        )
+      : el("p", { class: "muted small" }, "Telemetry service not started."),
+  );
+
+  const recentCard = el("section", { class: "plugin-section" },
+    el("div", { class: "section-head" },
+      el("h3", {}, "Recent metrics"),
+      el("button", { class: "btn-ghost", onclick: () => renderAll() }, "Refresh"),
+    ),
+    recent.length === 0
+      ? el("p", { class: "muted small" }, "No metrics recorded yet. Run a tool (e.g. a network scan) to produce some.")
+      : el("ol", { class: "plugin-log" },
+          ...recent.slice().reverse().map((p) =>
+            el("li", { class: "log-info" },
+              el("span", { class: "log-time" }, new Date(p.ts).toLocaleTimeString()),
+              el("span", { class: "log-msg" },
+                `${p.measurement} ${Object.entries(p.tags).map(([k, v]) => `${k}=${v}`).join(",")} → ${Object.entries(p.fields).map(([k, v]) => `${k}=${v}`).join(", ")}`),
+            )),
+        ),
+  );
+
+  return el("div", { class: "plugin-controls" }, statusCard, statsCard, recentCard);
+}
+
+// ============================================================================
+// BACnet Historian (composed tool page)
+// ============================================================================
+
+function historianInstance() {
+  return platform ? platform.capability("bacnet.historian.v1") : null;
+}
+
+let histIntervalMs = 60000;
+
+function histStatusPill() {
+  const hist = historianInstance();
+  if (!hist) return { label: "Off", cls: "pill-muted" };
+  return hist.isRunning() ? { label: "Logging", cls: "pill-running" } : { label: "Idle", cls: "pill-idle" };
+}
+
+// Persist the configured points + run state so unattended logging survives a
+// reload/restart (the historian core itself is in-memory only).
+function histPersist() {
+  const hist = historianInstance();
+  if (!hist) return;
+  userState.historian = {
+    points: hist.points().map((p) => ({
+      device: p.device, objectType: p.objectType, instance: p.instance, label: p.label || "",
+    })),
+    running: hist.isRunning(),
+    intervalMs: histIntervalMs,
+  };
+  saveUserState();
+}
+
+function histRestore() {
+  const hist = historianInstance();
+  const saved = userState.historian;
+  if (!hist || !saved) return;
+  for (const p of saved.points || []) hist.addPoint(p);
+  if (saved.intervalMs) histIntervalMs = saved.intervalMs;
+  if (saved.running && (saved.points || []).length) {
+    hist.start(histIntervalMs);
+    logTo("bacnet-historian", `Resumed logging ${saved.points.length} point(s).`, "info");
+  }
+}
+
+function renderHistorianPage() {
+  const hist = historianInstance();
+  if (!hist) {
+    return el("div", { class: "plugin-controls" },
+      el("section", { class: "plugin-section" },
+        el("p", { class: "muted" }, "Historian unavailable — the platform kernel did not resolve its dependencies.")));
+  }
+
+  // Devices come from the BACnet Explorer's discovery results (inter-tool reuse).
+  const devices = bac.devices || [];
+  let devIdx = devices.length ? "0" : "";
+  const objTypeInput = el("input", { type: "number", class: "nm-input bac-range-input", value: "0", title: "Object type (0=AI, 1=AO, 2=AV, …)" });
+  const instInput = el("input", { type: "number", class: "nm-input bac-range-input", value: "0" });
+  const labelInput = el("input", { type: "text", class: "nm-input", placeholder: "label (optional)" });
+  const devSelect = el("select", { class: "nm-input", onchange: (e) => { devIdx = e.target.value; } },
+    ...(devices.length
+      ? devices.map((d, i) => el("option", { value: String(i) }, bacDeviceLabel(d)))
+      : [el("option", { value: "" }, "No devices — discover in BACnet Explorer first")]));
+
+  const addBtn = el("button", {
+    class: "btn",
+    disabled: devices.length ? undefined : "disabled",
+    onclick: () => {
+      const dev = devices[Number(devIdx)];
+      if (!dev) return;
+      hist.addPoint({
+        device: { ...bacDeviceRef(dev), deviceInstance: dev.instance },
+        objectType: Number(objTypeInput.value),
+        instance: Number(instInput.value),
+        label: labelInput.value.trim(),
+      });
+      logTo("bacnet-historian", `Added device ${dev.instance} point ${objTypeInput.value}:${instInput.value}.`, "ok");
+      histPersist();
+      renderAll();
+    },
+  }, "Add point");
+
+  const addCard = el("section", { class: "plugin-section" },
+    el("h3", {}, "Add a point"),
+    el("p", { class: "muted small" }, "Points are read from devices discovered in the BACnet Explorer."),
+    el("div", { class: "bac-discover-controls" },
+      el("label", { class: "nm-field bac-target-field" }, el("span", { class: "nm-field-label" }, "Device"), devSelect),
+      el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Object type"), objTypeInput),
+      el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Instance"), instInput),
+      el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Label"), labelInput),
+      addBtn,
+    ),
+  );
+
+  const intervalInput = el("input", { type: "number", class: "nm-input bac-range-input", value: String(Math.round(histIntervalMs / 1000) || 60), title: "seconds" });
+  const running = hist.isRunning();
+  const controlCard = el("section", { class: "plugin-section" },
+    el("div", { class: "section-head" },
+      el("h3", {}, "Logging"),
+      el("span", { class: `pill ${running ? "pill-running" : "pill-idle"}` }, running ? "Logging" : "Idle")),
+    el("p", { class: "muted small" },
+      "Writes present-value to the time-series service. Connect the Observability Pack to chart it in Grafana."),
+    el("div", { class: "bac-discover-controls" },
+      el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Interval (s)"), intervalInput),
+      el("button", {
+        class: "btn btn-primary",
+        onclick: () => {
+          histIntervalMs = Math.max(5, Number(intervalInput.value) || 60) * 1000;
+          hist.start(histIntervalMs);
+          logTo("bacnet-historian", "Started logging.", "ok");
+          histPersist();
+          renderAll();
+        },
+      }, running ? "Restart" : "Start"),
+      running
+        ? el("button", { class: "btn-ghost", onclick: () => { hist.stop(); logTo("bacnet-historian", "Stopped logging.", "info"); histPersist(); renderAll(); } }, "Stop")
+        : null,
+      el("button", {
+        class: "btn-ghost",
+        onclick: async () => {
+          const r = await hist.pollOnce();
+          logTo("bacnet-historian", `Polled — ${r.written} written, ${r.errors} error(s).`, r.errors ? "warn" : "ok");
+          renderAll();
+        },
+      }, "Poll now"),
+    ),
+  );
+
+  const pts = hist.points();
+  const pointsCard = el("section", { class: "plugin-section" },
+    el("h3", {}, `Points (${pts.length})`),
+    pts.length === 0
+      ? el("p", { class: "muted small" }, "No points yet — add one above.")
+      : el("ol", { class: "plugin-log" },
+          ...pts.map((p) =>
+            el("li", { class: p.lastError ? "log-error" : "log-info" },
+              el("span", { class: "log-msg" },
+                `${p.label ? p.label + " · " : ""}dev ${p.device.deviceInstance} ${p.objectType}:${p.instance} → ` +
+                `${p.lastError ? "ERR " + p.lastError : (p.lastValue ?? "—")} (${p.reads} reads)`),
+              el("button", { class: "btn-ghost", onclick: () => { hist.removePoint(p); histPersist(); renderAll(); } }, "Remove"),
+            ))),
+  );
+
+  return el("div", { class: "plugin-controls" }, controlCard, addCard, pointsCard);
+}
+
+// ============================================================================
+// Third-party MCP tools (install / page / remove)
+// ============================================================================
+
+function mcpStatusPill(m) {
+  if (platform && platform.isBooted(m.id)) return { label: "Connected", cls: "pill-running" };
+  return { label: "Off", cls: "pill-muted" };
+}
+
+function renderMcpToolPage(m) {
+  const booted = platform && platform.isBooted(m.id);
+  const caps = (m.provides || []).map((p) => `${p.capability}.v${String(p.version).split(".")[0]}`);
+  const entry = m.entry || {};
+  return el("div", { class: "plugin-controls" },
+    el("section", { class: "plugin-section" },
+      el("h3", {}, "Third-party MCP tool"),
+      el("p", { class: "muted small" },
+        booted
+          ? "Connected — its capabilities are available to other tools via the kernel."
+          : "Not connected — the MCP server failed to start (check the command is installed)."),
+      el("p", { class: "muted small" }, `Provides: ${caps.length ? caps.join(", ") : "—"}`),
+      el("p", { class: "muted small" }, `Permissions: ${(m.permissions || []).join(", ") || "none"}`),
+      el("p", { class: "muted small" }, `Command: ${entry.command || "?"} ${(entry.args || []).join(" ")}`),
+      el("div", { class: "tool-actions" },
+        el("button", { class: "btn-ghost", onclick: () => mcpRemove(m.id) }, "Remove tool"),
+      ),
+    ),
+  );
+}
+
+// Install a kind:"mcp" tool from a pasted manifest: validate, get permission
+// approval, persist, then reload so the kernel boots it.
+async function mcpInstallFromJson(jsonText) {
+  let manifest;
+  try { manifest = JSON.parse(jsonText); }
+  catch (e) { alert(`Invalid JSON: ${e.message}`); return; }
+
+  const { valid, errors } = validateManifest(manifest);
+  if (!valid) { alert(`Invalid manifest:\n${errors.join("\n")}`); return; }
+  if (manifest.kind !== "mcp") { alert('Only kind:"mcp" tools can be installed here.'); return; }
+  const exists = ALL_MANIFESTS.some((t) => t.id === manifest.id);
+  if (exists) { alert(`A tool with id "${manifest.id}" already exists.`); return; }
+
+  const granted = await approveInstall(manifest, ({ permissions }) =>
+    confirm(`"${manifest.name}" requests these permissions:\n\n${permissions.join("\n")}\n\nApprove and install?`));
+  if ((manifest.permissions || []).length && granted.size === 0) {
+    alert("Install cancelled — permissions were not approved.");
+    return;
+  }
+
+  userState.installedTools = [...(userState.installedTools || []), manifest];
+  userState.installedGrants = { ...(userState.installedGrants || {}), [manifest.id]: [...granted] };
+  saveUserState();
+  alert(`Installed "${manifest.name}". The app will reload to start it.`);
+  location.reload();
+}
+
+async function mcpRemove(id) {
+  if (!confirm("Remove this MCP tool?")) return;
+  try { await invoke("mcp_stop", { id }); } catch (_) {}
+  userState.installedTools = (userState.installedTools || []).filter((t) => t.id !== id);
+  const grants = { ...(userState.installedGrants || {}) };
+  delete grants[id];
+  userState.installedGrants = grants;
+  if (currentPluginId() === id) userState.view = "library";
+  saveUserState();
+  location.reload();
 }
 
 // ============================================================================
@@ -3051,6 +3432,33 @@ function renderSettings() {
         href: "#",
         onclick: (e) => { e.preventDefault(); openExternal("https://github.com/S-Tier-Building-Automation/STierUtilities"); },
       }, "github.com/S-Tier-Building-Automation/STierUtilities"),
+    ),
+  ));
+
+  // ===== Third-party tools (MCP) =====
+  const installed = userState.installedTools || [];
+  const mcpTextarea = el("textarea", {
+    class: "nm-input",
+    rows: "6",
+    style: "width:100%; font-family:monospace; font-size:12px;",
+    placeholder: '{ "id": "my-tool", "name": "My Tool", "version": "0.1.0", "apiVersion": "1", "kind": "mcp", "entry": { "transport": "stdio", "command": "my-mcp.exe" }, "provides": [{ "capability": "my.thing", "version": "1.0" }], "permissions": [] }',
+  });
+  root.appendChild(el("section", { class: "settings-card" },
+    el("h3", {}, "Third-party tools (MCP)"),
+    el("p", { class: "muted small" },
+      "Install a tool that plugs in as an MCP server. Paste its manifest below; you'll approve its permissions, then the app restarts to connect it. Its capabilities become available to other tools."),
+    installed.length
+      ? el("ul", { class: "hidden-list" },
+          ...installed.map((m) => el("li", { class: "hidden-row" },
+            el("span", { class: "hidden-row-icon" }, (m.ui && m.ui.emoji) || "🧩"),
+            el("span", { class: "hidden-row-name" }, `${m.name} (${m.id})`),
+            el("span", { class: "hidden-row-tag" }, platform && platform.isBooted(m.id) ? "connected" : "off"),
+            el("button", { class: "btn-ghost", onclick: () => mcpRemove(m.id) }, "Remove"),
+          )))
+      : el("p", { class: "muted small" }, "No third-party tools installed."),
+    mcpTextarea,
+    el("div", { class: "tool-actions", style: "margin-top:8px;" },
+      el("button", { class: "btn btn-primary", onclick: () => mcpInstallFromJson(mcpTextarea.value) }, "Install MCP tool"),
     ),
   ));
 
@@ -3325,6 +3733,50 @@ window.addEventListener("DOMContentLoaded", async () => {
     ctPending = ctClonePending(s.settings);
   } catch (err) {
     logTo("clipboardtyper", `Could not read state: ${err}`, "error");
+  }
+
+  // Boot the platform kernel: validate the tool manifests, resolve the
+  // capability dependency graph, and register native capability implementations
+  // (network.adapters, netscan, media.convert, bacnet.read, …). Defensive — a
+  // kernel failure must never take down the rest of the UI.
+  try {
+    telemetry = createTimeseries();
+    scheduler = createScheduler();
+    rebuildCatalog();
+    const installed = ALL_MANIFESTS.filter((m) => m.kind === "mcp");
+    const factories = new Map([
+      ...buildFactories(invoke, { timeseries: telemetry, scheduler }),
+      ...buildMcpFactories(invoke, installed),
+    ]);
+    const installGrants = new Map(
+      Object.entries(userState.installedGrants || {}).map(([id, perms]) => [id, new Set(perms)]),
+    );
+    platform = createKernel({
+      manifests: ALL_MANIFESTS,
+      factories,
+      grant: grantsFromInstall(installGrants),
+      onLog: (e) => console.debug(`[platform:${e.toolId}] ${e.msg}`),
+    });
+    const res = await platform.boot();
+    if (!res.ok) console.warn("[platform] capability graph issues:", res.errors);
+
+    // Observability Pack controller. The service starts degraded (ring buffer);
+    // connecting attaches the live InfluxDB transport. The periodic flush is a
+    // no-op until then, so it's safe to run unconditionally.
+    pack = createPackController({ invoke, timeseries: telemetry });
+    setInterval(() => { pack.flush().catch(() => {}); }, 10000);
+
+    // Granular install progress from the Rust downloader.
+    listen("observability://install", (e) => {
+      const p = e.payload || {};
+      obsStep = `${p.component || "pack"}: ${p.step || ""} (${(p.index ?? 0) + 1}/${p.total ?? 3})`;
+      if (currentPluginId() === "observability") renderAll();
+    });
+
+    // Restore any previously-configured Historian points + resume logging.
+    histRestore();
+  } catch (err) {
+    console.error("[platform] kernel boot failed:", err);
   }
 
   // Load saved network profiles up front so the library card shows a count.

@@ -1,0 +1,36 @@
+{
+  "__comment": "Dashboard-as-code for the bacnet_point measurement written by the BACnet Historian. Provisioned into Grafana by the Observability Pack supervisor. Referenced by the bacnet-historian manifest's `dashboards` field.",
+  "uid": "stier-bacnet-points",
+  "title": "BACnet — Point Trends",
+  "tags": ["s-tier", "bacnet"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "device",
+        "type": "query",
+        "datasource": { "type": "influxdb", "uid": "influxdb" },
+        "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"utilities\", tag: \"device\", predicate: (r) => r._measurement == \"bacnet_point\")",
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Present value — device $device",
+      "type": "timeseries",
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "line", "fillOpacity": 8, "showPoints": "never" } } },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"utilities\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"bacnet_point\" and r._field == \"present_value\")\n  |> filter(fn: (r) => r.device == \"${device}\")\n  |> aggregateWindow(every: v.windowPeriod, fn: mean)\n  |> group(columns: [\"object\", \"label\"])"
+        }
+      ]
+    }
+  ]
+}
