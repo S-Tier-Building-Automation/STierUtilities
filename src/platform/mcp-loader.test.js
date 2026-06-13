@@ -55,6 +55,16 @@ test("the proxy is not mistaken for a Promise (no thenable trap)", () => {
   assert.equal(cap.then, undefined);
 });
 
+test("the proxy does not fire RPCs on JSON.stringify / coercion / introspection", () => {
+  const client = mockMcpClient();
+  const cap = mcpCapabilityProxy(client, "x");
+  for (const k of ["toJSON", "toString", "valueOf", "constructor", "inspect", "catch", "finally"]) {
+    assert.equal(cap[k], undefined, `${k} must not be a method`);
+  }
+  JSON.stringify(cap);          // would throw / RPC if toJSON were proxied
+  assert.equal(client.calls.length, 0, "no tools/call should have fired");
+});
+
 test("an MCP tool registers its capability through the kernel like a native one", async () => {
   const client = mockMcpClient();
   const consumer = {

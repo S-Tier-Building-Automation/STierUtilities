@@ -16,11 +16,18 @@ import { validateManifest } from "./manifest.js";
  * `<prefix>.<method>`. Guards against the thenable trap so the proxy can be
  * returned from async code without being mistaken for a Promise.
  */
+// Property names that must NOT be treated as MCP tool methods, or the proxy would
+// fire spurious tools/call RPCs (or throw) during JSON.stringify, string coercion,
+// promise-resolution, or runtime introspection of the capability object.
+const RESERVED_PROXY_KEYS = new Set([
+  "then", "catch", "finally", "toJSON", "toString", "valueOf", "constructor", "inspect", "prototype",
+]);
+
 export function mcpCapabilityProxy(client, prefix) {
   const cache = new Map();
   return new Proxy(Object.create(null), {
     get(_target, method) {
-      if (typeof method !== "string" || method === "then") return undefined;
+      if (typeof method !== "string" || RESERVED_PROXY_KEYS.has(method)) return undefined;
       if (!cache.has(method)) {
         cache.set(method, (args) => client.callTool(`${prefix}.${method}`, args ?? {}));
       }

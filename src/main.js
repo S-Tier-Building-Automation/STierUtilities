@@ -3194,12 +3194,25 @@ async function mcpInstallFromJson(jsonText) {
   const exists = ALL_MANIFESTS.some((t) => t.id === manifest.id);
   if (exists) { alert(`A tool with id "${manifest.id}" already exists.`); return; }
 
-  const granted = await approveInstall(manifest, ({ permissions }) =>
-    confirm(`"${manifest.name}" requests these permissions:\n\n${permissions.join("\n")}\n\nApprove and install?`));
-  if ((manifest.permissions || []).length && granted.size === 0) {
-    alert("Install cancelled — permissions were not approved.");
-    return;
-  }
+  // SECURITY: installing an MCP tool runs a native program on every launch, so
+  // always require an explicit, command-disclosing confirmation — even when the
+  // manifest declares no permissions. This (not the permission list) is the real
+  // gate: the user is deciding whether to trust an executable.
+  const entry = manifest.entry || {};
+  const cmdLine = `${entry.command || "?"} ${(entry.args || []).join(" ")}`.trim();
+  const envKeys = entry.env ? Object.keys(entry.env) : [];
+  const ok = confirm(
+    `Install "${manifest.name}"?\n\n` +
+    `⚠ This runs a program on your computer every time the app launches:\n  ${cmdLine}\n` +
+    (envKeys.length ? `Environment: ${envKeys.join(", ")}\n` : "") +
+    `\nCapabilities it will provide: ${(manifest.provides || []).map((p) => p.capability).join(", ") || "none"}\n` +
+    `Permissions requested: ${(manifest.permissions || []).join(", ") || "none"}\n\n` +
+    `Only install tools from sources you trust — this is arbitrary code execution.`,
+  );
+  if (!ok) { alert("Install cancelled."); return; }
+
+  // Record the approved permission set (the command was already consented to above).
+  const granted = await approveInstall(manifest, () => true);
 
   userState.installedTools = [...(userState.installedTools || []), manifest];
   userState.installedGrants = { ...(userState.installedGrants || {}), [manifest.id]: [...granted] };

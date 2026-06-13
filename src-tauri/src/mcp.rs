@@ -130,6 +130,11 @@ fn spawn_reader(stdout: ChildStdout, pending: Arc<Mutex<HashMap<i64, mpsc::Sende
                 // notifications / log lines are ignored
             }
         }
+        // stdout closed (server exited): drop every waiting sender so in-flight
+        // requests fail fast instead of blocking the full timeout.
+        if let Ok(mut p) = pending.lock() {
+            p.clear();
+        }
     });
 }
 
@@ -139,6 +144,21 @@ fn request(handle: &ServerHandle, method: &str, params: Value) -> Result<Value, 
     let id = handle.next_id.fetch_add(1, Ordering::SeqCst);
     let (tx, rx) = mpsc::channel();
     handle.pending.lock().unwrap().insert(id, tx);
+
+    // Ensure the pending entry is removed on EVERY exit path (write/flush error,
+    // timeout) — otherwise a slow/dead server leaks one entry per call.
+    struct PendingGuard<'a> {
+        pending: &'a Arc<Mutex<HashMap<i64, mpsc::Sender<Value>>>>,
+        id: i64,
+    }
+    impl Drop for PendingGuard<'_> {
+        fn drop(&mut self) {
+            if let Ok(mut p) = self.pending.lock() {
+                p.remove(&self.id);
+            }
+        }
+    }
+    let _guard = PendingGuard { pending: &handle.pending, id };
 
     let line = build_request(id, method, &params);
     {
@@ -163,6 +183,28 @@ fn notify(handle: &ServerHandle, method: &str, params: Value) -> Result<(), Stri
     stdin.flush().map_err(|e| e.to_string())
 }
 
+/// Kill a child and reap it (kill alone leaves a zombie until wait()).
+fn kill_and_reap(handle: &ServerHandle) {
+    let mut child = handle.child.lock().unwrap();
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// True if the child process has already exited.
+fn child_exited(handle: &ServerHandle) -> bool {
+    matches!(handle.child.lock().unwrap().try_wait(), Ok(Some(_)))
+}
+
+/// Append the tail of captured stderr to an error so a failed handshake is diagnosable.
+fn with_stderr(err: String, buf: &Arc<Mutex<Vec<String>>>) -> String {
+    let lines = buf.lock().unwrap();
+    if lines.is_empty() {
+        return err;
+    }
+    let tail: Vec<&str> = lines.iter().rev().take(8).rev().map(|s| s.as_str()).collect();
+    format!("{err}\nserver stderr:\n{}", tail.join("\n"))
+}
+
 // ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
@@ -184,7 +226,7 @@ pub fn mcp_start(
     cmd.args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .creation_flags(CREATE_NO_WINDOW);
     if let Some(env) = env {
         for (k, v) in env {
@@ -194,6 +236,23 @@ pub fn mcp_start(
     let mut child = cmd.spawn().map_err(|e| format!("failed to start MCP server '{id}': {e}"))?;
     let stdin = child.stdin.take().ok_or("MCP server has no stdin")?;
     let stdout = child.stdout.take().ok_or("MCP server has no stdout")?;
+
+    // Capture the tail of stderr (drained on its own thread so the pipe never
+    // blocks the child) for diagnosing a failed handshake.
+    let stderr_buf = Arc::new(Mutex::new(Vec::<String>::new()));
+    if let Some(stderr) = child.stderr.take() {
+        let buf = Arc::clone(&stderr_buf);
+        thread::spawn(move || {
+            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                let mut b = buf.lock().unwrap();
+                b.push(line);
+                let len = b.len();
+                if len > 50 {
+                    b.drain(0..len - 50);
+                }
+            }
+        });
+    }
 
     let pending = Arc::new(Mutex::new(HashMap::new()));
     spawn_reader(stdout, Arc::clone(&pending));
@@ -213,15 +272,15 @@ pub fn mcp_start(
         "clientInfo": { "name": "s-tier-utilities", "version": "0.5.4" },
     });
     if let Err(e) = request(&handle, "initialize", init) {
-        let _ = handle.child.lock().unwrap().kill();
-        return Err(e);
+        kill_and_reap(&handle);
+        return Err(with_stderr(e, &stderr_buf));
     }
     let _ = notify(&handle, "notifications/initialized", json!({}));
     let tools = match request(&handle, "tools/list", json!({})) {
         Ok(res) => parse_tools(&res),
         Err(e) => {
-            let _ = handle.child.lock().unwrap().kill();
-            return Err(e);
+            kill_and_reap(&handle);
+            return Err(with_stderr(e, &stderr_buf));
         }
     };
     handle.tools = tools.clone();
@@ -237,6 +296,12 @@ pub fn mcp_call(id: String, name: String, arguments: Option<Value>) -> Result<Va
         let servers = SERVERS.lock().unwrap();
         servers.get(&id).cloned().ok_or_else(|| format!("MCP server '{id}' is not running"))?
     };
+    // Fail fast (and deregister) if the server process has died, instead of
+    // blocking the full request timeout on a dead pipe.
+    if child_exited(&handle) {
+        SERVERS.lock().unwrap().remove(&id);
+        return Err(format!("MCP server '{id}' has exited"));
+    }
     let params = json!({ "name": name, "arguments": arguments.unwrap_or(json!({})) });
     request(&handle, "tools/call", params)
 }
