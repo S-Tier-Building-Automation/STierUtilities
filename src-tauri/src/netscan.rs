@@ -466,6 +466,34 @@ pub async fn netscan_scan(app: AppHandle, ip: String, prefix: u8) -> Result<Scan
     Ok(result)
 }
 
+/// ICMP-echoes a single host once, creating and closing its own ICMP handle.
+/// Returns the round-trip time in ms on a successful reply, or `None`.
+fn ping_host(target: Ipv4Addr) -> Option<u32> {
+    let handle = match unsafe { IcmpCreateFile() } {
+        Ok(h) => h,
+        Err(_) => return None,
+    };
+    let rtt = ping_one(handle, target);
+    let _ = unsafe { IcmpCloseHandle(handle) };
+    rtt
+}
+
+/// Single-host reachability probe exposed as the `netscan` capability's
+/// `isReachable`. Lets other tools (e.g. BACnet Explorer) cheaply check whether a
+/// device IP answers ICMP before trying to talk to it. Returns the round-trip
+/// time in milliseconds, or `null` if the host did not reply. Runs on the blocking
+/// pool since `IcmpSendEcho` blocks up to `PING_TIMEOUT_MS`.
+#[tauri::command]
+pub async fn netscan_ping(ip: String) -> Result<Option<u32>, String> {
+    let target: Ipv4Addr = ip
+        .trim()
+        .parse()
+        .map_err(|_| "Ping target must be a valid IPv4 address.".to_string())?;
+    tauri::async_runtime::spawn_blocking(move || ping_host(target))
+        .await
+        .map_err(|e| format!("ping task panicked: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

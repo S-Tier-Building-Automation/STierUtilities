@@ -96,6 +96,66 @@ fn heicmov_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// Evict oldest cache files until the directory is under `max_bytes`. Returns the
+/// number of files removed. The preview cache is keyed by path+mtime and never
+/// self-expires, so this keeps it bounded (addresses the unbounded-growth gap).
+fn prune_cache(dir: &Path, max_bytes: u64) -> Result<usize, String> {
+    if !dir.exists() {
+        return Ok(0);
+    }
+    let mut files: Vec<(PathBuf, u64, SystemTime)> = Vec::new();
+    let mut total: u64 = 0;
+    for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let meta = match entry.metadata() {
+            Ok(m) if m.is_file() => m,
+            _ => continue,
+        };
+        total += meta.len();
+        files.push((entry.path(), meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
+    }
+    if total <= max_bytes {
+        return Ok(0);
+    }
+    files.sort_by_key(|f| f.2); // oldest first
+    let mut removed = 0;
+    let mut running = total;
+    for (path, size, _) in files {
+        if running <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&path).is_ok() {
+            running -= size;
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
+/// Prune the preview cache to a budget (default 512 MiB).
+#[tauri::command]
+pub async fn heicmov_prune_cache(app: AppHandle, max_bytes: Option<u64>) -> Result<usize, String> {
+    let dir = heicmov_cache_dir(&app)?;
+    prune_cache(&dir, max_bytes.unwrap_or(512 * 1024 * 1024))
+}
+
+/// Delete the entire preview cache. Returns the number of files removed.
+#[tauri::command]
+pub async fn heicmov_clear_cache(app: AppHandle) -> Result<usize, String> {
+    let dir = heicmov_cache_dir(&app)?;
+    let mut removed = 0;
+    if dir.exists() {
+        for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            if let Ok(e) = entry {
+                if e.metadata().map(|m| m.is_file()).unwrap_or(false) && std::fs::remove_file(e.path()).is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
 fn sidecar_output(output: Output) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
@@ -457,4 +517,55 @@ pub async fn heicmov_open_path(app: AppHandle, path: String) -> Result<(), Strin
     app.opener()
         .open_path(path, None::<&str>)
         .map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dir_total(dir: &Path) -> u64 {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter_map(|e| e.metadata().ok())
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+            .sum()
+    }
+
+    #[test]
+    fn prune_cache_evicts_down_to_budget() {
+        let dir = std::env::temp_dir().join(format!("stier_heicmov_prune_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // 5 files of 1 KiB each = 5 KiB total.
+        for i in 0..5 {
+            std::fs::write(dir.join(format!("f{i}.bin")), vec![0u8; 1024]).unwrap();
+        }
+        assert_eq!(dir_total(&dir), 5 * 1024);
+
+        // Prune to 2 KiB: should remove at least 3 files and leave <= budget.
+        let removed = prune_cache(&dir, 2 * 1024).unwrap();
+        assert!(removed >= 3, "expected to evict at least 3 files, got {removed}");
+        assert!(dir_total(&dir) <= 2 * 1024);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_cache_noop_when_under_budget() {
+        let dir = std::env::temp_dir().join(format!("stier_heicmov_under_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("a.bin"), vec![0u8; 100]).unwrap();
+        assert_eq!(prune_cache(&dir, 10 * 1024).unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_cache_missing_dir_is_ok() {
+        let dir = std::env::temp_dir().join("stier_heicmov_does_not_exist_xyz");
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(prune_cache(&dir, 1024).unwrap(), 0);
+    }
 }

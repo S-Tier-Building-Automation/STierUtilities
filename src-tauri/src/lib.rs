@@ -2,10 +2,19 @@
 mod bacnet;
 mod bacnet_codec;
 
+// Platform observability: InfluxDB line-protocol encoding (portable, pure) and
+// the Observability Pack supervisor (config gen, ports, line-protocol writes).
+mod observability;
+mod timeseries;
+
 #[cfg(windows)]
 mod clipboardtyper;
 #[cfg(windows)]
 mod heicmov;
+#[cfg(windows)]
+mod mcp;
+#[cfg(windows)]
+mod secrets;
 #[cfg(windows)]
 mod netscan;
 #[cfg(windows)]
@@ -63,6 +72,9 @@ pub fn run() {
         heicmov::heicmov_make_preview,
         heicmov::heicmov_convert,
         heicmov::heicmov_open_path,
+        heicmov::heicmov_prune_cache,
+        heicmov::heicmov_clear_cache,
+        secrets::secrets_influx_token,
         networkmanager::networkmanager_list_adapters,
         networkmanager::networkmanager_read_state,
         networkmanager::networkmanager_capture_profile,
@@ -74,6 +86,24 @@ pub fn run() {
         networkmanager::networkmanager_open_profiles_dir,
         networkmanager::networkmanager_apply_profile,
         netscan::netscan_scan,
+        netscan::netscan_ping,
+        observability::observability_pick_ports,
+        observability::observability_status,
+        observability::observability_write_configs,
+        observability::observability_health,
+        observability::observability_download_urls,
+        observability::observability_install,
+        observability::observability_start,
+        observability::observability_stop,
+        observability::observability_onboard,
+        observability::observability_load_config,
+        observability::observability_save_config,
+        observability::timeseries_write,
+        mcp::mcp_start,
+        mcp::mcp_call,
+        mcp::mcp_list_tools,
+        mcp::mcp_list_servers,
+        mcp::mcp_stop,
         bacnet::bacnet_discover,
         bacnet::bacnet_read_objects,
         bacnet::bacnet_read_properties,
@@ -83,7 +113,17 @@ pub fn run() {
         bacnet::bacnet_unsubscribe_cov,
     ]);
 
-    builder
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+    // Build, then run with an event loop so we can stop any spawned Observability
+    // Pack services on exit — otherwise influxd/grafana/telegraf would be orphaned
+    // and InfluxDB's bolt lock would block the next launch.
+    let app = builder
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+    app.run(|_app_handle, event| {
+        if let tauri::RunEvent::ExitRequested { .. } = event {
+            let _ = observability::observability_stop();
+            #[cfg(windows)]
+            mcp::stop_all();
+        }
+    });
 }
