@@ -13,7 +13,20 @@ The app **auto-updates** through the Tauri updater plugin — release a new tag 
 | Tool | What it does |
 | --- | --- |
 | **ClipboardTyper** | Middle-click anywhere to send clipboard text through Windows `SendInput` scan codes. Useful for local password fields, some RDP/VM screens, and places where Ctrl+V is blocked. Some remote tools, including DeskIn in certain modes, may ignore injected input before timing settings can help. |
-| _more soon_ | |
+| **HEIC & MOV** | Preview and convert iPhone photos/videos on Windows (FFmpeg sidecar). |
+| **Network Manager** | Save IPv4/DNS adapter profiles, see drift, scan the subnet. |
+| **BACnet Explorer** | Discover BACnet/IP devices, browse objects, read/write points, trends, COV. |
+| **Observability** | Shared time-series service; optional Telegraf + InfluxDB + Grafana pack. |
+| **BACnet Historian** | Continuously log BACnet points to InfluxDB and chart them in Grafana. |
+
+## Platform (tools as capabilities)
+
+Tools are no longer a hardcoded list — each declares a **manifest** ([src/tools/manifests.js](src/tools/manifests.js)) saying what capabilities it **provides** and **requires**. A small **kernel** ([src/platform/](src/platform/)) validates the manifests, resolves the dependency graph, and lets tools reuse each other (`host.use("netscan.v1")`) instead of re-solving the same problem. Shared services — `timeseries` (metrics), `scheduler`, `network.adapters` — live here too, and third-party tools can plug in as MCP servers (`kind: "mcp"`). See [docs/platform-observability-and-ecosystem.md](docs/platform-observability-and-ecosystem.md).
+
+```bash
+npm test                                              # JS kernel + services + tool wiring
+cargo test --manifest-path src-tauri/Cargo.toml       # Rust encoders, supervisor, secrets
+```
 
 ## Run it (dev)
 
@@ -52,9 +65,12 @@ git push origin v0.5.1
 
 ## Adding a new micro-tool
 
-1. Add a Rust module under `src-tauri/src/<tool>.rs` and `mod` it from `lib.rs`.
-2. Expose its surface as `#[tauri::command]`s and register them in `invoke_handler![]`.
-3. Render a card and wire the buttons/sliders in `src/main.js`.
+1. Add a manifest entry to `src/tools/manifests.js` (id, version, `provides`/`requires`, permissions, UI text). The kernel and the Library catalog both read from it.
+2. If it has native logic, add a Rust module under `src-tauri/src/<tool>.rs`, `mod` it from `lib.rs`, and register its `#[tauri::command]`s in `invoke_handler![]`.
+3. Register a capability implementation (wrapping `invoke`) in `src/tools/capabilities.js`, and the page renderer in the `TOOL_RENDERERS` map in `src/main.js`.
+4. Reuse other tools by declaring them in `requires` and calling `host.use("<cap>.vN")` — don't reimplement discovery, scanning, storage, or scheduling.
+
+Third-party tools can instead ship a `kind: "mcp"` manifest pointing at an MCP server; the kernel proxies each capability method to the server's tools.
 
 The Win32 plumbing in `clipboardtyper.rs` (low-level hook on a dedicated thread, `SendInput` with explicit modifier timing) is a reasonable template for keyboard/mouse-driven tools.
 
