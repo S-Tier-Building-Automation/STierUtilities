@@ -322,6 +322,43 @@ function toggleAboutMenu() {
   else closeAboutMenu();
 }
 
+// --- Generic modal (used for the per-tool "About" pop-out) ---
+// One modal at a time: a backdrop overlay + centered card. Closes on the × button,
+// a click on the backdrop (but not the card), or Escape.
+
+let activeModal = null;
+
+function closeModal() {
+  if (!activeModal) return;
+  document.removeEventListener("keydown", activeModal.onKey);
+  activeModal.overlay.remove();
+  activeModal = null;
+}
+
+function openModal({ title, body = [] } = {}) {
+  closeModal(); // never stack
+  const closeBtn = el("button", {
+    class: "modal-close", title: "Close", "aria-label": "Close", onclick: closeModal,
+  }, "×");
+  const card = el("div",
+    { class: "modal-card", role: "dialog", "aria-modal": "true", "aria-label": title || "Dialog" },
+    el("div", { class: "modal-head" },
+      el("h3", { class: "modal-title" }, title || ""),
+      closeBtn,
+    ),
+    el("div", { class: "modal-body" }, ...(Array.isArray(body) ? body : [body])),
+  );
+  const overlay = el("div", {
+    class: "modal-overlay",
+    onclick: (e) => { if (e.target === e.currentTarget) closeModal(); },
+  }, card);
+  const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); closeModal(); } };
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(overlay);
+  activeModal = { overlay, onKey };
+  closeBtn.focus(); // land keyboard focus inside the dialog
+}
+
 // ============================================================================
 // ClipboardTyper-specific bits (status pill + page)
 // ============================================================================
@@ -3415,6 +3452,22 @@ function renderLibrary() {
   }
 }
 
+// Body for the per-tool "About" modal: the description plus a source link.
+function aboutModalBody(tool) {
+  const parts = [
+    el("p", { class: "modal-desc" }, tool.description || "No description available."),
+  ];
+  if (tool.repo) {
+    parts.push(el("p", { class: "modal-foot" },
+      el("a", {
+        href: "#",
+        onclick: (e) => { e.preventDefault(); openExternal(tool.repo); },
+      }, "Source on GitHub →"),
+    ));
+  }
+  return parts;
+}
+
 function renderPluginPage(id) {
   const root = document.getElementById("view-root");
   root.replaceChildren();
@@ -3433,11 +3486,20 @@ function renderPluginPage(id) {
     }, "← Library"),
   ));
 
+  const hasAbout = Boolean(tool.description || tool.repo);
   root.appendChild(el("header", { class: "plugin-header" },
     el("div", { class: "plugin-header-left" },
       el("div", { class: "tool-icon plugin-icon" }, tool.emoji),
       el("div", {},
-        el("h2", { class: "plugin-title" }, tool.name),
+        el("div", { class: "plugin-title-row" },
+          el("h2", { class: "plugin-title" }, tool.name),
+          hasAbout && el("button", {
+            class: "info-btn",
+            title: "About this tool",
+            "aria-label": `About ${tool.name}`,
+            onclick: () => openModal({ title: `About ${tool.name}`, body: aboutModalBody(tool) }),
+          }, "ⓘ"),
+        ),
         el("p", { class: "plugin-tagline" }, tool.tagline),
       ),
     ),
@@ -3455,17 +3517,7 @@ function renderPluginPage(id) {
   // Plugin-specific page body.
   if (tool.renderPage) root.appendChild(tool.renderPage(tool));
 
-  // Description / source row.
-  root.appendChild(el("section", { class: "plugin-section" },
-    el("h3", {}, "About"),
-    el("p", { class: "plugin-desc" }, tool.description),
-    el("p", {},
-      el("a", {
-        href: "#",
-        onclick: (e) => { e.preventDefault(); openExternal(tool.repo); },
-      }, "Source on GitHub →"),
-    ),
-  ));
+  // (The former "About" section now lives behind the ⓘ button in the header.)
 
   // Per-plugin activity log.
   const logEntries = pluginLogs.get(tool.id) || [];

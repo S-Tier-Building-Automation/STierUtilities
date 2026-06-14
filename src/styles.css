@@ -145,6 +145,50 @@ a:hover { text-decoration: underline; }
 .header-menu .menu-ver { margin: -6px 0 2px; font-size: 12px; color: var(--text-dim); }
 .header-menu .menu-link { font-size: 12.5px; }
 
+/* Tool "About" info button (sits next to the page title) */
+.plugin-title-row { display: flex; align-items: center; gap: 8px; }
+.info-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 22px; height: 22px; padding: 0;
+  border: none; border-radius: 50%;
+  background: transparent; color: var(--text-dim);
+  font-size: 15px; line-height: 1; cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.info-btn:hover { background: var(--bg-elev-2); color: var(--text); }
+.info-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* Generic modal (per-tool About pop-out) */
+.modal-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.55);
+  -webkit-backdrop-filter: blur(2px); backdrop-filter: blur(2px);
+}
+.modal-card {
+  width: 100%; max-width: 460px; max-height: 80vh; overflow-y: auto;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: var(--shadow);
+}
+.modal-head {
+  display: flex; align-items: flex-start; justify-content: space-between;
+  gap: 12px; padding: 16px 18px 10px;
+}
+.modal-title { margin: 0; font-size: 15px; }
+.modal-close {
+  border: none; background: transparent; color: var(--text-dim);
+  font-size: 22px; line-height: 1; cursor: pointer;
+  padding: 0 4px; border-radius: 6px;
+}
+.modal-close:hover { color: var(--text); background: var(--bg-elev); }
+.modal-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.modal-body { padding: 0 18px 18px; }
+.modal-body .modal-desc { margin: 0; color: var(--text); line-height: 1.5; }
+.modal-body .modal-foot { margin: 14px 0 0; font-size: 12.5px; }
+
 /* ===== Sidebar ===== */
 
 .sidebar {
@@ -451,7 +495,6 @@ a:hover { text-decoration: underline; }
   font-size: 12px; color: var(--text-dim);
   text-transform: uppercase; letter-spacing: 0.9px;
 }
-.plugin-desc { margin: 0; color: var(--text-dim); line-height: 1.55; font-size: 13.5px; }
 
 .action-row {
   display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
