@@ -561,20 +561,25 @@ pub fn provision_dashboards(paths: &PackPaths) -> Result<(), String> {
 /// InfluxDB transport (Phase 3); when the pack isn't running, the connect fails and
 /// the frontend service keeps buffering.
 #[tauri::command]
-pub fn timeseries_write(config: PackConfig, points: Vec<PointDto>) -> Result<usize, String> {
-    let pts: Vec<Point> = points.into_iter().map(dto_to_point).collect();
-    let count = pts.len();
-    let (body, _skipped) = to_line_protocol_batch(&pts);
-    if body.is_empty() {
-        return Ok(0);
-    }
-    let request = build_write_request(&config, &body);
-    let (status, resp) = http_send(config.influx_port, &request)?;
-    if (200..300).contains(&status) {
-        Ok(count)
-    } else {
-        Err(format!("InfluxDB write returned HTTP {status}: {}", resp.lines().next().unwrap_or("")))
-    }
+pub async fn timeseries_write(config: PackConfig, points: Vec<PointDto>) -> Result<usize, String> {
+    // Blocking HTTP off the main thread (called on the flush interval).
+    tauri::async_runtime::spawn_blocking(move || -> Result<usize, String> {
+        let pts: Vec<Point> = points.into_iter().map(dto_to_point).collect();
+        let count = pts.len();
+        let (body, _skipped) = to_line_protocol_batch(&pts);
+        if body.is_empty() {
+            return Ok(0);
+        }
+        let request = build_write_request(&config, &body);
+        let (status, resp) = http_send(config.influx_port, &request)?;
+        if (200..300).contains(&status) {
+            Ok(count)
+        } else {
+            Err(format!("InfluxDB write returned HTTP {status}: {}", resp.lines().next().unwrap_or("")))
+        }
+    })
+    .await
+    .map_err(|e| format!("write task panicked: {e}"))?
 }
 
 // ---------------------------------------------------------------------------
@@ -642,37 +647,46 @@ pub struct PackHealth {
 /// additionally confirms the token authenticates an API call, so the UI doesn't
 /// report "connected" against an un-onboarded InfluxDB.
 #[tauri::command]
-pub fn observability_health(config: PackConfig) -> PackHealth {
-    let influx_up = port_open(config.influx_port);
-    let influx_ready = influx_up
-        && !config.token.is_empty()
-        && matches!(
-            http_send(config.influx_port, &build_buckets_request(&config)),
-            Ok((s, _)) if (200..300).contains(&s)
-        );
-    PackHealth {
-        influx_up,
-        influx_ready,
-        grafana_up: port_open(config.grafana_port),
-    }
+pub async fn observability_health(config: PackConfig) -> PackHealth {
+    // Off the main thread: the authed buckets probe can block on a slow port.
+    tauri::async_runtime::spawn_blocking(move || {
+        let influx_up = port_open(config.influx_port);
+        let influx_ready = influx_up
+            && !config.token.is_empty()
+            && matches!(
+                http_send(config.influx_port, &build_buckets_request(&config)),
+                Ok((s, _)) if (200..300).contains(&s)
+            );
+        PackHealth {
+            influx_up,
+            influx_ready,
+            grafana_up: port_open(config.grafana_port),
+        }
+    })
+    .await
+    .unwrap_or(PackHealth { influx_up: false, influx_ready: false, grafana_up: false })
 }
 
 /// One-time InfluxDB v2 onboarding (`/api/v2/setup`): makes the app's pre-generated
 /// token the operator token so writes + Grafana authenticate. Idempotent — HTTP 422
 /// ("already set up") is treated as success. Requires influxd to be up.
 #[tauri::command]
-pub fn observability_onboard(config: PackConfig) -> Result<bool, String> {
-    if config.token.is_empty() {
-        return Err("no InfluxDB token configured".into());
-    }
-    // username/password are required by setup; the operator token is what we use.
-    let request = build_setup_request(&config, "stier", &config.token);
-    let (status, resp) = http_send(config.influx_port, &request)?;
-    match status {
-        s if (200..300).contains(&s) => Ok(true),
-        422 => Ok(true), // already onboarded
-        s => Err(format!("InfluxDB setup returned HTTP {s}: {}", resp.lines().next().unwrap_or(""))),
-    }
+pub async fn observability_onboard(config: PackConfig) -> Result<bool, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<bool, String> {
+        if config.token.is_empty() {
+            return Err("no InfluxDB token configured".into());
+        }
+        // username/password are required by setup; the operator token is what we use.
+        let request = build_setup_request(&config, "stier", &config.token);
+        let (status, resp) = http_send(config.influx_port, &request)?;
+        match status {
+            s if (200..300).contains(&s) => Ok(true),
+            422 => Ok(true), // already onboarded
+            s => Err(format!("InfluxDB setup returned HTTP {s}: {}", resp.lines().next().unwrap_or(""))),
+        }
+    })
+    .await
+    .map_err(|e| format!("onboard task panicked: {e}"))?
 }
 
 /// The download URLs for all three components at this OS/arch.
@@ -690,7 +704,14 @@ pub fn observability_download_urls() -> Result<Vec<DownloadAsset>, String> {
 /// returns an error naming any component that isn't installed/failed to launch.
 #[cfg(windows)]
 #[tauri::command]
-pub fn observability_start(app: tauri::AppHandle, config: PackConfig) -> Result<(), String> {
+pub async fn observability_start(app: tauri::AppHandle, config: PackConfig) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || start_blocking(app, config))
+        .await
+        .map_err(|e| format!("start task panicked: {e}"))?
+}
+
+#[cfg(windows)]
+fn start_blocking(app: tauri::AppHandle, config: PackConfig) -> Result<(), String> {
     use tauri::Manager;
     let dir = app
         .path()
@@ -846,7 +867,15 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
 /// Streams `observability://install` progress events. Returns the resulting status.
 #[cfg(windows)]
 #[tauri::command]
-pub fn observability_install(app: tauri::AppHandle) -> Result<PackStatus, String> {
+pub async fn observability_install(app: tauri::AppHandle) -> Result<PackStatus, String> {
+    // Run the ~400 MB download + extract off the main thread so the UI never freezes.
+    tauri::async_runtime::spawn_blocking(move || install_blocking(app))
+        .await
+        .map_err(|e| format!("install task panicked: {e}"))?
+}
+
+#[cfg(windows)]
+fn install_blocking(app: tauri::AppHandle) -> Result<PackStatus, String> {
     use tauri::{Emitter, Manager};
     let dir = app
         .path()

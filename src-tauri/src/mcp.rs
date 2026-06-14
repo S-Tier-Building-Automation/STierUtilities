@@ -212,7 +212,20 @@ fn with_stderr(err: String, buf: &Arc<Mutex<Vec<String>>>) -> String {
 /// Start (or return) an MCP server: spawn the process, run the JSON-RPC
 /// handshake (initialize -> initialized -> tools/list), and remember it by id.
 #[tauri::command]
-pub fn mcp_start(
+pub async fn mcp_start(
+    id: String,
+    command: String,
+    args: Vec<String>,
+    env: Option<HashMap<String, String>>,
+) -> Result<ServerInfo, String> {
+    // The spawn + handshake (initialize/tools/list) can block for seconds — run
+    // it off the main thread so the UI stays responsive.
+    tauri::async_runtime::spawn_blocking(move || mcp_start_blocking(id, command, args, env))
+        .await
+        .map_err(|e| format!("mcp start task panicked: {e}"))?
+}
+
+fn mcp_start_blocking(
     id: String,
     command: String,
     args: Vec<String>,
@@ -291,19 +304,25 @@ pub fn mcp_start(
 
 /// Call a tool on a running MCP server.
 #[tauri::command]
-pub fn mcp_call(id: String, name: String, arguments: Option<Value>) -> Result<Value, String> {
-    let handle = {
-        let servers = SERVERS.lock().unwrap();
-        servers.get(&id).cloned().ok_or_else(|| format!("MCP server '{id}' is not running"))?
-    };
-    // Fail fast (and deregister) if the server process has died, instead of
-    // blocking the full request timeout on a dead pipe.
-    if child_exited(&handle) {
-        SERVERS.lock().unwrap().remove(&id);
-        return Err(format!("MCP server '{id}' has exited"));
-    }
-    let params = json!({ "name": name, "arguments": arguments.unwrap_or(json!({})) });
-    request(&handle, "tools/call", params)
+pub async fn mcp_call(id: String, name: String, arguments: Option<Value>) -> Result<Value, String> {
+    // tools/call blocks until the server responds (up to the request timeout) —
+    // keep it off the main thread.
+    tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
+        let handle = {
+            let servers = SERVERS.lock().unwrap();
+            servers.get(&id).cloned().ok_or_else(|| format!("MCP server '{id}' is not running"))?
+        };
+        // Fail fast (and deregister) if the server process has died, instead of
+        // blocking the full request timeout on a dead pipe.
+        if child_exited(&handle) {
+            SERVERS.lock().unwrap().remove(&id);
+            return Err(format!("MCP server '{id}' has exited"));
+        }
+        let params = json!({ "name": name, "arguments": arguments.unwrap_or(json!({})) });
+        request(&handle, "tools/call", params)
+    })
+    .await
+    .map_err(|e| format!("mcp call task panicked: {e}"))?
 }
 
 /// List the tools a running MCP server advertised at startup.
