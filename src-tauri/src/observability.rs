@@ -834,13 +834,13 @@ fn curl_download(url: &str, out: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn ps_expand(zip: &Path, dest: &Path) -> Result<(), String> {
-    let script = format!(
-        "Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force",
-        zip.display().to_string().replace('\'', "''"),
-        dest.display().to_string().replace('\'', "''"),
-    );
-    run_tool("powershell.exe", &["-NoProfile", "-NonInteractive", "-Command", &script])
+fn extract_archive(archive: &Path, dest: &Path) -> Result<(), String> {
+    // Use Windows' built-in bsdtar (tar.exe), NOT PowerShell 5.1 Expand-Archive:
+    // Expand-Archive silently fails on Grafana's deep (>260-char MAX_PATH) entries
+    // — it leaves an empty directory but still exits 0. tar.exe is long-path-aware
+    // and ~15x faster.
+    std::fs::create_dir_all(dest).map_err(|e| e.to_string())?;
+    run_tool("tar.exe", &["-xf", &archive.to_string_lossy(), "-C", &dest.to_string_lossy()])
 }
 
 #[cfg(windows)]
@@ -903,6 +903,13 @@ fn install_blocking(app: tauri::AppHandle) -> Result<PackStatus, String> {
             );
         };
 
+        // Skip a component that's already installed (makes a retry after a partial
+        // failure only fetch what's missing).
+        if paths.binary(exe).exists() {
+            emit("already-installed");
+            continue;
+        }
+
         emit("download");
         let asset = download_asset(component, version, os, arch)?;
         let archive_path = dl.join(format!("{component}.{}", asset.archive));
@@ -916,8 +923,7 @@ fn install_blocking(app: tauri::AppHandle) -> Result<PackStatus, String> {
         emit("extract");
         let extract_dir = dl.join(component);
         let _ = std::fs::remove_dir_all(&extract_dir);
-        std::fs::create_dir_all(&extract_dir).map_err(|e| e.to_string())?;
-        ps_expand(&archive_path, &extract_dir)?;
+        extract_archive(&archive_path, &extract_dir)?;
 
         emit("install");
         let exe_file = format!("{exe}.exe");
