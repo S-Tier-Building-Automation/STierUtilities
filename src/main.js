@@ -2901,6 +2901,34 @@ let obsBusy = false;
 let obsPhase = "";       // high-level bring-up phase label
 let obsProgress = null;  // latest per-component install event (download %, rate, ETA, …)
 let obsHealth = null;
+let obsPack = null;      // installed-vs-pinned component versions (update detection)
+let obsPackLoading = false;
+
+const OBS_COMPONENT_NAMES = { influxdb: "InfluxDB", telegraf: "Telegraf", grafana: "Grafana" };
+
+// Lazily fetch pack version status (installed vs pinned) once per page visit.
+function obsEnsurePackStatus() {
+  if (obsPack !== null || obsPackLoading || !pack) return;
+  obsPackLoading = true;
+  pack.packStatus()
+    .then((s) => { obsPack = s; obsPackLoading = false; renderAll(); })
+    .catch(() => { obsPackLoading = false; });
+}
+
+// "InfluxDB 2.7.5 · Telegraf 1.30.0 · Grafana 11.1.0 → 11.2.0" + an update badge.
+function obsVersionsLine() {
+  if (!obsPack || !obsPack.components) return null;
+  const parts = obsPack.components.map((c) => {
+    const name = OBS_COMPONENT_NAMES[c.name] || c.name;
+    const ver = c.present ? (c.installedVersion || "?") : "not installed";
+    const upgrade = c.present && c.needsUpdate ? ` → ${c.pinnedVersion}` : "";
+    return `${name} ${ver}${upgrade}`;
+  });
+  return el("p", { class: "muted small" },
+    parts.join(" · "),
+    obsPack.updatesAvailable ? el("span", { class: "pill pill-running", style: "margin-left:8px" }, "Update available") : null,
+  );
+}
 
 const OBS_PHASE_LABELS = {
   status: "Checking what's installed…",
@@ -2970,6 +2998,9 @@ async function obsBringUp() {
   } catch (err) {
     logTo("observability", `Bring-up failed: ${err}`, "error");
   } finally {
+    // Re-fetch installed versions on success OR failure (a partial update may
+    // have changed them), so the version line / Update-available badge is fresh.
+    obsPack = null;
     obsBusy = false; obsPhase = ""; obsProgress = null; renderAll();
   }
 }
@@ -2987,6 +3018,7 @@ async function obsWriteConfigs() {
 }
 
 function renderObservabilityPage() {
+  obsEnsurePackStatus();
   const stats = telemetry ? telemetry.stats() : null;
   const recent = telemetry ? telemetry.recent(15) : [];
   const cfg = pack ? pack.getConfig() : null;
@@ -2995,18 +3027,24 @@ function renderObservabilityPage() {
     ? `InfluxDB: ${obsHealth.influxReady ? "ready" : obsHealth.influxUp ? "starting" : "down"} · Grafana: ${obsHealth.grafanaUp ? "up" : "down"}`
     : "Health unknown — click Check health.";
 
+  const installLabel = obsBusy ? "Working…"
+    : (obsPack && obsPack.updatesAvailable) ? "Update & restart pack"
+    : (obsPack && obsPack.installed) ? "Restart pack"
+    : "Install & start pack";
+
   const statusCard = el("section", { class: "plugin-section" },
     el("h3", {}, "Observability Pack"),
     el("p", { class: "muted small" },
       "Telegraf + InfluxDB + Grafana run locally on 127.0.0.1. The first install downloads ~400 MB; " +
       "until then, tool metrics are kept in an in-memory ring buffer (still visible below)."),
+    obsVersionsLine(),
     el("p", { class: "muted small" }, obsBusy ? (obsPhase || "Working…") : healthLine),
     el("div", { class: "tool-actions" },
       el("button", {
         class: "btn btn-primary",
         disabled: obsBusy ? "disabled" : undefined,
         onclick: obsBringUp,
-      }, obsBusy ? "Working…" : "Install & start pack"),
+      }, installLabel),
       el("button", { class: "btn-ghost", disabled: obsBusy ? "disabled" : undefined, onclick: obsStop }, "Stop"),
       el("button", { class: "btn-ghost", onclick: obsRefreshHealth }, "Check health"),
       el("button", { class: "btn-ghost", disabled: obsBusy ? "disabled" : undefined, onclick: obsWriteConfigs }, "Write configs"),
@@ -3832,6 +3870,19 @@ window.addEventListener("DOMContentLoaded", async () => {
 
     // Restore any previously-configured Historian points + resume logging.
     histRestore();
+
+    // Passive pack-update check: surface in the Observability activity log if an
+    // app update bumped a pinned component version past what's installed.
+    pack.packStatus()
+      .then((s) => {
+        obsPack = s;
+        if (s && s.updatesAvailable) {
+          const outdated = (s.components || []).filter((c) => c.present && c.needsUpdate)
+            .map((c) => `${OBS_COMPONENT_NAMES[c.name] || c.name} ${c.installedVersion}→${c.pinnedVersion}`).join(", ");
+          logTo("observability", `Pack update available: ${outdated}. Open Observability → "Update & restart pack".`, "info");
+        }
+      })
+      .catch(() => {});
   } catch (err) {
     console.error("[platform] kernel boot failed:", err);
   }

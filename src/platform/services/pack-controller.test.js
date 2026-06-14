@@ -68,7 +68,7 @@ test("bringUp runs install -> configs -> start -> wait -> onboard -> connect in 
   await ctl.bringUp((s) => steps.push(s));
 
   const cmds = invoke.commands();
-  const order = ["observability_status", "observability_install", "observability_write_configs", "observability_start", "observability_health", "observability_onboard"];
+  const order = ["observability_install", "observability_write_configs", "observability_start", "observability_health", "observability_onboard"];
   let last = -1;
   for (const c of order) {
     const at = cmds.indexOf(c);
@@ -79,16 +79,17 @@ test("bringUp runs install -> configs -> start -> wait -> onboard -> connect in 
   assert.ok(steps.includes("done"));
 });
 
-test("bringUp skips install when already installed", async () => {
+test("bringUp always runs the (version-aware) install, which fast-skips up-to-date components", async () => {
   const invoke = mockInvoke({
     observability_load_config: () => ({ ...PORTS, token: "t" }),
-    observability_status: () => ({ installed: true }),
+    observability_install: () => ({ installed: true }),
     observability_health: () => ({ influxUp: true, influxReady: true, grafanaUp: true }),
     observability_onboard: () => true,
   });
   const ctl = createPackController({ invoke, timeseries: createTimeseries(), sleep: noSleep });
   await ctl.bringUp();
-  assert.ok(!invoke.commands().includes("observability_install"));
+  // install is always invoked; the skip-if-up-to-date decision lives in Rust.
+  assert.ok(invoke.commands().includes("observability_install"));
 });
 
 test("bringUp throws if InfluxDB never comes up", async () => {

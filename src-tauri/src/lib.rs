@@ -89,6 +89,7 @@ pub fn run() {
         netscan::netscan_ping,
         observability::observability_pick_ports,
         observability::observability_status,
+        observability::observability_pack_status,
         observability::observability_write_configs,
         observability::observability_health,
         observability::observability_download_urls,

@@ -34,6 +34,7 @@ export function createPackController({ invoke, timeseries, sleep = (ms) => new P
 
   return {
     status: () => invoke("observability_status"),
+    packStatus: () => invoke("observability_pack_status"),
     install: () => invoke("observability_install"),
     stop: () => invoke("observability_stop"),
 
@@ -59,9 +60,10 @@ export function createPackController({ invoke, timeseries, sleep = (ms) => new P
      */
     async bringUp(onStep = () => {}) {
       await ensureConfig();
-      onStep('status');
-      const st = await invoke("observability_status");
-      if (!st || !st.installed) { onStep('install'); await invoke("observability_install"); }
+      // install is version-aware: it fast-skips up-to-date components and only
+      // (re)downloads what's missing or outdated, so it doubles as the updater.
+      onStep('install');
+      await invoke("observability_install");
       onStep('write-configs');
       await invoke("observability_write_configs", { config });
       onStep('start');
