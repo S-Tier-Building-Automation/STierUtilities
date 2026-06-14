@@ -104,6 +104,7 @@ function loadUserState() {
     hidden: stored.hidden || {},
     showHidden: Boolean(stored.showHidden),
     libraryView: stored.libraryView === "list" ? "list" : "grid",
+    nmRailWidth: Number.isFinite(stored.nmRailWidth) ? stored.nmRailWidth : 240,
     view: typeof stored.view === "string" ? stored.view : "library",
     sidebarCollapsed: Boolean(stored.sidebarCollapsed),
     historian: stored.historian || null,
@@ -951,13 +952,14 @@ function renderHeicMovPage() {
 let nm = {
   adapters: [],            // NetworkAdapterInfo[]
   profiles: [],            // NetworkProfile[]
-  selectedId: null,
+  selectedId: null,        // selected profile id (mutually exclusive with selectedAdapter)
+  selectedAdapter: null,   // selected adapter name, when inspecting a live NIC
   stateByAdapter: {},      // adapterName -> AdapterNetworkState
   matchById: {},           // profileId -> ProfileMatchResult
   busy: false,
   busyLabel: "",
   loaded: false,           // adapters/state read at least once this session
-  tab: "profiles",         // "profiles" | "adapters" | "scan"
+  tab: "configure",        // "configure" (merged adapters+profiles) | "scan"
   scan: {
     adapterName: "",       // adapter whose subnet we sweep
     scanning: false,
@@ -1125,6 +1127,7 @@ async function nmNew() {
   p.adapterName = nmDefaultAdapter();
   nm.profiles.push(p);
   nm.selectedId = p.id;
+  nm.selectedAdapter = null;
   await nmRecomputeMatch(p);
   nmSaveSoon();
   logTo("networkmanager", `Created "${p.name}".`, "info");
@@ -1137,6 +1140,7 @@ async function nmDuplicate() {
   const p = { ...sel, id: nmNewId(), name: nmUniqueName(`${sel.name} copy`), lastAppliedAt: null };
   nm.profiles.push(p);
   nm.selectedId = p.id;
+  nm.selectedAdapter = null;
   await nmRecomputeMatch(p);
   nmSaveSoon();
   renderAll();
@@ -1157,8 +1161,18 @@ function nmDelete() {
 }
 
 function nmSelect(id) {
-  if (nm.selectedId === id) return;
+  if (nm.selectedId === id && !nm.selectedAdapter) return;
   nm.selectedId = id;
+  nm.selectedAdapter = null;
+  renderAll();
+}
+
+// Select a live adapter (shows its detail in the config panel). Mutually
+// exclusive with a profile selection.
+function nmSelectAdapter(name) {
+  if (nm.selectedAdapter === name) return;
+  nm.selectedAdapter = name;
+  nm.selectedId = null;
   renderAll();
 }
 
@@ -1180,8 +1194,8 @@ function nmSetText(key, value) {
 function nmRefreshLiveBits() {
   if (currentPluginId() !== "networkmanager") return;
   const sel = nmSelected();
-  const list = document.getElementById("nm-profile-list");
-  if (list && nm.profiles.length) list.replaceChildren(...nm.profiles.map(nmProfileRow));
+  const rail = document.getElementById("nm-config-rail");
+  if (rail) rail.replaceChildren(...nmConfigRailContent());
   const drift = document.getElementById("nm-drift");
   if (drift && sel) drift.replaceWith(nmDriftBanner(sel));
   const title = document.getElementById("nm-editor-title");
@@ -1211,7 +1225,7 @@ async function nmCaptureAdapter(adapterName) {
     p.name = nmUniqueName(p.name);
     nm.profiles.push(p);
     nm.selectedId = p.id;
-    nm.tab = "profiles";   // jump to the editor so the user sees the result
+    nm.selectedAdapter = null;   // show the new profile's editor in the config panel
     await nmRecomputeMatch(p);
     nmSaveNow();
     logTo("networkmanager", `Captured "${p.name}" from ${adapterName}.`, "ok");
@@ -1316,29 +1330,34 @@ async function nmApply() {
 
 // ---- render ----
 
-function nmProfileRow(p) {
-  const m = nmMatch(p);
-  const active = p.id === nm.selectedId;
-  return el("li", {
-    class: `nm-profile-row ${active ? "nm-profile-active" : ""}`,
+// Active / Drift / Idle status for a profile, derived from its live-match result:
+// Active = currently applied; Drift = its target adapter is present but live config
+// differs; Idle = no present target adapter.
+function nmProfileStatus(p) {
+  if (nmMatch(p).isMatch) return { dot: "nm-dot-active", label: "Active", cls: "nm-nic-active" };
+  const present = nm.adapters.some((a) => a.name === p.adapterName && a.status !== "Not Present");
+  return present
+    ? { dot: "nm-dot-drift", label: "Drift", cls: "nm-state-drift" }
+    : { dot: "nm-dot-idle", label: "Idle", cls: "muted" };
+}
+
+// A profile row in the grouped config rail (the adapter it targets is implied by
+// its group, so the row only carries name + status).
+function nmRailProfileRow(p) {
+  const active = !nm.selectedAdapter && p.id === nm.selectedId;
+  const s = nmProfileStatus(p);
+  return el("div", {
+    class: `nm-rail-profile ${active ? "selected" : ""}`,
     role: "button",
     tabindex: "0",
+    title: p.name || "(unnamed)",
     "aria-pressed": active ? "true" : "false",
     onclick: () => nmSelect(p.id),
-    onkeydown: (e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        nmSelect(p.id);
-      }
-    },
+    onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nmSelect(p.id); } },
   },
-    el("div", { class: "nm-profile-main" },
-      el("span", { class: "nm-profile-name" }, p.name || "(unnamed)"),
-      el("span", { class: `pill ${m.isMatch ? "pill-running" : "pill-idle"}` },
-        m.isMatch ? "Active" : (m.status || "Not active")),
-    ),
-    el("span", { class: "nm-profile-sub muted small" }, p.adapterName ? `→ ${p.adapterName}` : "No adapter"),
-    m.detail ? el("span", { class: "nm-profile-detail muted small" }, m.detail) : null,
+    el("span", { class: `nm-rail-dot ${s.dot}`, "aria-hidden": "true" }),
+    el("span", { class: "nm-rail-pname" }, p.name || "(unnamed)"),
+    el("span", { class: `nm-rail-pstate small ${s.cls}` }, s.label),
   );
 }
 
@@ -1793,25 +1812,160 @@ function nmTabBar() {
     onclick: () => { nm.tab = id; renderAll(); },
   }, label);
   return el("div", { class: "nm-tabs" },
-    tab("profiles", "Profiles"),
-    tab("adapters", "Adapters"),
+    tab("configure", "Configure"),
     tab("scan", "Scan"),
   );
 }
 
-function nmProfilesTab() {
-  const sel = nmSelected();
+// ---- resizable rail (the splitter between the rail and the config panel) ----
 
-  const list = el("ul", { id: "nm-profile-list", class: "nm-profile-list" });
-  if (nm.profiles.length === 0) {
-    list.appendChild(el("li", { class: "muted small nm-profile-empty" }, "No profiles yet."));
-  } else {
-    for (const p of nm.profiles) list.appendChild(nmProfileRow(p));
+function nmRailWidthPx() {
+  return Math.max(180, Math.min(440, userState.nmRailWidth || 240));
+}
+function nmSetRailWidth(px, persist) {
+  userState.nmRailWidth = Math.max(180, Math.min(440, Math.round(px)));
+  const md = document.getElementById("nm-config-md");
+  if (md) md.style.gridTemplateColumns = `${userState.nmRailWidth}px 8px minmax(0, 1fr)`;
+  const sep = document.getElementById("nm-splitter");
+  if (sep) sep.setAttribute("aria-valuenow", String(userState.nmRailWidth));
+  if (persist) saveUserState();
+}
+// Track the drag on window so it survives the pointer leaving the handle.
+// Pointer capture + a pointercancel teardown guard against a "stuck" drag if the
+// matching pointerup is ever lost (alt-tab, OS cancel).
+function nmStartRailDrag(e) {
+  e.preventDefault();
+  const startX = e.clientX;
+  const startW = nmRailWidthPx();
+  const handle = e.currentTarget;
+  try { handle.setPointerCapture(e.pointerId); } catch (_) { /* not fatal */ }
+  document.body.classList.add("nm-resizing");
+  const onMove = (ev) => nmSetRailWidth(startW + (ev.clientX - startX), false);
+  const onUp = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", onUp);
+    document.body.classList.remove("nm-resizing");
+    try { handle.releasePointerCapture(e.pointerId); } catch (_) { /* already released */ }
+    saveUserState();
+  };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+  window.addEventListener("pointercancel", onUp);
+}
+function nmRailKeyResize(e) {
+  if (e.key === "ArrowLeft") { e.preventDefault(); nmSetRailWidth(nmRailWidthPx() - 16, true); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); nmSetRailWidth(nmRailWidthPx() + 16, true); }
+}
+
+// ---- merged Configure view (adapters + profiles, master/detail) ----
+
+// The grouped rail: each present adapter is a header (selectable → live detail)
+// with its saved profiles nested beneath; profiles whose target adapter isn't
+// present fall into an "Other" group.
+function nmConfigRailContent() {
+  const children = [];
+  const present = nm.adapters.filter((a) => a.status !== "Not Present");
+  const byAdapter = new Map();
+  for (const p of nm.profiles) {
+    const key = p.adapterName || "";
+    if (!byAdapter.has(key)) byAdapter.set(key, []);
+    byAdapter.get(key).push(p);
   }
+  for (const a of present) {
+    children.push(nmRailAdapterHeader(a));
+    for (const p of (byAdapter.get(a.name) || [])) children.push(nmRailProfileRow(p));
+    byAdapter.delete(a.name);
+  }
+  const others = [];
+  for (const ps of byAdapter.values()) others.push(...ps);
+  if (others.length) {
+    children.push(el("div", { class: "nm-rail-other-head" }, "Other profiles"));
+    for (const p of others) children.push(nmRailProfileRow(p));
+  }
+  if (!children.length) {
+    children.push(el("p", { class: "muted small nm-rail-empty" },
+      nm.loaded ? "No adapters or profiles yet." : "Reading adapters…"));
+  }
+  return children;
+}
 
-  const listPane = el("div", { class: "nm-list-pane" },
-    el("div", { class: "nm-pane-head" }, el("h3", {}, "Profiles")),
-    list,
+function nmRailAdapterHeader(a) {
+  const st = nm.stateByAdapter[a.name];
+  const selected = nm.selectedAdapter === a.name;
+  return el("div", { class: `nm-rail-adapter ${selected ? "selected" : ""}` },
+    el("div", { class: "nm-rail-adapter-head" },
+      // The name is the selectable region; Save is a SIBLING (not a nested button),
+      // so keyboard Enter/Space on Save can't trigger the adapter selection.
+      el("span", {
+        class: "nm-rail-adapter-name",
+        role: "button",
+        tabindex: "0",
+        title: a.description || a.name,
+        "aria-pressed": selected ? "true" : "false",
+        onclick: () => nmSelectAdapter(a.name),
+        onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nmSelectAdapter(a.name); } },
+      }, a.name),
+      el("button", {
+        class: "btn-ghost nm-rail-save",
+        title: "Save this adapter as a profile",
+        "aria-label": `Save ${a.name} as a profile`,
+        disabled: nm.busy ? "disabled" : undefined,
+        onclick: () => nmCaptureAdapter(a.name),
+      }, "Save"),
+    ),
+    el("div", { class: "nm-rail-summary" },
+      st ? `IPv4 ${nmIpv4Summary(st)} · gw ${st.gateway || "none"}` : (nm.loaded ? "no live state" : "reading…")),
+  );
+}
+
+// Config panel when a live adapter (not a profile) is selected.
+function nmAdapterDetail(a) {
+  const st = nm.stateByAdapter[a.name];
+  const matching = nm.profiles.filter((p) => p.adapterName === a.name);
+  const profilesList = el("div", { class: "nm-rail-list" });
+  if (matching.length) for (const p of matching) profilesList.appendChild(nmRailProfileRow(p));
+  else profilesList.appendChild(el("p", { class: "muted small" }, "No profiles yet — save this adapter to make one."));
+
+  return el("div", { class: "nm-editor-pane" },
+    el("div", { class: "nm-editor-head" },
+      el("h3", { class: "nm-editor-title" }, a.name),
+      el("div", { class: "nm-editor-actions" },
+        el("button", {
+          class: "btn btn-primary",
+          disabled: nm.busy ? "disabled" : undefined,
+          onclick: () => nmCaptureAdapter(a.name),
+        }, "Save as profile"),
+      ),
+    ),
+    el("section", { class: "plugin-section" },
+      el("h3", {}, "Live adapter"),
+      el("p", { class: "muted small" }, a.description || ""),
+      el("div", { class: "muted small" }, `Status: ${a.status}`),
+      el("div", { class: "muted small" }, st ? `IPv4 ${nmIpv4Summary(st)}` : "No live snapshot — use Refresh adapters."),
+      st ? el("div", { class: "muted small" }, `Gateway ${st.gateway || "none"} · DNS ${nmDnsSummary(st)}`) : null,
+    ),
+    el("section", { class: "plugin-section" },
+      el("h3", {}, "Profiles for this adapter"),
+      profilesList,
+    ),
+  );
+}
+
+function nmConfigEmpty() {
+  return el("div", { class: "nm-editor-pane nm-editor-empty" },
+    el("div", { class: "nm-empty" },
+      el("p", { class: "nm-empty-title" }, "Select an adapter or profile"),
+      el("p", { class: "muted small" },
+        "Pick a NIC on the left to see its live config and save it as a profile, or pick a profile to edit and apply it."),
+    ),
+  );
+}
+
+function nmConfigureTab() {
+  const railList = el("div", { id: "nm-config-rail", class: "nm-rail-list" }, ...nmConfigRailContent());
+  const rail = el("div", { class: "nm-rail" },
+    railList,
     el("button", {
       class: "btn btn-primary nm-new-btn",
       disabled: nm.busy ? "disabled" : undefined,
@@ -1819,76 +1973,49 @@ function nmProfilesTab() {
     }, "+ New profile"),
   );
 
-  const editorPane = sel
-    ? el("div", { class: "nm-editor-pane" }, ...nmEditorContent(sel))
-    : el("div", { class: "nm-editor-pane nm-editor-empty" },
-        el("div", { class: "nm-empty" },
-          el("p", { class: "nm-empty-title" }, "Select a profile to edit"),
-          el("p", { class: "muted small" },
-            "Pick one from the list, create a new one, or capture an adapter from the Adapters tab."),
-        ),
-      );
-
-  return el("div", { class: "nm-master-detail" }, listPane, editorPane);
-}
-
-function nmAdaptersTab() {
-  const refreshBtn = el("button", {
-    class: "btn-ghost",
-    disabled: nm.busy ? "disabled" : undefined,
-    onclick: nmRefresh,
-  }, nm.busy ? "Reading…" : "Refresh");
-
-  const nicList = el("div", { class: "nm-nic-list" });
-  const present = nm.adapters.filter((a) => a.status !== "Not Present");
-  if (present.length === 0) {
-    nicList.appendChild(el("p", { class: "muted small" }, nm.loaded ? "No adapters found." : "Reading adapters…"));
+  let panel;
+  if (nm.selectedAdapter) {
+    const a = nm.adapters.find((x) => x.name === nm.selectedAdapter);
+    panel = a ? nmAdapterDetail(a) : nmConfigEmpty();
   } else {
-    for (const a of present) {
-      const st = nm.stateByAdapter[a.name];
-      const matching = nm.profiles
-        .filter((p) => p.adapterName === a.name && nm.matchById[p.id]?.isMatch)
-        .map((p) => p.name);
-      nicList.appendChild(el("div", { class: "nm-nic-row" },
-        el("div", { class: "nm-nic-head" },
-          el("span", { class: "nm-nic-name" }, a.name),
-          el("span", { class: "muted small" }, a.status),
-        ),
-        el("div", { class: "muted small" }, a.description),
-        el("div", { class: "muted small" }, `IPv4 ${nmIpv4Summary(st)} · Gateway ${st?.gateway || "none"} · DNS ${nmDnsSummary(st)}`),
-        el("div", { class: "nm-nic-foot" },
-          el("span", { class: `small ${matching.length ? "nm-nic-active" : "muted"}` },
-            matching.length ? `Active profile: ${matching.join(", ")}` : "No matching profile"),
-          el("button", {
-            class: "btn-ghost nm-nic-save",
-            disabled: nm.busy ? "disabled" : undefined,
-            onclick: () => nmCaptureAdapter(a.name),
-          }, "Save as profile"),
-        ),
-      ));
-    }
+    const sel = nmSelected();
+    panel = sel ? el("div", { class: "nm-editor-pane" }, ...nmEditorContent(sel)) : nmConfigEmpty();
   }
 
+  const splitter = el("div", {
+    id: "nm-splitter",
+    class: "nm-splitter",
+    role: "separator",
+    tabindex: "0",
+    "aria-orientation": "vertical",
+    "aria-label": "Resize the configuration panel",
+    "aria-valuemin": "180",
+    "aria-valuemax": "440",
+    "aria-valuenow": String(nmRailWidthPx()),
+    title: "Drag to resize · double-click to reset",
+    onpointerdown: nmStartRailDrag,
+    ondblclick: () => nmSetRailWidth(240, true),
+    onkeydown: nmRailKeyResize,
+  });
+
+  const md = el("div", { id: "nm-config-md", class: "nm-config-md" }, rail, splitter, panel);
+  md.style.gridTemplateColumns = `${nmRailWidthPx()}px 8px minmax(0, 1fr)`;
+
   return el("div", { class: "plugin-controls" },
-    el("section", { class: "plugin-section" },
-      el("div", { class: "nm-pane-head" },
-        el("div", { class: "nm-pane-head-text" },
-          el("h3", {}, "Windows adapters"),
-          el("p", { class: "muted small nm-section-sub" }, "Your live network adapters. Save one as a reusable profile."),
-        ),
-        refreshBtn,
-      ),
-      nicList,
+    el("div", { class: "nm-config-head" },
+      el("button", {
+        class: "btn-ghost",
+        disabled: nm.busy ? "disabled" : undefined,
+        onclick: nmRefresh,
+      }, nm.busy ? "Reading…" : "Refresh adapters"),
     ),
+    md,
   );
 }
 
 function renderNetworkManagerPage() {
   nmEnsureLoaded();
-  const body =
-    nm.tab === "adapters" ? nmAdaptersTab()
-    : nm.tab === "scan" ? nmScanTab()
-    : nmProfilesTab();
+  const body = nm.tab === "scan" ? nmScanTab() : nmConfigureTab();
   return el("div", { class: "plugin-controls nm-root" },
     nmTabBar(),
     body,

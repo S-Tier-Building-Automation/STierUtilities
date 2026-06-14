@@ -865,28 +865,90 @@ a:hover { text-decoration: underline; }
 .nm-tab:hover { color: var(--text); }
 .nm-tab-active { color: var(--accent-2); border-bottom-color: var(--accent); }
 
-/* master-detail: list + editor side by side (fixed desktop layout) */
-.nm-master-detail {
-  display: grid;
-  grid-template-columns: 260px minmax(0, 1fr);
-  gap: var(--sp-5);
-  align-items: start;
-}
-
-.nm-list-pane {
-  background: var(--bg-elev);
-  border: 1px solid var(--border);
-  border-radius: var(--r-lg);
-  padding: var(--pad-card);
-  display: flex; flex-direction: column; gap: var(--sp-5);
-}
+/* section/pane head, shared by the Scan tab and the BACnet page */
 .nm-pane-head { display: flex; align-items: flex-start; justify-content: space-between; gap: var(--sp-4); }
 .nm-pane-head h3 {
   margin: 0; font-size: var(--fs-label); color: var(--text-dim);
   text-transform: uppercase; letter-spacing: 0.6px;
 }
 .nm-section-sub { margin: var(--sp-2) 0 0; }
+
+/* merged Configure view: a resizable rail + a config panel. The grid columns
+   are set inline from userState.nmRailWidth; 6px middle column is the splitter. */
+.nm-config-head { display: flex; justify-content: flex-end; }
+.nm-config-md {
+  display: grid;
+  grid-template-columns: 240px 8px minmax(0, 1fr);
+  align-items: start;
+}
+/* While dragging the splitter, lock the resize cursor and kill text selection. */
+body.nm-resizing { cursor: col-resize; user-select: none; -webkit-user-select: none; }
+
+.nm-rail {
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: var(--sp-3);
+  display: flex; flex-direction: column; gap: var(--sp-3);
+}
+.nm-rail-list { display: flex; flex-direction: column; gap: 1px; max-height: 520px; overflow-y: auto; }
 .nm-new-btn { width: 100%; }
+
+/* splitter handle (the 6px middle grid column) */
+.nm-splitter {
+  align-self: stretch;
+  display: flex; align-items: center; justify-content: center;
+  cursor: col-resize;
+}
+.nm-splitter::before {
+  content: ""; width: 2px; height: 36px; border-radius: 1px;
+  background: var(--border-strong); transition: background 0.12s ease;
+}
+.nm-splitter:hover::before, .nm-splitter:focus-visible::before { background: var(--accent); }
+.nm-splitter:focus-visible { outline: none; }
+
+/* rail groups: an adapter header with its profiles nested beneath */
+.nm-rail-other-head, .nm-rail-empty { padding: var(--sp-3) 6px var(--sp-2); }
+.nm-rail-other-head {
+  font-size: var(--fs-label); text-transform: uppercase; letter-spacing: 0.6px;
+  color: var(--text-dim); font-weight: 600; margin-top: var(--sp-3);
+}
+.nm-rail-adapter { margin-top: var(--sp-3); }
+.nm-rail-adapter:first-child { margin-top: 0; }
+.nm-rail-adapter-head { display: flex; align-items: center; gap: var(--sp-3); }
+.nm-rail-adapter-name {
+  flex: 1; min-width: 0;
+  padding: 4px 6px; border-radius: var(--r-md); cursor: pointer;
+  box-shadow: inset 2px 0 0 transparent;
+  font-size: var(--fs-label); text-transform: uppercase; letter-spacing: 0.6px;
+  color: var(--text-dim); font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nm-rail-adapter-name:hover { background: var(--bg-elev-2); }
+.nm-rail-adapter-name:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.nm-rail-adapter.selected .nm-rail-adapter-name {
+  background: rgba(99, 102, 241, 0.12); box-shadow: inset 2px 0 0 var(--accent);
+}
+.nm-rail-save { padding: 2px 8px; font-size: 11px; flex-shrink: 0; }
+.nm-rail-summary {
+  font-size: var(--fs-label); color: var(--text-dim);
+  padding: 1px 6px 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.nm-rail-profile {
+  display: flex; align-items: center; gap: var(--sp-4);
+  padding: 5px 8px 5px 14px; border-radius: var(--r-md); cursor: pointer;
+  box-shadow: inset 2px 0 0 transparent;
+  transition: background 0.12s ease;
+}
+.nm-rail-profile:hover { background: var(--bg-elev-2); }
+.nm-rail-profile.selected { background: rgba(99, 102, 241, 0.12); box-shadow: inset 2px 0 0 var(--accent); }
+.nm-rail-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.nm-dot-active { background: var(--ok); }
+.nm-dot-drift  { background: var(--warn); }
+.nm-dot-idle   { background: var(--text-dim); }
+.nm-rail-pname { flex: 1; font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nm-rail-pstate { flex-shrink: 0; }
+.nm-state-drift { color: var(--warn); }
 
 .nm-editor-pane { display: flex; flex-direction: column; gap: var(--sp-5); min-width: 0; }
 .nm-editor-empty {
@@ -902,36 +964,11 @@ a:hover { text-decoration: underline; }
 .nm-editor-actions { display: flex; gap: var(--sp-4); flex-shrink: 0; }
 .nm-readonly-note { margin: 0; line-height: 1.5; }
 
-/* profile list — flush rows */
-.nm-profile-list {
-  list-style: none; margin: 0; padding: 0;
-  display: flex; flex-direction: column;
-  max-height: 420px; overflow-y: auto;
-}
-.nm-profile-empty { padding: var(--sp-4) 2px; }
-.nm-profile-row {
-  display: flex; flex-direction: column; gap: 3px;
-  padding: 6px 10px;
-  border-bottom: 1px solid var(--border);
-  cursor: pointer;
-  box-shadow: inset 2px 0 0 transparent;
-  transition: background 0.12s ease;
-}
-.nm-profile-row:last-child { border-bottom: none; }
-.nm-profile-row:hover { background: var(--bg-elev-2); }
-.nm-profile-active {
-  background: rgba(99, 102, 241, 0.12);
-  box-shadow: inset 2px 0 0 var(--accent);
-}
-.nm-profile-main { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); }
-.nm-profile-name { font-weight: 600; font-size: var(--fs-body); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.nm-profile-sub { white-space: nowrap; }
-.nm-profile-detail { line-height: 1.4; }
-
-/* form fields */
+/* form fields — fluid 2-up that collapses to 1 column when the panel is narrow
+   (the rail is resizable, so panel width varies; this replaces the old @media query) */
 .nm-grid-2 {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: var(--sp-5) var(--sp-6);
   margin-bottom: var(--sp-5);
 }
@@ -995,19 +1032,8 @@ a:hover { text-decoration: underline; }
 .nm-drift-active .nm-drift-status { color: var(--ok); }
 .nm-drift-snapshot { overflow-wrap: anywhere; word-break: normal; }
 
-/* adapters list — flush rows */
-.nm-nic-list { display: flex; flex-direction: column; }
-.nm-nic-row {
-  border-bottom: 1px solid var(--border);
-  padding: 6px 10px;
-  display: flex; flex-direction: column; gap: 3px;
-}
-.nm-nic-row:last-child { border-bottom: none; }
-.nm-nic-head { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); }
-.nm-nic-name { font-weight: 600; font-size: var(--fs-body); }
-.nm-nic-foot { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); margin-top: var(--sp-2); }
+/* "Active" status text in the rail */
 .nm-nic-active { color: var(--ok); }
-.nm-nic-save { padding: 5px 10px; }
 
 /* scan tab */
 .nm-scan-controls { display: flex; align-items: flex-end; gap: var(--sp-5); margin-top: var(--sp-5); }
