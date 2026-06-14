@@ -2898,8 +2898,47 @@ function renderBacnetPage() {
 
 // Pack UI state.
 let obsBusy = false;
-let obsStep = "";
+let obsPhase = "";       // high-level bring-up phase label
+let obsProgress = null;  // latest per-component install event (download %, rate, ETA, …)
 let obsHealth = null;
+
+const OBS_PHASE_LABELS = {
+  status: "Checking what's installed…",
+  install: "Downloading & installing components…",
+  "write-configs": "Writing configuration…",
+  start: "Starting InfluxDB, Telegraf & Grafana…",
+  "wait-influx": "Waiting for InfluxDB to come up…",
+  onboard: "Initializing InfluxDB…",
+  connect: "Connecting telemetry…",
+  done: "Done",
+};
+
+function renderInstallProgress() {
+  const pr = obsProgress;
+  const downloading = pr && pr.step === "download" && pr.percent != null;
+  const pct = downloading ? Math.max(0, Math.min(100, Math.round(Number(pr.percent)))) : null;
+  let detail;
+  if (downloading) {
+    detail = `Downloading ${pr.component} (${(pr.index ?? 0) + 1}/${pr.total ?? 3}) — ` +
+      `${pct}% · ${pr.received}/${pr.size} · ${pr.rate}/s · ETA ${pr.eta}`;
+  } else if (pr && pr.step) {
+    const verb = { extract: "Extracting", install: "Installing", "already-installed": "Already installed",
+      done: "Installed", verify: "Verifying" }[pr.step] || pr.step;
+    detail = `${verb} ${pr.component} (${(pr.index ?? 0) + 1}/${pr.total ?? 3})…`;
+  } else {
+    detail = obsPhase || "Working…";
+  }
+  const fill = el("div", { class: "progress-fill" });
+  fill.style.width = pct != null ? `${pct}%` : "100%";
+  if (pct == null) fill.style.opacity = "0.4"; // indeterminate phases
+  const bar = el("div", { class: "progress-bar" }, fill);
+  bar.style.display = "block";
+  return el("section", { class: "plugin-section" },
+    el("h3", {}, obsPhase || "Installing…"),
+    el("p", { class: "muted small" }, detail),
+    bar,
+  );
+}
 
 function obsStatusPill() {
   if (obsHealth && obsHealth.influxReady) return { label: "Live", cls: "pill-running" };
@@ -2918,16 +2957,20 @@ async function obsRefreshHealth() {
 
 async function obsBringUp() {
   if (!pack || obsBusy) return;
-  obsBusy = true; obsStep = "starting"; renderAll();
+  obsBusy = true; obsPhase = OBS_PHASE_LABELS.status; obsProgress = null; renderAll();
   try {
     logTo("observability", "Bringing up the Observability Pack… (first run downloads ~400 MB)", "info");
-    const cfg = await pack.bringUp((s) => { obsStep = s; renderAll(); });
+    const cfg = await pack.bringUp((s) => {
+      obsPhase = OBS_PHASE_LABELS[s] || s;
+      if (s !== "install") obsProgress = null; // download detail only during install
+      renderAll();
+    });
     logTo("observability", `Pack up — InfluxDB :${cfg.influxPort}, Grafana :${cfg.grafanaPort}.`, "ok");
     await obsRefreshHealth();
   } catch (err) {
     logTo("observability", `Bring-up failed: ${err}`, "error");
   } finally {
-    obsBusy = false; obsStep = ""; renderAll();
+    obsBusy = false; obsPhase = ""; obsProgress = null; renderAll();
   }
 }
 
@@ -2957,13 +3000,13 @@ function renderObservabilityPage() {
     el("p", { class: "muted small" },
       "Telegraf + InfluxDB + Grafana run locally on 127.0.0.1. The first install downloads ~400 MB; " +
       "until then, tool metrics are kept in an in-memory ring buffer (still visible below)."),
-    el("p", { class: "muted small" }, obsBusy ? `Working… ${obsStep}` : healthLine),
+    el("p", { class: "muted small" }, obsBusy ? (obsPhase || "Working…") : healthLine),
     el("div", { class: "tool-actions" },
       el("button", {
         class: "btn btn-primary",
         disabled: obsBusy ? "disabled" : undefined,
         onclick: obsBringUp,
-      }, obsBusy ? `Working… ${obsStep}` : "Install & start pack"),
+      }, obsBusy ? "Working…" : "Install & start pack"),
       el("button", { class: "btn-ghost", disabled: obsBusy ? "disabled" : undefined, onclick: obsStop }, "Stop"),
       el("button", { class: "btn-ghost", onclick: obsRefreshHealth }, "Check health"),
       el("button", { class: "btn-ghost", disabled: obsBusy ? "disabled" : undefined, onclick: obsWriteConfigs }, "Write configs"),
@@ -3004,7 +3047,8 @@ function renderObservabilityPage() {
         ),
   );
 
-  return el("div", { class: "plugin-controls" }, statusCard, statsCard, recentCard);
+  const progressCard = obsBusy ? renderInstallProgress() : null;
+  return el("div", { class: "plugin-controls" }, statusCard, progressCard, statsCard, recentCard);
 }
 
 // ============================================================================
@@ -3779,10 +3823,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     pack = createPackController({ invoke, timeseries: telemetry });
     setInterval(() => { pack.flush().catch(() => {}); }, 10000);
 
-    // Granular install progress from the Rust downloader.
+    // Granular per-component install progress (download %, rate, ETA, extract…)
+    // from the Rust downloader, rendered as a live progress bar.
     listen("observability://install", (e) => {
-      const p = e.payload || {};
-      obsStep = `${p.component || "pack"}: ${p.step || ""} (${(p.index ?? 0) + 1}/${p.total ?? 3})`;
+      obsProgress = e.payload || null;
       if (currentPluginId() === "observability") renderAll();
     });
 

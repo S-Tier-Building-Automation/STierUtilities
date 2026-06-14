@@ -586,7 +586,7 @@ pub async fn timeseries_write(config: PackConfig, points: Vec<PointDto>) -> Resu
 // Process supervision (integration — requires the downloaded binaries)
 // ---------------------------------------------------------------------------
 
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
@@ -677,7 +677,11 @@ pub async fn observability_onboard(config: PackConfig) -> Result<bool, String> {
             return Err("no InfluxDB token configured".into());
         }
         // username/password are required by setup; the operator token is what we use.
-        let request = build_setup_request(&config, "stier", &config.token);
+        // The password is bcrypt-hashed by InfluxDB, which rejects inputs over 72
+        // bytes — so derive a short password from the token (the token field below
+        // still sets the full operator token).
+        let password = &config.token[..config.token.len().min(32)];
+        let request = build_setup_request(&config, "stier", password);
         let (status, resp) = http_send(config.influx_port, &request)?;
         match status {
             s if (200..300).contains(&s) => Ok(true),
@@ -825,12 +829,87 @@ fn run_tool(program: &str, args: &[&str]) -> Result<(), String> {
     }
 }
 
+/// Parse one curl progress-meter line into (percent, totalSize, received, rate, eta).
+/// Columns: %Total Total %Recv Recv %Xferd Xferd Dload Upload TimeTotal TimeSpent TimeLeft CurSpeed
+fn parse_curl_meter(line: &str) -> Option<(f64, String, String, String, String)> {
+    let t: Vec<&str> = line.split_whitespace().collect();
+    if t.len() < 12 {
+        return None;
+    }
+    let percent = t[0].parse::<f64>().ok()?;
+    Some((percent, t[1].to_string(), t[3].to_string(), t[11].to_string(), t[10].to_string()))
+}
+
+/// Download `url` to `out` with curl, streaming live progress (percent, bytes,
+/// rate, ETA) to the frontend via `observability://install` "download" events.
 #[cfg(windows)]
-fn curl_download(url: &str, out: &Path) -> Result<(), String> {
-    run_tool(
-        "curl.exe",
-        &["-L", "--fail", "--silent", "--show-error", "-o", &out.to_string_lossy(), url],
-    )
+fn curl_download_with_progress(
+    app: &tauri::AppHandle,
+    component: &str,
+    index: usize,
+    total: usize,
+    url: &str,
+    out: &Path,
+) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    use tauri::Emitter;
+
+    let mut child = Command::new("curl.exe")
+        // No --silent: curl writes its progress meter to stderr, which we parse.
+        .args(["-L", "--fail", "--show-error", "-o", &out.to_string_lossy(), url])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn()
+        .map_err(|e| format!("failed to run curl: {e}"))?;
+
+    let mut err_tail: Vec<String> = Vec::new();
+    if let Some(mut stderr) = child.stderr.take() {
+        let mut acc = String::new();
+        let mut chunk = [0u8; 4096];
+        loop {
+            let n = match stderr.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            acc.push_str(&String::from_utf8_lossy(&chunk[..n]));
+            // curl rewrites the meter line with '\r'; split on both '\r' and '\n'.
+            while let Some(pos) = acc.find(['\r', '\n']) {
+                let seg: String = acc.drain(..=pos).collect();
+                let seg = seg.trim();
+                if seg.is_empty() {
+                    continue;
+                }
+                if let Some((percent, size, received, rate, eta)) = parse_curl_meter(seg) {
+                    let _ = app.emit(
+                        "observability://install",
+                        serde_json::json!({
+                            "component": component, "step": "download", "index": index, "total": total,
+                            "percent": percent, "size": size, "received": received, "rate": rate, "eta": eta,
+                        }),
+                    );
+                } else if !seg.starts_with('%') && !seg.contains("Dload") {
+                    // keep non-meter lines (e.g. curl errors) for diagnostics
+                    err_tail.push(seg.to_string());
+                    if err_tail.len() > 6 {
+                        err_tail.remove(0);
+                    }
+                }
+            }
+        }
+    }
+
+    let status = child.wait().map_err(|e| format!("curl wait failed: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "download of {component} failed (curl exit {}){}",
+            status.code().unwrap_or(-1),
+            if err_tail.is_empty() { String::new() } else { format!(": {}", err_tail.join(" ")) },
+        ))
+    }
 }
 
 #[cfg(windows)]
@@ -913,7 +992,7 @@ fn install_blocking(app: tauri::AppHandle) -> Result<PackStatus, String> {
         emit("download");
         let asset = download_asset(component, version, os, arch)?;
         let archive_path = dl.join(format!("{component}.{}", asset.archive));
-        curl_download(&asset.url, &archive_path)?;
+        curl_download_with_progress(&app, component, i, total, &asset.url, &archive_path)?;
 
         if let Some(expected) = pinned_sha256(component) {
             emit("verify");
@@ -1194,6 +1273,20 @@ mod tests {
         // its home is the dir two levels up (the dir containing bin/)
         assert_eq!(found.parent().unwrap().parent().unwrap(), root.join("grafana-v11.1.0"));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn parse_curl_meter_extracts_progress_fields() {
+        let line = " 10  172M   10 17.6M    0     0  5.8M      0  0:00:29  0:00:03  0:00:26 5.8M";
+        let (percent, size, received, rate, eta) = parse_curl_meter(line).unwrap();
+        assert_eq!(percent, 10.0);
+        assert_eq!(size, "172M");
+        assert_eq!(received, "17.6M");
+        assert_eq!(rate, "5.8M");
+        assert_eq!(eta, "0:00:26");
+        // header / partial lines are ignored
+        assert!(parse_curl_meter("% Total    % Received % Xferd  Average Speed").is_none());
+        assert!(parse_curl_meter("curl: (22) The requested URL returned error: 404").is_none());
     }
 
     #[test]
