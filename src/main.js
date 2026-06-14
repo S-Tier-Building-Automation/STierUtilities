@@ -103,6 +103,7 @@ function loadUserState() {
     favorites: stored.favorites || {},
     hidden: stored.hidden || {},
     showHidden: Boolean(stored.showHidden),
+    libraryView: stored.libraryView === "list" ? "list" : "grid",
     view: typeof stored.view === "string" ? stored.view : "library",
     sidebarCollapsed: Boolean(stored.sidebarCollapsed),
     historian: stored.historian || null,
@@ -140,6 +141,12 @@ function setHidden(id, on) {
 
 function setShowHidden(on) {
   userState.showHidden = on;
+  saveUserState();
+  renderLibrary();
+}
+
+function setLibraryView(view) {
+  userState.libraryView = view === "list" ? "list" : "grid";
   saveUserState();
   renderLibrary();
 }
@@ -1774,7 +1781,8 @@ function nmScanTab() {
     head,
     el("section", { class: "plugin-section" },
       showFilter ? nmScanFilterBar() : null,
-      table,
+      // Static scroll wrapper; refresh swaps the inner <table> in place (no re-nesting).
+      el("div", { class: "table-scroll" }, table),
     ),
   );
 }
@@ -2862,7 +2870,8 @@ function renderBacnetPage() {
           }, "Export CSV"),
         )
       : null,
-    bacDeviceTableEl(),
+    // Static scroll wrapper; bacApplyDeviceView swaps the inner <table> in place (no re-nesting).
+    el("div", { class: "table-scroll" }, bacDeviceTableEl()),
   );
 
   const dev = bacSelectedDevice();
@@ -3356,45 +3365,78 @@ async function mcpRemove(id) {
 // Library card (compact)
 // ============================================================================
 
-function renderToolCard(tool) {
+// Shared library affordances, so the card and the list-row can't drift apart.
+function toolStarBtn(tool) {
   const fav = isFavorite(tool.id);
-  const status = tool.renderStatusPill ? tool.renderStatusPill() : null;
-
-  const star = el("button", {
+  return el("button", {
     class: `star-btn ${fav ? "star-on" : ""}`,
     title: fav ? "Unfavorite" : "Favorite",
     "aria-pressed": fav ? "true" : "false",
     onclick: (e) => { e.stopPropagation(); setFavorite(tool.id, !fav); },
   }, fav ? "★" : "☆");
+}
 
-  const hideBtn = el("button", {
-    class: "btn-ghost",
+// Compact "hide" affordance — revealed on hover/focus (see .tool-hide in styles.css).
+// The whole card/row is the open action, so this replaces the old "Open →" button.
+function toolHideBtn(tool) {
+  return el("button", {
+    class: "tool-hide",
+    title: "Hide from library",
+    "aria-label": `Hide ${tool.name}`,
     onclick: (e) => { e.stopPropagation(); setHidden(tool.id, true); },
-  }, "Hide");
+  }, "×");
+}
 
-  const openBtn = el("button", {
-    class: "btn btn-primary",
-    onclick: (e) => { e.stopPropagation(); setView(pluginView(tool.id)); },
-  }, "Open →");
+function toolStatusPill(tool) {
+  const status = tool.renderStatusPill ? tool.renderStatusPill() : null;
+  return status ? el("span", { class: `pill ${status.cls}` }, status.label) : null;
+}
 
+function renderToolCard(tool) {
   return el("article",
     {
       class: "tool-card",
       id: `tool-card-${tool.id}`,
+      title: tool.tagline || tool.name,
+      role: "button",
+      tabindex: "0",
       onclick: () => setView(pluginView(tool.id)),
+      onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setView(pluginView(tool.id)); } },
     },
     el("div", { class: "tool-icon" }, tool.emoji),
     el("div", { class: "tool-body" },
       el("div", { class: "tool-header" },
         el("h3", {}, tool.name),
         el("div", { class: "card-header-right" },
-          status && el("span", { class: `pill ${status.cls}` }, status.label),
-          star,
+          toolStatusPill(tool),
+          toolStarBtn(tool),
+          toolHideBtn(tool),
         ),
       ),
       el("p", { class: "tool-tagline" }, tool.tagline),
-      el("div", { class: "tool-actions card-footer" }, hideBtn, openBtn),
     ),
+  );
+}
+
+// Compact one-line-per-tool row for the list view. The empty-span fallback keeps
+// the fixed 6-column grid aligned when a tool has no status pill.
+function renderToolRow(tool) {
+  return el("li",
+    {
+      class: "tool-row",
+      id: `tool-card-${tool.id}`,
+      title: tool.tagline || tool.name,
+      role: "button",
+      tabindex: "0",
+      onclick: () => setView(pluginView(tool.id)),
+      onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setView(pluginView(tool.id)); } },
+    },
+    el("span", { class: "tool-row-icon" }, tool.emoji),
+    el("span", { class: "tool-row-name" }, tool.name),
+    el("span", { class: "tool-row-tag" }, tool.tagline),
+    toolStatusPill(tool) || el("span", {}),
+    toolStarBtn(tool),
+    toolHideBtn(tool),
   );
 }
 
@@ -3418,9 +3460,24 @@ function renderLibrary() {
   const visible = TOOLS.filter((t) => !isHidden(t.id));
   const hidden = TOOLS.filter((t) => isHidden(t.id));
 
+  const listView = userState.libraryView === "list";
+  const viewToggle = el("div", { class: "lib-toggle", role: "group", "aria-label": "Library layout" },
+    el("button", {
+      class: listView ? "" : "active",
+      title: "Grid view", "aria-pressed": String(!listView),
+      onclick: () => setLibraryView("grid"),
+    }, "▦ Grid"),
+    el("button", {
+      class: listView ? "active" : "",
+      title: "List view", "aria-pressed": String(listView),
+      onclick: () => setLibraryView("list"),
+    }, "☰ List"),
+  );
+
   root.appendChild(el("div", { class: "view-header" },
     el("h2", {}, "Library"),
     el("div", { class: "view-header-right" },
+      viewToggle,
       el("label", { class: "checkbox-row" },
         el("input", {
           type: "checkbox",
@@ -3438,6 +3495,10 @@ function renderLibrary() {
         ? "All tools are hidden. Toggle “Show hidden” to restore them."
         : "No tools available.",
     ));
+  } else if (listView) {
+    const list = el("ul", { class: "tool-list" });
+    for (const tool of visible) list.appendChild(renderToolRow(tool));
+    root.appendChild(list);
   } else {
     const grid = el("section", { class: "tool-grid" });
     for (const tool of visible) grid.appendChild(renderToolCard(tool));
