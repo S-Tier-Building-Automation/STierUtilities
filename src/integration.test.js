@@ -27,7 +27,7 @@ async function bootRealPlatform(invoke, telemetry, scheduler) {
 
 test("the whole tool catalog boots with a clean capability graph", async () => {
   const kernel = await bootRealPlatform(mockInvoke(), createTimeseries(), createScheduler());
-  for (const id of ["observability", "clipboardtyper", "heicmov", "networkmanager", "bacnet", "bacnet-historian"]) {
+  for (const id of ["observability", "clipboardtyper", "heicmov", "networkmanager", "bacnet-core", "bacnet", "bacnet-historian"]) {
     assert.ok(kernel.isBooted(id), `${id} should be booted`);
   }
   for (const cap of [

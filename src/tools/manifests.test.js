@@ -29,10 +29,22 @@ test("bacnet resolves its optional netscan dependency to networkmanager", () => 
   assert.ok(reg.initOrder.indexOf("networkmanager") < reg.initOrder.indexOf("bacnet"));
 });
 
+test("bacnet.read is extracted into the headless bacnet-core service", () => {
+  const reg = buildRegistry(TOOL_MANIFESTS);
+  // The service owns the capability...
+  assert.ok(reg.providers.get("bacnet.read").some((p) => p.toolId === "bacnet-core"));
+  assert.equal(manifestById("bacnet-core").category, "service");
+  // ...and the Explorer App consumes it rather than providing it.
+  assert.deepEqual(manifestById("bacnet").provides, []);
+  const res = reg.resolutions.get("bacnet").find((r) => r.capability === "bacnet.read");
+  assert.equal(res.providerId, "bacnet-core");
+  assert.ok(reg.initOrder.indexOf("bacnet-core") < reg.initOrder.indexOf("bacnet"));
+});
+
 test("the observability service provides timeseries, resolving consumers' optional dep", () => {
   const reg = buildRegistry(TOOL_MANIFESTS);
   assert.ok(reg.providers.get("timeseries").some((p) => p.toolId === "observability"));
-  const ts = reg.resolutions.get("bacnet").find((r) => r.capability === "timeseries");
+  const ts = reg.resolutions.get("networkmanager").find((r) => r.capability === "timeseries");
   assert.equal(ts.providerId, "observability");
   // observability has no deps, so it must boot before its consumers.
   assert.ok(reg.initOrder.indexOf("observability") < reg.initOrder.indexOf("bacnet"));
@@ -42,7 +54,7 @@ test("the observability service provides timeseries, resolving consumers' option
 test("observability also provides the scheduler capability", () => {
   const reg = buildRegistry(TOOL_MANIFESTS);
   assert.ok(reg.providers.get("scheduler").some((p) => p.toolId === "observability"));
-  const sched = reg.resolutions.get("bacnet").find((r) => r.capability === "scheduler");
+  const sched = reg.resolutions.get("networkmanager").find((r) => r.capability === "scheduler");
   assert.equal(sched.providerId, "observability");
 });
 
@@ -51,12 +63,12 @@ test("bacnet-historian composes bacnet.read + scheduler + timeseries", () => {
   assert.ok(reg.ok, reg.errors.join("; "));
   const res = reg.resolutions.get("bacnet-historian");
   const by = (cap) => res.find((r) => r.capability === cap);
-  assert.equal(by("bacnet.read").providerId, "bacnet");
+  assert.equal(by("bacnet.read").providerId, "bacnet-core");
   assert.equal(by("scheduler").providerId, "observability");
   assert.equal(by("timeseries").providerId, "observability");
   // must boot after all three providers
   const order = reg.initOrder;
-  for (const dep of ["bacnet", "observability"]) {
+  for (const dep of ["bacnet-core", "observability"]) {
     assert.ok(order.indexOf(dep) < order.indexOf("bacnet-historian"), `${dep} before historian`);
   }
 });

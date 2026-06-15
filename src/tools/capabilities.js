@@ -131,9 +131,11 @@ export function buildFactories(invoke, options = {}) {
     });
   });
 
-  // bacnet provides point reads and *consumes* netscan (optional) to suggest
-  // discovery targets — the first real inter-tool dependency edge.
-  factories.set("bacnet", async (host) => {
+  // bacnet-core is the headless BACnet service: it provides the reusable
+  // bacnet.read capability and *consumes* netscan (optional) to suggest
+  // discovery targets. The BACnet Explorer App and the Historian both resolve
+  // bacnet.read from here rather than embedding their own BACnet code.
+  factories.set("bacnet-core", async (host) => {
     const netscan = host.tryUse("netscan.v1"); // null if networkmanager absent/disabled
     host.provide("bacnet.read", "1.0", {
       /** Broadcast/unicast Who-Is discovery. */

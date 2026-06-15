@@ -57,12 +57,16 @@ function manifestToTool(m) {
 // the catalog derived from it. Both are rebuilt (rebuildCatalog) once user state
 // is loaded and after any install/remove. The kernel boots from ALL_MANIFESTS.
 let ALL_MANIFESTS = [...TOOL_MANIFESTS];
-let TOOLS = ALL_MANIFESTS.map(manifestToTool);
+// The nav-facing catalog excludes headless services (e.g. bacnet-core): they
+// provide capabilities and boot in the kernel — which reads ALL_MANIFESTS — but
+// have no page, so they must not show up as empty, unclickable tiles. A tool is
+// catalog-visible iff manifestToTool gave it a renderPage (apps + mcp tools).
+let TOOLS = ALL_MANIFESTS.map(manifestToTool).filter((t) => t.renderPage);
 
 function rebuildCatalog() {
   const installed = (userState.installedTools || []).filter((m) => validateManifest(m).valid);
   ALL_MANIFESTS = [...TOOL_MANIFESTS, ...installed];
-  TOOLS = ALL_MANIFESTS.map(manifestToTool);
+  TOOLS = ALL_MANIFESTS.map(manifestToTool).filter((t) => t.renderPage);
 }
 
 function toolById(id) { return TOOLS.find((t) => t.id === id); }
@@ -2154,6 +2158,23 @@ async function bacSuggestTargets() {
   }
 }
 
+// The Explorer consumes the extracted bacnet-core service for the two operations
+// in the reusable bacnet.read contract (discovery + point reads). If the kernel
+// didn't boot, it falls back to direct backend calls so the Explorer still works
+// — the platform must never take the UI down.
+function bacnetRead() {
+  const cap = platformHost("bacnet")?.tryUse("bacnet.read.v1");
+  if (cap) return cap;
+  return {
+    listDevices: (o = {}) => invoke("bacnet_discover", {
+      target: o.target ?? null, lowLimit: o.lowLimit ?? null,
+      highLimit: o.highLimit ?? null, durationMs: o.durationMs ?? null,
+    }),
+    readPoint: (device, objectType, instance) =>
+      invoke("bacnet_read_properties", { device, objectType, instance }),
+  };
+}
+
 async function bacDiscover() {
   if (bac.discovering) return;
   bacEnsureListeners();
@@ -2168,7 +2189,7 @@ async function bacDiscover() {
   const low = parseInt(bac.lowLimit, 10);
   const high = parseInt(bac.highLimit, 10);
   try {
-    const devices = await invoke("bacnet_discover", {
+    const devices = await bacnetRead().listDevices({
       target: bac.target.trim() || null,
       lowLimit: Number.isFinite(low) ? low : null,
       highLimit: Number.isFinite(high) ? high : null,
@@ -2233,11 +2254,9 @@ async function bacSelectObject(key) {
   bac.propsLoading = true;
   renderAll();
   try {
-    const props = await invoke("bacnet_read_properties", {
-      device: bacDeviceRef(dev),
-      objectType: obj.objectType,
-      instance: obj.instance,
-    });
+    const props = await bacnetRead().readPoint(
+      bacDeviceRef(dev), obj.objectType, obj.instance,
+    );
     // Guard against a newer object selection resolving first.
     if (bac.selectedObjectKey !== key) return;
     bac.props = props;

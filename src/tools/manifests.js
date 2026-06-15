@@ -106,18 +106,51 @@ export const TOOL_MANIFESTS = [
     },
   },
   {
+    // The headless BACnet/IP service — the reference "extract the engine out of
+    // the app" case. It owns the BACnet/IP stack and provides the reusable
+    // bacnet.read capability (Who-Is discovery + point reads). The BACnet
+    // Explorer App and the BACnet Historian both *consume* this contract instead
+    // of embedding their own BACnet code. category:"service" marks it headless —
+    // it boots in the kernel but has no page in the tool catalog.
+    id: "bacnet-core",
+    name: "BACnet Service",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "service",
+    provides: [{ capability: "bacnet.read", version: "1.0" }],
+    requires: [{ capability: "netscan", version: "^1.0", optional: true }],
+    permissions: ["network.udp"],
+    ui: {
+      emoji: "📡",
+      tagline: "Headless BACnet/IP read service — discovery and point reads other tools reuse.",
+      description:
+        "The reusable BACnet/IP read capability: broadcast Who-Is discovery and " +
+        "read a point's properties. It owns the BACnet/IP stack on an ephemeral " +
+        "UDP port (so it coexists with Niagara or any other BACnet stack) and " +
+        "exposes a stable bacnet.read contract any platform app can depend on. " +
+        "The BACnet Explorer and the BACnet Historian both consume it rather " +
+        "than reimplementing BACnet. Runs headless — it has no page of its own.",
+      repo: REPO,
+    },
+  },
+  {
+    // The BACnet Explorer App — the YABE-style power UI. It no longer provides
+    // bacnet.read; it *consumes* it from bacnet-core (discovery + point reads),
+    // and keeps direct backend calls for the explorer-only operations not in the
+    // shared contract (object lists, writes, COV, trends).
     id: "bacnet",
     name: "BACnet Explorer",
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
-    provides: [{ capability: "bacnet.read", version: "1.0" }],
+    category: "app",
+    provides: [],
     requires: [
+      { capability: "bacnet.read", version: "^1.0" },
       { capability: "netscan", version: "^1.0", optional: true },
-      { capability: "timeseries", version: "^1.0", optional: true },
-      { capability: "scheduler", version: "^1.0", optional: true },
     ],
-    permissions: ["network.udp", "timeseries.write", "fs.appdata"],
+    permissions: ["fs.appdata"],
     ui: {
       emoji: "🏢",
       tagline: "Discover BACnet/IP devices, browse objects, read & write points.",
