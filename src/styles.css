@@ -1197,3 +1197,54 @@ body.nm-resizing { cursor: col-resize; user-select: none; -webkit-user-select: n
 .bac-trend-max { width: 80px; }
 .bac-trend-table { margin-top: var(--gap); max-height: 320px; }
 .bac-trend-table th { position: sticky; top: 0; background: var(--bg-elev); }
+
+/* ---- Services & Capabilities (developer API reference) ---- */
+.services-intro { max-width: 70ch; margin: 0 0 var(--sp-6); line-height: 1.6; }
+.services-intro code {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 0.92em; padding: 1px 5px; border-radius: 4px;
+  background: var(--bg-elev-2); border: 1px solid var(--border); color: var(--accent-2);
+}
+.svc-provider {
+  margin-bottom: var(--sp-6); padding: var(--sp-5);
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px;
+}
+.svc-provider-head { display: flex; align-items: center; gap: var(--sp-4); margin-bottom: var(--sp-5); flex-wrap: wrap; }
+.svc-provider-icon { font-size: 20px; }
+.svc-provider-titles { display: flex; align-items: center; gap: var(--sp-4); }
+.svc-provider-name { margin: 0; font-size: var(--fs-md); }
+.svc-badge { font-size: var(--fs-label); text-transform: uppercase; letter-spacing: 0.04em; }
+.svc-badge-service { background: rgba(99, 102, 241, 0.16); color: var(--accent-2); }
+.svc-badge-app { background: var(--bg-elev-2); color: var(--text-dim); }
+.svc-perms { margin-left: auto; font-family: ui-monospace, Consolas, monospace; }
+
+.svc-cap { padding: var(--sp-5) 0; border-top: 1px solid var(--border); }
+.svc-cap-head { display: flex; align-items: center; gap: var(--sp-4); flex-wrap: wrap; }
+.svc-cap-ref {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: var(--fs-sm);
+  padding: 2px 7px; border-radius: 5px; background: var(--bg-elev-2);
+  border: 1px solid var(--border-strong); color: var(--accent-2);
+}
+.svc-copy { margin-left: auto; font-size: var(--fs-sm); }
+.svc-cap-summary { margin: var(--sp-4) 0; max-width: 78ch; line-height: 1.55; }
+.svc-methods {
+  display: flex; flex-direction: column; gap: var(--sp-3);
+  margin: var(--sp-4) 0; padding-left: var(--sp-5); border-left: 2px solid var(--border);
+}
+.svc-method-sig {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: var(--fs-sm); color: var(--text);
+}
+.svc-method-ret { margin-left: var(--sp-3); }
+.svc-method-desc { margin: 2px 0 0; max-width: 78ch; }
+.svc-note { margin: var(--sp-4) 0 0; }
+.svc-usage { margin: var(--sp-4) 0 0; }
+.svc-usage summary { cursor: pointer; color: var(--accent-2); font-size: var(--fs-sm); width: max-content; }
+.svc-usage-code {
+  margin: var(--sp-4) 0 0; padding: var(--sp-5); overflow-x: auto;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+}
+.svc-usage-code code {
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: var(--fs-sm); line-height: 1.6; color: var(--text); white-space: pre;
+}
+.svc-consumers { margin: var(--sp-4) 0 0; }

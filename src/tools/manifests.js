@@ -21,6 +21,7 @@ export const TOOL_MANIFESTS = [
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
+    category: "service",
     provides: [
       { capability: "timeseries", version: "1.0" },
       { capability: "scheduler", version: "1.0" },
@@ -44,6 +45,7 @@ export const TOOL_MANIFESTS = [
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
+    category: "app",
     provides: [],
     requires: [{ capability: "timeseries", version: "^1.0", optional: true }],
     permissions: ["input.inject", "fs.appdata"],
@@ -65,6 +67,7 @@ export const TOOL_MANIFESTS = [
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
+    category: "app",
     provides: [{ capability: "media.convert", version: "1.0" }],
     requires: [{ capability: "timeseries", version: "^1.0", optional: true }],
     permissions: ["process.spawn", "fs.userpick", "fs.appdata"],
@@ -84,6 +87,7 @@ export const TOOL_MANIFESTS = [
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
+    category: "app",
     provides: [
       { capability: "network.adapters", version: "1.0" },
       { capability: "netscan", version: "1.0" },
@@ -173,6 +177,7 @@ export const TOOL_MANIFESTS = [
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
+    category: "service",
     provides: [{ capability: "bacnet.historian", version: "1.0" }],
     requires: [
       { capability: "bacnet.read", version: "^1.0" },
