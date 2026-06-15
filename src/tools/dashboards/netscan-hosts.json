@@ -1,0 +1,36 @@
+{
+  "__comment": "Dashboard-as-code for the netscan_sweep measurement. The Observability Pack supervisor provisions every registered tool's dashboards/*.json into Grafana on install. Referenced by the networkmanager manifest's `dashboards` field.",
+  "uid": "stier-netscan-hosts",
+  "title": "Network — Host Presence",
+  "tags": ["s-tier", "netscan"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "time": { "from": "now-7d", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "subnet",
+        "type": "query",
+        "datasource": { "type": "influxdb", "uid": "influxdb" },
+        "query": "import \"influxdata/influxdb/schema\"\nschema.tagValues(bucket: \"utilities\", tag: \"subnet\")",
+        "refresh": 2
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Live hosts on $subnet",
+      "type": "timeseries",
+      "datasource": { "type": "influxdb", "uid": "influxdb" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 0 },
+      "fieldConfig": { "defaults": { "unit": "short", "custom": { "drawStyle": "line", "fillOpacity": 10 } } },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"utilities\")\n  |> range(start: v.timeRangeStart, stop: v.timeRangeStop)\n  |> filter(fn: (r) => r._measurement == \"netscan_sweep\" and r._field == \"hosts\")\n  |> filter(fn: (r) => r.subnet == \"${subnet}\")\n  |> aggregateWindow(every: v.windowPeriod, fn: last)"
+        }
+      ]
+    }
+  ]
+}

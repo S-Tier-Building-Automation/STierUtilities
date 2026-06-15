@@ -1,0 +1,169 @@
+// Tool manifests — the single source of truth for what tools exist, what
+// capabilities they provide/consume, and what they're allowed to do. The kernel
+// (src/platform/host.js) boots from this list; main.js attaches each tool's UI
+// renderers by id. Keep this file free of Tauri/DOM imports so it stays
+// unit-testable under `node --test`.
+//
+// Capability versions here are *contract* versions, independent of the app
+// version. Bump a provided capability's major only on a breaking interface
+// change so consumers' semver ranges keep working.
+
+const REPO = "https://github.com/S-Tier-Building-Automation/STierUtilities";
+
+export const TOOL_MANIFESTS = [
+  {
+    // The platform's observability service. Provides the shared timeseries
+    // capability (degraded ring-buffer mode until the Observability Pack —
+    // InfluxDB/Grafana/Telegraf — is installed and started). Later phases add
+    // the scheduler capability and the pack supervisor here.
+    id: "observability",
+    name: "Observability",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    provides: [
+      { capability: "timeseries", version: "1.0" },
+      { capability: "scheduler", version: "1.0" },
+    ],
+    requires: [],
+    permissions: ["timeseries.write", "timeseries.read", "scheduler.register", "fs.appdata", "process.spawn"],
+    ui: {
+      emoji: "📈",
+      tagline: "Local metrics now; InfluxDB + Grafana dashboards when you install the pack.",
+      description:
+        "The shared time-series service every tool can write to. Until you install " +
+        "the optional Observability Pack (Telegraf + InfluxDB + Grafana), metrics are " +
+        "kept in a local in-memory ring buffer so tools work unchanged; once the pack " +
+        "is running, the same metrics stream into InfluxDB and chart in Grafana.",
+      repo: REPO,
+    },
+  },
+  {
+    id: "clipboardtyper",
+    name: "ClipboardTyper",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    provides: [],
+    requires: [{ capability: "timeseries", version: "^1.0", optional: true }],
+    permissions: ["input.inject", "fs.appdata"],
+    ui: {
+      emoji: "⌨️",
+      tagline: "Middle-click your mouse to auto-type your clipboard.",
+      description:
+        "Useful for local password fields, some remote-desktop login screens, " +
+        "VMs, and anywhere Ctrl+V is blocked. ClipboardTyper installs a low-level " +
+        "mouse hook while enabled; middle-clicks are intercepted and your clipboard " +
+        "contents are sent with Windows SendInput scan codes. Some remote tools, including " +
+        "DeskIn in certain modes, may ignore or refuse to forward injected input.",
+      repo: "https://github.com/stier1ba/ClipboardTyper",
+    },
+  },
+  {
+    id: "heicmov",
+    name: "HEIC & MOV",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    provides: [{ capability: "media.convert", version: "1.0" }],
+    requires: [{ capability: "timeseries", version: "^1.0", optional: true }],
+    permissions: ["process.spawn", "fs.userpick", "fs.appdata"],
+    ui: {
+      emoji: "🖼️",
+      tagline: "Preview and convert iPhone photos and videos on Windows.",
+      description:
+        "Open HEIC, HEIF, and MOV files from your phone or cloud sync folder. " +
+        "Preview them in the app, then convert images to JPEG (or PNG) and videos " +
+        "to MP4. FFmpeg is bundled — no separate install required.",
+      repo: REPO,
+    },
+  },
+  {
+    id: "networkmanager",
+    name: "Network Manager",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    provides: [
+      { capability: "network.adapters", version: "1.0" },
+      { capability: "netscan", version: "1.0" },
+    ],
+    requires: [
+      { capability: "timeseries", version: "^1.0", optional: true },
+      { capability: "scheduler", version: "^1.0", optional: true },
+    ],
+    permissions: ["fs.appdata", "elevation.request", "network.raw"],
+    dashboards: ["dashboards/netscan-hosts.json"],
+    ui: {
+      emoji: "🌐",
+      tagline: "Save network profiles and see which one Windows is using.",
+      description:
+        "Save reusable IPv4 + DNS profiles for your network adapters and see at a " +
+        'glance whether Windows currently matches one ("drift"). Capture the live ' +
+        "settings of any adapter into a new profile, then apply a profile to switch " +
+        "an adapter's IPv4/DNS settings. Applying prompts for administrator approval.",
+      repo: REPO,
+    },
+  },
+  {
+    id: "bacnet",
+    name: "BACnet Explorer",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    provides: [{ capability: "bacnet.read", version: "1.0" }],
+    requires: [
+      { capability: "netscan", version: "^1.0", optional: true },
+      { capability: "timeseries", version: "^1.0", optional: true },
+      { capability: "scheduler", version: "^1.0", optional: true },
+    ],
+    permissions: ["network.udp", "timeseries.write", "fs.appdata"],
+    ui: {
+      emoji: "🏢",
+      tagline: "Discover BACnet/IP devices, browse objects, read & write points.",
+      description:
+        "A YABE-style BACnet/IP management tool. Broadcast a Who-Is to discover " +
+        "devices (including ones behind BACnet routers), browse each device's " +
+        "object list, read every property of a point, and write present-value " +
+        "with a command priority — including relinquishing a slot by writing " +
+        "Null. Uses an ephemeral UDP port, so it coexists with Niagara or any " +
+        "other BACnet stack running on this machine.",
+      repo: REPO,
+    },
+  },
+  {
+    // The flagship inter-tool feature: continuously logs BACnet points to the
+    // timeseries service on a scheduler cadence. Reuses bacnet.read (point reads),
+    // netscan (reachability), scheduler, and timeseries — writing none of them.
+    id: "bacnet-historian",
+    name: "BACnet Historian",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    provides: [{ capability: "bacnet.historian", version: "1.0" }],
+    requires: [
+      { capability: "bacnet.read", version: "^1.0" },
+      { capability: "scheduler", version: "^1.0" },
+      { capability: "timeseries", version: "^1.0" },
+      { capability: "netscan", version: "^1.0", optional: true },
+    ],
+    permissions: ["timeseries.write", "scheduler.register"],
+    dashboards: ["dashboards/bacnet-points.json"],
+    ui: {
+      emoji: "📊",
+      tagline: "Continuously log BACnet points to InfluxDB and chart them in Grafana.",
+      description:
+        "Pick BACnet points to historize; the Historian polls them on a schedule " +
+        "and streams present-value into the time-series service. With the " +
+        "Observability Pack running, the same data charts live in Grafana. It " +
+        "reuses the BACnet Explorer's reads, the scheduler, and the telemetry " +
+        "service — no duplicated BACnet, scheduling, or storage code.",
+      repo: REPO,
+    },
+  },
+];
+
+/** Look up a manifest by tool id. */
+export function manifestById(id) {
+  return TOOL_MANIFESTS.find((m) => m.id === id) || null;
+}

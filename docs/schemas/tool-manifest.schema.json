@@ -1,0 +1,194 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://stierbuildings.com/schemas/tool-manifest.schema.json",
+  "title": "S-Tier Utilities Tool Manifest",
+  "description": "Declares a tool to the platform kernel: what it provides, what it requires, how it loads, and what it is allowed to do. One manifest per tool, first-party or third-party. See docs/platform-observability-and-ecosystem.md.",
+  "type": "object",
+  "required": ["id", "name", "version", "apiVersion", "kind"],
+  "additionalProperties": false,
+  "properties": {
+    "id": {
+      "type": "string",
+      "description": "Stable unique tool id (kebab-case). Used as the namespace for its capabilities and config dir.",
+      "pattern": "^[a-z][a-z0-9-]*$"
+    },
+    "name": { "type": "string", "description": "Human-readable display name." },
+    "version": {
+      "type": "string",
+      "description": "Tool version (semver).",
+      "pattern": "^\\d+\\.\\d+\\.\\d+(?:[-+].*)?$"
+    },
+    "apiVersion": {
+      "type": "string",
+      "description": "Platform/kernel contract this tool was built against. The kernel refuses to load a tool whose apiVersion it does not support.",
+      "enum": ["1"]
+    },
+    "kind": {
+      "type": "string",
+      "description": "How the kernel loads and isolates the tool. native = Rust module compiled in (full trust). mcp = out-of-process MCP server (sandboxed; recommended for third parties). webview = sandboxed iframe panel.",
+      "enum": ["native", "mcp", "webview"]
+    },
+    "provides": {
+      "type": "array",
+      "description": "Capabilities this tool offers to others. A capability is a named, versioned contract (interface), not an implementation.",
+      "items": { "$ref": "#/$defs/providedCapability" },
+      "default": []
+    },
+    "requires": {
+      "type": "array",
+      "description": "Capabilities this tool consumes. The kernel resolves these from the providers and hands the tool a handle to each (least privilege: a tool can only host.use() what it lists here).",
+      "items": { "$ref": "#/$defs/requiredCapability" },
+      "default": []
+    },
+    "permissions": {
+      "type": "array",
+      "description": "Coarse capability-independent grants the user approves on install and the kernel enforces at runtime.",
+      "items": { "$ref": "#/$defs/permission" },
+      "uniqueItems": true,
+      "default": []
+    },
+    "ui": {
+      "type": "object",
+      "description": "Presentation metadata for the Library/sidebar.",
+      "additionalProperties": false,
+      "properties": {
+        "emoji": { "type": "string" },
+        "tagline": { "type": "string" },
+        "description": { "type": "string" },
+        "repo": { "type": "string", "format": "uri" },
+        "hidden": { "type": "boolean", "default": false }
+      }
+    },
+    "dashboards": {
+      "type": "array",
+      "description": "Paths (relative to the tool bundle) to Grafana dashboard JSON files. The kernel provisions these into Grafana when the Observability Pack is installed.",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "entry": {
+      "type": "object",
+      "description": "How to load the implementation. Shape depends on `kind`.",
+      "oneOf": [
+        {
+          "title": "native entry",
+          "additionalProperties": false,
+          "properties": {
+            "module": { "type": "string", "description": "Rust module / registration symbol (informational for native; resolved at compile time)." }
+          }
+        },
+        {
+          "title": "mcp entry",
+          "required": ["transport"],
+          "additionalProperties": false,
+          "properties": {
+            "transport": { "type": "string", "enum": ["stdio", "http", "sse"] },
+            "command": { "type": "string", "description": "Executable to launch for stdio transport." },
+            "args": { "type": "array", "items": { "type": "string" } },
+            "url": { "type": "string", "format": "uri", "description": "Endpoint for http/sse transport." },
+            "env": { "type": "object", "additionalProperties": { "type": "string" } }
+          }
+        },
+        {
+          "title": "webview entry",
+          "required": ["page"],
+          "additionalProperties": false,
+          "properties": {
+            "page": { "type": "string", "description": "Relative path to the panel HTML loaded in a sandboxed iframe." }
+          }
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "capabilityName": {
+      "type": "string",
+      "description": "Capability id without version, dotted namespace (e.g. 'bacnet.read', 'timeseries').",
+      "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)*$"
+    },
+    "providedCapability": {
+      "type": "object",
+      "required": ["capability", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "capability": { "$ref": "#/$defs/capabilityName" },
+        "version": {
+          "type": "string",
+          "description": "Exact version of the contract this tool implements (semver).",
+          "pattern": "^\\d+\\.\\d+(?:\\.\\d+)?$"
+        }
+      }
+    },
+    "requiredCapability": {
+      "type": "object",
+      "required": ["capability", "version"],
+      "additionalProperties": false,
+      "properties": {
+        "capability": { "$ref": "#/$defs/capabilityName" },
+        "version": {
+          "type": "string",
+          "description": "Semver range the provider must satisfy (e.g. '^1.0', '~1.2', '1.0').",
+          "pattern": "^[\\^~]?\\d+\\.\\d+(?:\\.\\d+)?$"
+        },
+        "optional": {
+          "type": "boolean",
+          "description": "If true, the tool loads even when no provider exists and must degrade gracefully. Use this for timeseries and other ambient services.",
+          "default": false
+        }
+      }
+    },
+    "permission": {
+      "type": "string",
+      "description": "A coarse runtime grant enforced by the kernel's permission broker.",
+      "enum": [
+        "network.udp",
+        "network.tcp",
+        "network.raw",
+        "timeseries.write",
+        "timeseries.read",
+        "scheduler.register",
+        "inventory.write",
+        "inventory.read",
+        "fs.appdata",
+        "fs.userpick",
+        "process.spawn",
+        "input.inject",
+        "elevation.request"
+      ]
+    }
+  },
+  "examples": [
+    {
+      "id": "bacnet",
+      "name": "BACnet Explorer",
+      "version": "1.2.0",
+      "apiVersion": "1",
+      "kind": "native",
+      "provides": [{ "capability": "bacnet.read", "version": "1.0" }],
+      "requires": [
+        { "capability": "netscan", "version": "^1.0", "optional": true },
+        { "capability": "timeseries", "version": "^1.0", "optional": true },
+        { "capability": "scheduler", "version": "^1.0", "optional": true }
+      ],
+      "permissions": ["network.udp", "timeseries.write", "fs.appdata"],
+      "ui": { "emoji": "🏢", "tagline": "Discover BACnet/IP devices, browse objects, read & write points." },
+      "dashboards": ["dashboards/bacnet-points.json"]
+    },
+    {
+      "id": "bacnet-historian",
+      "name": "BACnet Historian",
+      "version": "0.1.0",
+      "apiVersion": "1",
+      "kind": "native",
+      "provides": [],
+      "requires": [
+        { "capability": "bacnet.read", "version": "^1.0" },
+        { "capability": "netscan", "version": "^1.0", "optional": true },
+        { "capability": "scheduler", "version": "^1.0" },
+        { "capability": "timeseries", "version": "^1.0" }
+      ],
+      "permissions": ["timeseries.write", "scheduler.register"],
+      "ui": { "emoji": "📈", "tagline": "Continuously log BACnet points to InfluxDB and chart them in Grafana." },
+      "dashboards": ["dashboards/site-trends.json"]
+    }
+  ]
+}

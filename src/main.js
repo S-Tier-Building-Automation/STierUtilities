@@ -1,3 +1,13 @@
+import { TOOL_MANIFESTS } from "./tools/manifests.js";
+import { createKernel } from "./platform/host.js";
+import { buildFactories } from "./tools/capabilities.js";
+import { createTimeseries } from "./platform/services/timeseries.js";
+import { createScheduler } from "./platform/services/scheduler.js";
+import { createPackController } from "./platform/services/pack-controller.js";
+import { validateManifest } from "./platform/manifest.js";
+import { grantsFromInstall, approveInstall } from "./platform/mcp-loader.js";
+import { buildMcpFactories } from "./platform/services/mcp-client.js";
+
 const { invoke, convertFileSrc } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
 const opener = window.__TAURI__.opener;
@@ -7,71 +17,71 @@ const tauriProcess = window.__TAURI__.process;
 const APP_VERSION = "0.5.4";
 
 // ============================================================================
-// Tool catalog
+// Tool catalog — derived from manifests (the single source of truth) plus the
+// per-tool UI renderers. The platform kernel boots from the same manifests, so
+// "registering a tool" means adding a manifest, not editing this list.
 // ============================================================================
 
-const TOOLS = [
-  {
-    id: "clipboardtyper",
-    name: "ClipboardTyper",
-    emoji: "⌨️",
-    tagline: "Middle-click your mouse to auto-type your clipboard.",
-    description:
-      "Useful for local password fields, some remote-desktop login screens, " +
-      "VMs, and anywhere Ctrl+V is blocked. ClipboardTyper installs a low-level " +
-      "mouse hook while enabled; middle-clicks are intercepted and your clipboard " +
-      "contents are sent with Windows SendInput scan codes. Some remote tools, including " +
-      "DeskIn in certain modes, may ignore or refuse to forward injected input.",
-    repo: "https://github.com/stier1ba/ClipboardTyper",
-    renderStatusPill: ctStatusPill,
-    renderPage: renderClipboardTyperPage,
-  },
-  {
-    id: "heicmov",
-    name: "HEIC & MOV",
-    emoji: "🖼️",
-    tagline: "Preview and convert iPhone photos and videos on Windows.",
-    description:
-      "Open HEIC, HEIF, and MOV files from your phone or cloud sync folder. " +
-      "Preview them in the app, then convert images to JPEG (or PNG) and videos " +
-      "to MP4. FFmpeg is bundled — no separate install required.",
-    repo: "https://github.com/S-Tier-Building-Automation/STierUtilities",
-    renderStatusPill: hmStatusPill,
-    renderPage: renderHeicMovPage,
-  },
-  {
-    id: "networkmanager",
-    name: "Network Manager",
-    emoji: "🌐",
-    tagline: "Save network profiles and see which one Windows is using.",
-    description:
-      "Save reusable IPv4 + DNS profiles for your network adapters and see at a " +
-      "glance whether Windows currently matches one (\"drift\"). Capture the live " +
-      "settings of any adapter into a new profile, then apply a profile to switch " +
-      "an adapter's IPv4/DNS settings. Applying prompts for administrator approval.",
-    repo: "https://github.com/S-Tier-Building-Automation/STierUtilities",
-    renderStatusPill: nmStatusPill,
-    renderPage: renderNetworkManagerPage,
-  },
-  {
-    id: "bacnet",
-    name: "BACnet Explorer",
-    emoji: "🏢",
-    tagline: "Discover BACnet/IP devices, browse objects, read & write points.",
-    description:
-      "A YABE-style BACnet/IP management tool. Broadcast a Who-Is to discover " +
-      "devices (including ones behind BACnet routers), browse each device's " +
-      "object list, read every property of a point, and write present-value " +
-      "with a command priority — including relinquishing a slot by writing " +
-      "Null. Uses an ephemeral UDP port, so it coexists with Niagara or any " +
-      "other BACnet stack running on this machine.",
-    repo: "https://github.com/S-Tier-Building-Automation/STierUtilities",
-    renderStatusPill: bacStatusPill,
-    renderPage: renderBacnetPage,
-  },
-];
+// Renderers keyed by manifest id. The referenced functions are hoisted
+// declarations defined later in this file.
+const TOOL_RENDERERS = {
+  clipboardtyper: { renderStatusPill: ctStatusPill, renderPage: renderClipboardTyperPage },
+  heicmov: { renderStatusPill: hmStatusPill, renderPage: renderHeicMovPage },
+  networkmanager: { renderStatusPill: nmStatusPill, renderPage: renderNetworkManagerPage },
+  bacnet: { renderStatusPill: bacStatusPill, renderPage: renderBacnetPage },
+  observability: { renderStatusPill: obsStatusPill, renderPage: renderObservabilityPage },
+  "bacnet-historian": { renderStatusPill: histStatusPill, renderPage: renderHistorianPage },
+};
+
+// Map a manifest to a catalog entry. First-party tools use their dedicated
+// renderer; installed kind:"mcp" tools get a generic MCP page.
+function manifestToTool(m) {
+  let renderers = TOOL_RENDERERS[m.id];
+  if (!renderers && m.kind === "mcp") {
+    renderers = { renderStatusPill: () => mcpStatusPill(m), renderPage: () => renderMcpToolPage(m) };
+  }
+  renderers = renderers || {};
+  return {
+    id: m.id,
+    name: m.name,
+    emoji: (m.ui && m.ui.emoji) || "🧩",
+    tagline: (m.ui && m.ui.tagline) || "",
+    description: (m.ui && m.ui.description) || "",
+    repo: m.ui && m.ui.repo,
+    manifest: m,
+    ...renderers,
+  };
+}
+
+// The full manifest set = first-party + installed third-party (mcp) tools, and
+// the catalog derived from it. Both are rebuilt (rebuildCatalog) once user state
+// is loaded and after any install/remove. The kernel boots from ALL_MANIFESTS.
+let ALL_MANIFESTS = [...TOOL_MANIFESTS];
+let TOOLS = ALL_MANIFESTS.map(manifestToTool);
+
+function rebuildCatalog() {
+  const installed = (userState.installedTools || []).filter((m) => validateManifest(m).valid);
+  ALL_MANIFESTS = [...TOOL_MANIFESTS, ...installed];
+  TOOLS = ALL_MANIFESTS.map(manifestToTool);
+}
 
 function toolById(id) { return TOOLS.find((t) => t.id === id); }
+
+// The platform kernel. Booted once in bootstrap(); tool pages reach shared
+// capabilities through platformHost(toolId) once it's up.
+let platform = null;
+// The shared timeseries service instance (passed into the kernel factories so
+// every tool writes to the same buffer/ring), the scheduler, and the
+// Observability Pack controller.
+let telemetry = null;
+let scheduler = null;
+let pack = null;
+
+/** Scoped host for a tool's page, or null if the kernel isn't booted. */
+function platformHost(toolId) {
+  try { return platform ? platform.hostFor(toolId) : null; }
+  catch (_) { return null; }
+}
 
 // ============================================================================
 // Persistent UI state
@@ -80,6 +90,7 @@ function toolById(id) { return TOOLS.find((t) => t.id === id); }
 const STORAGE_KEY = "microtools.user_state.v2";
 
 const userState = loadUserState();
+rebuildCatalog(); // fold installed third-party (mcp) tools into the catalog
 
 function loadUserState() {
   let stored = {};
@@ -92,8 +103,13 @@ function loadUserState() {
     favorites: stored.favorites || {},
     hidden: stored.hidden || {},
     showHidden: Boolean(stored.showHidden),
+    libraryView: stored.libraryView === "list" ? "list" : "grid",
+    nmRailWidth: Number.isFinite(stored.nmRailWidth) ? stored.nmRailWidth : 240,
     view: typeof stored.view === "string" ? stored.view : "library",
     sidebarCollapsed: Boolean(stored.sidebarCollapsed),
+    historian: stored.historian || null,
+    installedTools: Array.isArray(stored.installedTools) ? stored.installedTools : [],
+    installedGrants: stored.installedGrants || {},
   };
 }
 
@@ -126,6 +142,12 @@ function setHidden(id, on) {
 
 function setShowHidden(on) {
   userState.showHidden = on;
+  saveUserState();
+  renderLibrary();
+}
+
+function setLibraryView(view) {
+  userState.libraryView = view === "list" ? "list" : "grid";
   saveUserState();
   renderLibrary();
 }
@@ -306,6 +328,43 @@ function toggleAboutMenu() {
   const m = aboutMenuEl();
   if (m && m.hidden) openAboutMenu();
   else closeAboutMenu();
+}
+
+// --- Generic modal (used for the per-tool "About" pop-out) ---
+// One modal at a time: a backdrop overlay + centered card. Closes on the × button,
+// a click on the backdrop (but not the card), or Escape.
+
+let activeModal = null;
+
+function closeModal() {
+  if (!activeModal) return;
+  document.removeEventListener("keydown", activeModal.onKey);
+  activeModal.overlay.remove();
+  activeModal = null;
+}
+
+function openModal({ title, body = [] } = {}) {
+  closeModal(); // never stack
+  const closeBtn = el("button", {
+    class: "modal-close", title: "Close", "aria-label": "Close", onclick: closeModal,
+  }, "×");
+  const card = el("div",
+    { class: "modal-card", role: "dialog", "aria-modal": "true", "aria-label": title || "Dialog" },
+    el("div", { class: "modal-head" },
+      el("h3", { class: "modal-title" }, title || ""),
+      closeBtn,
+    ),
+    el("div", { class: "modal-body" }, ...(Array.isArray(body) ? body : [body])),
+  );
+  const overlay = el("div", {
+    class: "modal-overlay",
+    onclick: (e) => { if (e.target === e.currentTarget) closeModal(); },
+  }, card);
+  const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); closeModal(); } };
+  document.addEventListener("keydown", onKey);
+  document.body.appendChild(overlay);
+  activeModal = { overlay, onKey };
+  closeBtn.focus(); // land keyboard focus inside the dialog
 }
 
 // ============================================================================
@@ -893,13 +952,14 @@ function renderHeicMovPage() {
 let nm = {
   adapters: [],            // NetworkAdapterInfo[]
   profiles: [],            // NetworkProfile[]
-  selectedId: null,
+  selectedId: null,        // selected profile id (mutually exclusive with selectedAdapter)
+  selectedAdapter: null,   // selected adapter name, when inspecting a live NIC
   stateByAdapter: {},      // adapterName -> AdapterNetworkState
   matchById: {},           // profileId -> ProfileMatchResult
   busy: false,
   busyLabel: "",
   loaded: false,           // adapters/state read at least once this session
-  tab: "profiles",         // "profiles" | "adapters" | "scan"
+  tab: "configure",        // "configure" (merged adapters+profiles) | "scan"
   scan: {
     adapterName: "",       // adapter whose subnet we sweep
     scanning: false,
@@ -1067,6 +1127,7 @@ async function nmNew() {
   p.adapterName = nmDefaultAdapter();
   nm.profiles.push(p);
   nm.selectedId = p.id;
+  nm.selectedAdapter = null;
   await nmRecomputeMatch(p);
   nmSaveSoon();
   logTo("networkmanager", `Created "${p.name}".`, "info");
@@ -1079,6 +1140,7 @@ async function nmDuplicate() {
   const p = { ...sel, id: nmNewId(), name: nmUniqueName(`${sel.name} copy`), lastAppliedAt: null };
   nm.profiles.push(p);
   nm.selectedId = p.id;
+  nm.selectedAdapter = null;
   await nmRecomputeMatch(p);
   nmSaveSoon();
   renderAll();
@@ -1099,8 +1161,18 @@ function nmDelete() {
 }
 
 function nmSelect(id) {
-  if (nm.selectedId === id) return;
+  if (nm.selectedId === id && !nm.selectedAdapter) return;
   nm.selectedId = id;
+  nm.selectedAdapter = null;
+  renderAll();
+}
+
+// Select a live adapter (shows its detail in the config panel). Mutually
+// exclusive with a profile selection.
+function nmSelectAdapter(name) {
+  if (nm.selectedAdapter === name) return;
+  nm.selectedAdapter = name;
+  nm.selectedId = null;
   renderAll();
 }
 
@@ -1122,8 +1194,8 @@ function nmSetText(key, value) {
 function nmRefreshLiveBits() {
   if (currentPluginId() !== "networkmanager") return;
   const sel = nmSelected();
-  const list = document.getElementById("nm-profile-list");
-  if (list && nm.profiles.length) list.replaceChildren(...nm.profiles.map(nmProfileRow));
+  const rail = document.getElementById("nm-config-rail");
+  if (rail) rail.replaceChildren(...nmConfigRailContent());
   const drift = document.getElementById("nm-drift");
   if (drift && sel) drift.replaceWith(nmDriftBanner(sel));
   const title = document.getElementById("nm-editor-title");
@@ -1153,7 +1225,7 @@ async function nmCaptureAdapter(adapterName) {
     p.name = nmUniqueName(p.name);
     nm.profiles.push(p);
     nm.selectedId = p.id;
-    nm.tab = "profiles";   // jump to the editor so the user sees the result
+    nm.selectedAdapter = null;   // show the new profile's editor in the config panel
     await nmRecomputeMatch(p);
     nmSaveNow();
     logTo("networkmanager", `Captured "${p.name}" from ${adapterName}.`, "ok");
@@ -1258,29 +1330,34 @@ async function nmApply() {
 
 // ---- render ----
 
-function nmProfileRow(p) {
-  const m = nmMatch(p);
-  const active = p.id === nm.selectedId;
-  return el("li", {
-    class: `nm-profile-row ${active ? "nm-profile-active" : ""}`,
+// Active / Drift / Idle status for a profile, derived from its live-match result:
+// Active = currently applied; Drift = its target adapter is present but live config
+// differs; Idle = no present target adapter.
+function nmProfileStatus(p) {
+  if (nmMatch(p).isMatch) return { dot: "nm-dot-active", label: "Active", cls: "nm-nic-active" };
+  const present = nm.adapters.some((a) => a.name === p.adapterName && a.status !== "Not Present");
+  return present
+    ? { dot: "nm-dot-drift", label: "Drift", cls: "nm-state-drift" }
+    : { dot: "nm-dot-idle", label: "Idle", cls: "muted" };
+}
+
+// A profile row in the grouped config rail (the adapter it targets is implied by
+// its group, so the row only carries name + status).
+function nmRailProfileRow(p) {
+  const active = !nm.selectedAdapter && p.id === nm.selectedId;
+  const s = nmProfileStatus(p);
+  return el("div", {
+    class: `nm-rail-profile ${active ? "selected" : ""}`,
     role: "button",
     tabindex: "0",
+    title: p.name || "(unnamed)",
     "aria-pressed": active ? "true" : "false",
     onclick: () => nmSelect(p.id),
-    onkeydown: (e) => {
-      if (e.key === "Enter" || e.key === " ") {
-        e.preventDefault();
-        nmSelect(p.id);
-      }
-    },
+    onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nmSelect(p.id); } },
   },
-    el("div", { class: "nm-profile-main" },
-      el("span", { class: "nm-profile-name" }, p.name || "(unnamed)"),
-      el("span", { class: `pill ${m.isMatch ? "pill-running" : "pill-idle"}` },
-        m.isMatch ? "Active" : (m.status || "Not active")),
-    ),
-    el("span", { class: "nm-profile-sub muted small" }, p.adapterName ? `→ ${p.adapterName}` : "No adapter"),
-    m.detail ? el("span", { class: "nm-profile-detail muted small" }, m.detail) : null,
+    el("span", { class: `nm-rail-dot ${s.dot}`, "aria-hidden": "true" }),
+    el("span", { class: "nm-rail-pname" }, p.name || "(unnamed)"),
+    el("span", { class: `nm-rail-pstate small ${s.cls}` }, s.label),
   );
 }
 
@@ -1723,7 +1800,8 @@ function nmScanTab() {
     head,
     el("section", { class: "plugin-section" },
       showFilter ? nmScanFilterBar() : null,
-      table,
+      // Static scroll wrapper; refresh swaps the inner <table> in place (no re-nesting).
+      el("div", { class: "table-scroll" }, table),
     ),
   );
 }
@@ -1734,25 +1812,160 @@ function nmTabBar() {
     onclick: () => { nm.tab = id; renderAll(); },
   }, label);
   return el("div", { class: "nm-tabs" },
-    tab("profiles", "Profiles"),
-    tab("adapters", "Adapters"),
+    tab("configure", "Configure"),
     tab("scan", "Scan"),
   );
 }
 
-function nmProfilesTab() {
-  const sel = nmSelected();
+// ---- resizable rail (the splitter between the rail and the config panel) ----
 
-  const list = el("ul", { id: "nm-profile-list", class: "nm-profile-list" });
-  if (nm.profiles.length === 0) {
-    list.appendChild(el("li", { class: "muted small nm-profile-empty" }, "No profiles yet."));
-  } else {
-    for (const p of nm.profiles) list.appendChild(nmProfileRow(p));
+function nmRailWidthPx() {
+  return Math.max(180, Math.min(440, userState.nmRailWidth || 240));
+}
+function nmSetRailWidth(px, persist) {
+  userState.nmRailWidth = Math.max(180, Math.min(440, Math.round(px)));
+  const md = document.getElementById("nm-config-md");
+  if (md) md.style.gridTemplateColumns = `${userState.nmRailWidth}px 8px minmax(0, 1fr)`;
+  const sep = document.getElementById("nm-splitter");
+  if (sep) sep.setAttribute("aria-valuenow", String(userState.nmRailWidth));
+  if (persist) saveUserState();
+}
+// Track the drag on window so it survives the pointer leaving the handle.
+// Pointer capture + a pointercancel teardown guard against a "stuck" drag if the
+// matching pointerup is ever lost (alt-tab, OS cancel).
+function nmStartRailDrag(e) {
+  e.preventDefault();
+  const startX = e.clientX;
+  const startW = nmRailWidthPx();
+  const handle = e.currentTarget;
+  try { handle.setPointerCapture(e.pointerId); } catch (_) { /* not fatal */ }
+  document.body.classList.add("nm-resizing");
+  const onMove = (ev) => nmSetRailWidth(startW + (ev.clientX - startX), false);
+  const onUp = () => {
+    window.removeEventListener("pointermove", onMove);
+    window.removeEventListener("pointerup", onUp);
+    window.removeEventListener("pointercancel", onUp);
+    document.body.classList.remove("nm-resizing");
+    try { handle.releasePointerCapture(e.pointerId); } catch (_) { /* already released */ }
+    saveUserState();
+  };
+  window.addEventListener("pointermove", onMove);
+  window.addEventListener("pointerup", onUp);
+  window.addEventListener("pointercancel", onUp);
+}
+function nmRailKeyResize(e) {
+  if (e.key === "ArrowLeft") { e.preventDefault(); nmSetRailWidth(nmRailWidthPx() - 16, true); }
+  else if (e.key === "ArrowRight") { e.preventDefault(); nmSetRailWidth(nmRailWidthPx() + 16, true); }
+}
+
+// ---- merged Configure view (adapters + profiles, master/detail) ----
+
+// The grouped rail: each present adapter is a header (selectable → live detail)
+// with its saved profiles nested beneath; profiles whose target adapter isn't
+// present fall into an "Other" group.
+function nmConfigRailContent() {
+  const children = [];
+  const present = nm.adapters.filter((a) => a.status !== "Not Present");
+  const byAdapter = new Map();
+  for (const p of nm.profiles) {
+    const key = p.adapterName || "";
+    if (!byAdapter.has(key)) byAdapter.set(key, []);
+    byAdapter.get(key).push(p);
   }
+  for (const a of present) {
+    children.push(nmRailAdapterHeader(a));
+    for (const p of (byAdapter.get(a.name) || [])) children.push(nmRailProfileRow(p));
+    byAdapter.delete(a.name);
+  }
+  const others = [];
+  for (const ps of byAdapter.values()) others.push(...ps);
+  if (others.length) {
+    children.push(el("div", { class: "nm-rail-other-head" }, "Other profiles"));
+    for (const p of others) children.push(nmRailProfileRow(p));
+  }
+  if (!children.length) {
+    children.push(el("p", { class: "muted small nm-rail-empty" },
+      nm.loaded ? "No adapters or profiles yet." : "Reading adapters…"));
+  }
+  return children;
+}
 
-  const listPane = el("div", { class: "nm-list-pane" },
-    el("div", { class: "nm-pane-head" }, el("h3", {}, "Profiles")),
-    list,
+function nmRailAdapterHeader(a) {
+  const st = nm.stateByAdapter[a.name];
+  const selected = nm.selectedAdapter === a.name;
+  return el("div", { class: `nm-rail-adapter ${selected ? "selected" : ""}` },
+    el("div", { class: "nm-rail-adapter-head" },
+      // The name is the selectable region; Save is a SIBLING (not a nested button),
+      // so keyboard Enter/Space on Save can't trigger the adapter selection.
+      el("span", {
+        class: "nm-rail-adapter-name",
+        role: "button",
+        tabindex: "0",
+        title: a.description || a.name,
+        "aria-pressed": selected ? "true" : "false",
+        onclick: () => nmSelectAdapter(a.name),
+        onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); nmSelectAdapter(a.name); } },
+      }, a.name),
+      el("button", {
+        class: "btn-ghost nm-rail-save",
+        title: "Save this adapter as a profile",
+        "aria-label": `Save ${a.name} as a profile`,
+        disabled: nm.busy ? "disabled" : undefined,
+        onclick: () => nmCaptureAdapter(a.name),
+      }, "Save"),
+    ),
+    el("div", { class: "nm-rail-summary" },
+      st ? `IPv4 ${nmIpv4Summary(st)} · gw ${st.gateway || "none"}` : (nm.loaded ? "no live state" : "reading…")),
+  );
+}
+
+// Config panel when a live adapter (not a profile) is selected.
+function nmAdapterDetail(a) {
+  const st = nm.stateByAdapter[a.name];
+  const matching = nm.profiles.filter((p) => p.adapterName === a.name);
+  const profilesList = el("div", { class: "nm-rail-list" });
+  if (matching.length) for (const p of matching) profilesList.appendChild(nmRailProfileRow(p));
+  else profilesList.appendChild(el("p", { class: "muted small" }, "No profiles yet — save this adapter to make one."));
+
+  return el("div", { class: "nm-editor-pane" },
+    el("div", { class: "nm-editor-head" },
+      el("h3", { class: "nm-editor-title" }, a.name),
+      el("div", { class: "nm-editor-actions" },
+        el("button", {
+          class: "btn btn-primary",
+          disabled: nm.busy ? "disabled" : undefined,
+          onclick: () => nmCaptureAdapter(a.name),
+        }, "Save as profile"),
+      ),
+    ),
+    el("section", { class: "plugin-section" },
+      el("h3", {}, "Live adapter"),
+      el("p", { class: "muted small" }, a.description || ""),
+      el("div", { class: "muted small" }, `Status: ${a.status}`),
+      el("div", { class: "muted small" }, st ? `IPv4 ${nmIpv4Summary(st)}` : "No live snapshot — use Refresh adapters."),
+      st ? el("div", { class: "muted small" }, `Gateway ${st.gateway || "none"} · DNS ${nmDnsSummary(st)}`) : null,
+    ),
+    el("section", { class: "plugin-section" },
+      el("h3", {}, "Profiles for this adapter"),
+      profilesList,
+    ),
+  );
+}
+
+function nmConfigEmpty() {
+  return el("div", { class: "nm-editor-pane nm-editor-empty" },
+    el("div", { class: "nm-empty" },
+      el("p", { class: "nm-empty-title" }, "Select an adapter or profile"),
+      el("p", { class: "muted small" },
+        "Pick a NIC on the left to see its live config and save it as a profile, or pick a profile to edit and apply it."),
+    ),
+  );
+}
+
+function nmConfigureTab() {
+  const railList = el("div", { id: "nm-config-rail", class: "nm-rail-list" }, ...nmConfigRailContent());
+  const rail = el("div", { class: "nm-rail" },
+    railList,
     el("button", {
       class: "btn btn-primary nm-new-btn",
       disabled: nm.busy ? "disabled" : undefined,
@@ -1760,76 +1973,49 @@ function nmProfilesTab() {
     }, "+ New profile"),
   );
 
-  const editorPane = sel
-    ? el("div", { class: "nm-editor-pane" }, ...nmEditorContent(sel))
-    : el("div", { class: "nm-editor-pane nm-editor-empty" },
-        el("div", { class: "nm-empty" },
-          el("p", { class: "nm-empty-title" }, "Select a profile to edit"),
-          el("p", { class: "muted small" },
-            "Pick one from the list, create a new one, or capture an adapter from the Adapters tab."),
-        ),
-      );
-
-  return el("div", { class: "nm-master-detail" }, listPane, editorPane);
-}
-
-function nmAdaptersTab() {
-  const refreshBtn = el("button", {
-    class: "btn-ghost",
-    disabled: nm.busy ? "disabled" : undefined,
-    onclick: nmRefresh,
-  }, nm.busy ? "Reading…" : "Refresh");
-
-  const nicList = el("div", { class: "nm-nic-list" });
-  const present = nm.adapters.filter((a) => a.status !== "Not Present");
-  if (present.length === 0) {
-    nicList.appendChild(el("p", { class: "muted small" }, nm.loaded ? "No adapters found." : "Reading adapters…"));
+  let panel;
+  if (nm.selectedAdapter) {
+    const a = nm.adapters.find((x) => x.name === nm.selectedAdapter);
+    panel = a ? nmAdapterDetail(a) : nmConfigEmpty();
   } else {
-    for (const a of present) {
-      const st = nm.stateByAdapter[a.name];
-      const matching = nm.profiles
-        .filter((p) => p.adapterName === a.name && nm.matchById[p.id]?.isMatch)
-        .map((p) => p.name);
-      nicList.appendChild(el("div", { class: "nm-nic-row" },
-        el("div", { class: "nm-nic-head" },
-          el("span", { class: "nm-nic-name" }, a.name),
-          el("span", { class: "muted small" }, a.status),
-        ),
-        el("div", { class: "muted small" }, a.description),
-        el("div", { class: "muted small" }, `IPv4 ${nmIpv4Summary(st)} · Gateway ${st?.gateway || "none"} · DNS ${nmDnsSummary(st)}`),
-        el("div", { class: "nm-nic-foot" },
-          el("span", { class: `small ${matching.length ? "nm-nic-active" : "muted"}` },
-            matching.length ? `Active profile: ${matching.join(", ")}` : "No matching profile"),
-          el("button", {
-            class: "btn-ghost nm-nic-save",
-            disabled: nm.busy ? "disabled" : undefined,
-            onclick: () => nmCaptureAdapter(a.name),
-          }, "Save as profile"),
-        ),
-      ));
-    }
+    const sel = nmSelected();
+    panel = sel ? el("div", { class: "nm-editor-pane" }, ...nmEditorContent(sel)) : nmConfigEmpty();
   }
 
+  const splitter = el("div", {
+    id: "nm-splitter",
+    class: "nm-splitter",
+    role: "separator",
+    tabindex: "0",
+    "aria-orientation": "vertical",
+    "aria-label": "Resize the configuration panel",
+    "aria-valuemin": "180",
+    "aria-valuemax": "440",
+    "aria-valuenow": String(nmRailWidthPx()),
+    title: "Drag to resize · double-click to reset",
+    onpointerdown: nmStartRailDrag,
+    ondblclick: () => nmSetRailWidth(240, true),
+    onkeydown: nmRailKeyResize,
+  });
+
+  const md = el("div", { id: "nm-config-md", class: "nm-config-md" }, rail, splitter, panel);
+  md.style.gridTemplateColumns = `${nmRailWidthPx()}px 8px minmax(0, 1fr)`;
+
   return el("div", { class: "plugin-controls" },
-    el("section", { class: "plugin-section" },
-      el("div", { class: "nm-pane-head" },
-        el("div", { class: "nm-pane-head-text" },
-          el("h3", {}, "Windows adapters"),
-          el("p", { class: "muted small nm-section-sub" }, "Your live network adapters. Save one as a reusable profile."),
-        ),
-        refreshBtn,
-      ),
-      nicList,
+    el("div", { class: "nm-config-head" },
+      el("button", {
+        class: "btn-ghost",
+        disabled: nm.busy ? "disabled" : undefined,
+        onclick: nmRefresh,
+      }, nm.busy ? "Reading…" : "Refresh adapters"),
     ),
+    md,
   );
 }
 
 function renderNetworkManagerPage() {
   nmEnsureLoaded();
-  const body =
-    nm.tab === "adapters" ? nmAdaptersTab()
-    : nm.tab === "scan" ? nmScanTab()
-    : nmProfilesTab();
+  const body = nm.tab === "scan" ? nmScanTab() : nmConfigureTab();
   return el("div", { class: "plugin-controls nm-root" },
     nmTabBar(),
     body,
@@ -1940,6 +2126,33 @@ function bacEnsureListeners() {
 }
 
 // ---- actions ----
+
+// Inter-tool dependency in action: BACnet Explorer borrows Network Manager's
+// subnet scanner (the `netscan` capability) to find live hosts to aim discovery
+// at — instead of reimplementing an ICMP sweep. Only offered when the kernel
+// resolved the optional dependency, so it degrades cleanly if Network Manager
+// is unavailable.
+async function bacSuggestTargets() {
+  const netscan = platformHost("bacnet")?.tryUse("netscan.v1");
+  if (!netscan) { logTo("bacnet", "Network scan capability unavailable.", "warn"); return; }
+  if (!nm.loaded) { try { await nmRefresh(); } catch (_) {} }
+  let subnet = null;
+  for (const a of nm.adapters) {
+    const s = nmScanSubnetFor(a.name);
+    if (s) { subnet = s; break; }
+  }
+  if (!subnet) { logTo("bacnet", "No adapter with a scannable IPv4 subnet to search.", "warn"); return; }
+  logTo("bacnet", `Scanning ${subnet.network}/${subnet.prefix} for live hosts (via Network Manager)…`, "info");
+  try {
+    const result = await netscan.scan(`${subnet.ip}/${subnet.prefix}`);
+    const hosts = result?.hosts || [];
+    if (hosts.length === 0) { logTo("bacnet", "No live hosts found on the subnet.", "warn"); return; }
+    const preview = hosts.slice(0, 12).map((h) => h.ip).join(", ");
+    logTo("bacnet", `Found ${hosts.length} live host${hosts.length === 1 ? "" : "s"}: ${preview}${hosts.length > 12 ? "…" : ""}`, "ok");
+  } catch (err) {
+    logTo("bacnet", `Host scan failed: ${err}`, "error");
+  }
+}
 
 async function bacDiscover() {
   if (bac.discovering) return;
@@ -2727,6 +2940,17 @@ function renderBacnetPage() {
     onclick: bacDiscover,
   }, bac.discovering ? "Discovering…" : "Discover");
 
+  // Offered only when the platform kernel resolved BACnet's optional dependency
+  // on the netscan capability (i.e. Network Manager is present).
+  const scanBtn = platformHost("bacnet")?.has("netscan.v1")
+    ? el("button", {
+        class: "btn btn-ghost",
+        disabled: bac.discovering ? "disabled" : undefined,
+        title: "Use Network Manager's scanner to list live hosts on your subnet",
+        onclick: bacSuggestTargets,
+      }, "Find live hosts")
+    : null;
+
   const discoverSection = el("section", { class: "plugin-section" },
     el("div", { class: "nm-pane-head" },
       el("div", { class: "nm-pane-head-text" },
@@ -2744,6 +2968,7 @@ function renderBacnetPage() {
         el("div", { class: "bac-range-pair" }, lowInput, el("span", { class: "muted" }, "–"), highInput),
       ),
       discoverBtn,
+      scanBtn,
     ),
     bacTargetChips(),
   );
@@ -2772,7 +2997,8 @@ function renderBacnetPage() {
           }, "Export CSV"),
         )
       : null,
-    bacDeviceTableEl(),
+    // Static scroll wrapper; bacApplyDeviceView swaps the inner <table> in place (no re-nesting).
+    el("div", { class: "table-scroll" }, bacDeviceTableEl()),
   );
 
   const dev = bacSelectedDevice();
@@ -2840,48 +3066,504 @@ function renderBacnetPage() {
 }
 
 // ============================================================================
+// Observability (platform service page)
+// ============================================================================
+
+// Pack UI state.
+let obsBusy = false;
+let obsPhase = "";       // high-level bring-up phase label
+let obsProgress = null;  // latest per-component install event (download %, rate, ETA, …)
+let obsHealth = null;
+let obsPack = null;      // installed-vs-pinned component versions (update detection)
+let obsPackLoading = false;
+
+const OBS_COMPONENT_NAMES = { influxdb: "InfluxDB", telegraf: "Telegraf", grafana: "Grafana" };
+
+// Lazily fetch pack version status (installed vs pinned) once per page visit.
+function obsEnsurePackStatus() {
+  if (obsPack !== null || obsPackLoading || !pack) return;
+  obsPackLoading = true;
+  pack.packStatus()
+    .then((s) => { obsPack = s; obsPackLoading = false; renderAll(); })
+    .catch(() => { obsPackLoading = false; });
+}
+
+// "InfluxDB 2.7.5 · Telegraf 1.30.0 · Grafana 11.1.0 → 11.2.0" + an update badge.
+function obsVersionsLine() {
+  if (!obsPack || !obsPack.components) return null;
+  const parts = obsPack.components.map((c) => {
+    const name = OBS_COMPONENT_NAMES[c.name] || c.name;
+    const ver = c.present ? (c.installedVersion || "?") : "not installed";
+    const upgrade = c.present && c.needsUpdate ? ` → ${c.pinnedVersion}` : "";
+    return `${name} ${ver}${upgrade}`;
+  });
+  return el("p", { class: "muted small" },
+    parts.join(" · "),
+    obsPack.updatesAvailable ? el("span", { class: "pill pill-running", style: "margin-left:8px" }, "Update available") : null,
+  );
+}
+
+const OBS_PHASE_LABELS = {
+  status: "Checking what's installed…",
+  install: "Downloading & installing components…",
+  "write-configs": "Writing configuration…",
+  start: "Starting InfluxDB, Telegraf & Grafana…",
+  "wait-influx": "Waiting for InfluxDB to come up…",
+  onboard: "Initializing InfluxDB…",
+  connect: "Connecting telemetry…",
+  done: "Done",
+};
+
+function renderInstallProgress() {
+  const pr = obsProgress;
+  const downloading = pr && pr.step === "download" && pr.percent != null;
+  const pct = downloading ? Math.max(0, Math.min(100, Math.round(Number(pr.percent)))) : null;
+  let detail;
+  if (downloading) {
+    detail = `Downloading ${pr.component} (${(pr.index ?? 0) + 1}/${pr.total ?? 3}) — ` +
+      `${pct}% · ${pr.received}/${pr.size} · ${pr.rate}/s · ETA ${pr.eta}`;
+  } else if (pr && pr.step) {
+    const verb = { extract: "Extracting", install: "Installing", "already-installed": "Already installed",
+      done: "Installed", verify: "Verifying" }[pr.step] || pr.step;
+    detail = `${verb} ${pr.component} (${(pr.index ?? 0) + 1}/${pr.total ?? 3})…`;
+  } else {
+    detail = obsPhase || "Working…";
+  }
+  const fill = el("div", { class: "progress-fill" });
+  fill.style.width = pct != null ? `${pct}%` : "100%";
+  if (pct == null) fill.style.opacity = "0.4"; // indeterminate phases
+  const bar = el("div", { class: "progress-bar" }, fill);
+  bar.style.display = "block";
+  return el("section", { class: "plugin-section" },
+    el("h3", {}, obsPhase || "Installing…"),
+    el("p", { class: "muted small" }, detail),
+    bar,
+  );
+}
+
+function obsStatusPill() {
+  if (obsHealth && obsHealth.influxReady) return { label: "Live", cls: "pill-running" };
+  if (obsHealth && obsHealth.influxUp) return { label: "Starting", cls: "pill-muted" };
+  const s = telemetry ? telemetry.stats() : null;
+  if (s && s.backend && s.degraded) return { label: "Reconnecting", cls: "pill-muted" };
+  return { label: "Local", cls: "pill-idle" };
+}
+
+async function obsRefreshHealth() {
+  if (!pack) return;
+  try { obsHealth = await pack.health(); }
+  catch (_) { obsHealth = null; }
+  renderAll();
+}
+
+async function obsBringUp() {
+  if (!pack || obsBusy) return;
+  obsBusy = true; obsPhase = OBS_PHASE_LABELS.status; obsProgress = null; renderAll();
+  try {
+    logTo("observability", "Bringing up the Observability Pack… (first run downloads ~400 MB)", "info");
+    const cfg = await pack.bringUp((s) => {
+      obsPhase = OBS_PHASE_LABELS[s] || s;
+      if (s !== "install") obsProgress = null; // download detail only during install
+      renderAll();
+    });
+    logTo("observability", `Pack up — InfluxDB :${cfg.influxPort}, Grafana :${cfg.grafanaPort}.`, "ok");
+    await obsRefreshHealth();
+  } catch (err) {
+    logTo("observability", `Bring-up failed: ${err}`, "error");
+  } finally {
+    // Re-fetch installed versions on success OR failure (a partial update may
+    // have changed them), so the version line / Update-available badge is fresh.
+    obsPack = null;
+    obsBusy = false; obsPhase = ""; obsProgress = null; renderAll();
+  }
+}
+
+async function obsStop() {
+  if (!pack) return;
+  try { await pack.stop(); logTo("observability", "Stopped pack services.", "info"); await obsRefreshHealth(); }
+  catch (err) { logTo("observability", `Stop failed: ${err}`, "error"); }
+}
+
+async function obsWriteConfigs() {
+  if (!pack) return;
+  try { const dir = await pack.writeConfigs(); logTo("observability", `Wrote pack config files to ${dir}.`, "ok"); }
+  catch (err) { logTo("observability", `Could not write configs: ${err}`, "error"); }
+}
+
+function renderObservabilityPage() {
+  obsEnsurePackStatus();
+  const stats = telemetry ? telemetry.stats() : null;
+  const recent = telemetry ? telemetry.recent(15) : [];
+  const cfg = pack ? pack.getConfig() : null;
+
+  const healthLine = obsHealth
+    ? `InfluxDB: ${obsHealth.influxReady ? "ready" : obsHealth.influxUp ? "starting" : "down"} · Grafana: ${obsHealth.grafanaUp ? "up" : "down"}`
+    : "Health unknown — click Check health.";
+
+  const installLabel = obsBusy ? "Working…"
+    : (obsPack && obsPack.updatesAvailable) ? "Update & restart pack"
+    : (obsPack && obsPack.installed) ? "Restart pack"
+    : "Install & start pack";
+
+  const statusCard = el("section", { class: "plugin-section" },
+    el("h3", {}, "Observability Pack"),
+    el("p", { class: "muted small" },
+      "Telegraf + InfluxDB + Grafana run locally on 127.0.0.1. The first install downloads ~400 MB; " +
+      "until then, tool metrics are kept in an in-memory ring buffer (still visible below)."),
+    obsVersionsLine(),
+    el("p", { class: "muted small" }, obsBusy ? (obsPhase || "Working…") : healthLine),
+    el("div", { class: "tool-actions" },
+      el("button", {
+        class: "btn btn-primary",
+        disabled: obsBusy ? "disabled" : undefined,
+        onclick: obsBringUp,
+      }, installLabel),
+      el("button", { class: "btn-ghost", disabled: obsBusy ? "disabled" : undefined, onclick: obsStop }, "Stop"),
+      el("button", { class: "btn-ghost", onclick: obsRefreshHealth }, "Check health"),
+      el("button", { class: "btn-ghost", disabled: obsBusy ? "disabled" : undefined, onclick: obsWriteConfigs }, "Write configs"),
+      obsHealth && obsHealth.grafanaUp && cfg
+        ? el("button", { class: "btn-ghost", onclick: () => openExternal(`http://127.0.0.1:${cfg.grafanaPort}`) }, "Open Grafana")
+        : null,
+    ),
+  );
+
+  const statRow = (label, val) => el("div", { class: "kv-row" },
+    el("span", { class: "muted small" }, label), el("span", {}, String(val)));
+  const statsCard = el("section", { class: "plugin-section" },
+    el("h3", {}, "Buffer"),
+    stats
+      ? el("div", { class: "kv-grid" },
+          statRow("Recent (ring)", stats.ring),
+          statRow("Buffered", stats.buffered),
+          statRow("Written", stats.written),
+          statRow("Dropped", stats.dropped),
+        )
+      : el("p", { class: "muted small" }, "Telemetry service not started."),
+  );
+
+  const recentCard = el("section", { class: "plugin-section" },
+    el("div", { class: "section-head" },
+      el("h3", {}, "Recent metrics"),
+      el("button", { class: "btn-ghost", onclick: () => renderAll() }, "Refresh"),
+    ),
+    recent.length === 0
+      ? el("p", { class: "muted small" }, "No metrics recorded yet. Run a tool (e.g. a network scan) to produce some.")
+      : el("ol", { class: "plugin-log" },
+          ...recent.slice().reverse().map((p) =>
+            el("li", { class: "log-info" },
+              el("span", { class: "log-time" }, new Date(p.ts).toLocaleTimeString()),
+              el("span", { class: "log-msg" },
+                `${p.measurement} ${Object.entries(p.tags).map(([k, v]) => `${k}=${v}`).join(",")} → ${Object.entries(p.fields).map(([k, v]) => `${k}=${v}`).join(", ")}`),
+            )),
+        ),
+  );
+
+  const progressCard = obsBusy ? renderInstallProgress() : null;
+  return el("div", { class: "plugin-controls" }, statusCard, progressCard, statsCard, recentCard);
+}
+
+// ============================================================================
+// BACnet Historian (composed tool page)
+// ============================================================================
+
+function historianInstance() {
+  return platform ? platform.capability("bacnet.historian.v1") : null;
+}
+
+let histIntervalMs = 60000;
+
+function histStatusPill() {
+  const hist = historianInstance();
+  if (!hist) return { label: "Off", cls: "pill-muted" };
+  return hist.isRunning() ? { label: "Logging", cls: "pill-running" } : { label: "Idle", cls: "pill-idle" };
+}
+
+// Persist the configured points + run state so unattended logging survives a
+// reload/restart (the historian core itself is in-memory only).
+function histPersist() {
+  const hist = historianInstance();
+  if (!hist) return;
+  userState.historian = {
+    points: hist.points().map((p) => ({
+      device: p.device, objectType: p.objectType, instance: p.instance, label: p.label || "",
+    })),
+    running: hist.isRunning(),
+    intervalMs: histIntervalMs,
+  };
+  saveUserState();
+}
+
+function histRestore() {
+  const hist = historianInstance();
+  const saved = userState.historian;
+  if (!hist || !saved) return;
+  for (const p of saved.points || []) hist.addPoint(p);
+  if (saved.intervalMs) histIntervalMs = saved.intervalMs;
+  if (saved.running && (saved.points || []).length) {
+    hist.start(histIntervalMs);
+    logTo("bacnet-historian", `Resumed logging ${saved.points.length} point(s).`, "info");
+  }
+}
+
+function renderHistorianPage() {
+  const hist = historianInstance();
+  if (!hist) {
+    return el("div", { class: "plugin-controls" },
+      el("section", { class: "plugin-section" },
+        el("p", { class: "muted" }, "Historian unavailable — the platform kernel did not resolve its dependencies.")));
+  }
+
+  // Devices come from the BACnet Explorer's discovery results (inter-tool reuse).
+  const devices = bac.devices || [];
+  let devIdx = devices.length ? "0" : "";
+  const objTypeInput = el("input", { type: "number", class: "nm-input bac-range-input", value: "0", title: "Object type (0=AI, 1=AO, 2=AV, …)" });
+  const instInput = el("input", { type: "number", class: "nm-input bac-range-input", value: "0" });
+  const labelInput = el("input", { type: "text", class: "nm-input", placeholder: "label (optional)" });
+  const devSelect = el("select", { class: "nm-input", onchange: (e) => { devIdx = e.target.value; } },
+    ...(devices.length
+      ? devices.map((d, i) => el("option", { value: String(i) }, bacDeviceLabel(d)))
+      : [el("option", { value: "" }, "No devices — discover in BACnet Explorer first")]));
+
+  const addBtn = el("button", {
+    class: "btn",
+    disabled: devices.length ? undefined : "disabled",
+    onclick: () => {
+      const dev = devices[Number(devIdx)];
+      if (!dev) return;
+      hist.addPoint({
+        device: { ...bacDeviceRef(dev), deviceInstance: dev.instance },
+        objectType: Number(objTypeInput.value),
+        instance: Number(instInput.value),
+        label: labelInput.value.trim(),
+      });
+      logTo("bacnet-historian", `Added device ${dev.instance} point ${objTypeInput.value}:${instInput.value}.`, "ok");
+      histPersist();
+      renderAll();
+    },
+  }, "Add point");
+
+  const addCard = el("section", { class: "plugin-section" },
+    el("h3", {}, "Add a point"),
+    el("p", { class: "muted small" }, "Points are read from devices discovered in the BACnet Explorer."),
+    el("div", { class: "bac-discover-controls" },
+      el("label", { class: "nm-field bac-target-field" }, el("span", { class: "nm-field-label" }, "Device"), devSelect),
+      el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Object type"), objTypeInput),
+      el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Instance"), instInput),
+      el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Label"), labelInput),
+      addBtn,
+    ),
+  );
+
+  const intervalInput = el("input", { type: "number", class: "nm-input bac-range-input", value: String(Math.round(histIntervalMs / 1000) || 60), title: "seconds" });
+  const running = hist.isRunning();
+  const controlCard = el("section", { class: "plugin-section" },
+    el("div", { class: "section-head" },
+      el("h3", {}, "Logging"),
+      el("span", { class: `pill ${running ? "pill-running" : "pill-idle"}` }, running ? "Logging" : "Idle")),
+    el("p", { class: "muted small" },
+      "Writes present-value to the time-series service. Connect the Observability Pack to chart it in Grafana."),
+    el("div", { class: "bac-discover-controls" },
+      el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Interval (s)"), intervalInput),
+      el("button", {
+        class: "btn btn-primary",
+        onclick: () => {
+          histIntervalMs = Math.max(5, Number(intervalInput.value) || 60) * 1000;
+          hist.start(histIntervalMs);
+          logTo("bacnet-historian", "Started logging.", "ok");
+          histPersist();
+          renderAll();
+        },
+      }, running ? "Restart" : "Start"),
+      running
+        ? el("button", { class: "btn-ghost", onclick: () => { hist.stop(); logTo("bacnet-historian", "Stopped logging.", "info"); histPersist(); renderAll(); } }, "Stop")
+        : null,
+      el("button", {
+        class: "btn-ghost",
+        onclick: async () => {
+          const r = await hist.pollOnce();
+          logTo("bacnet-historian", `Polled — ${r.written} written, ${r.errors} error(s).`, r.errors ? "warn" : "ok");
+          renderAll();
+        },
+      }, "Poll now"),
+    ),
+  );
+
+  const pts = hist.points();
+  const pointsCard = el("section", { class: "plugin-section" },
+    el("h3", {}, `Points (${pts.length})`),
+    pts.length === 0
+      ? el("p", { class: "muted small" }, "No points yet — add one above.")
+      : el("ol", { class: "plugin-log" },
+          ...pts.map((p) =>
+            el("li", { class: p.lastError ? "log-error" : "log-info" },
+              el("span", { class: "log-msg" },
+                `${p.label ? p.label + " · " : ""}dev ${p.device.deviceInstance} ${p.objectType}:${p.instance} → ` +
+                `${p.lastError ? "ERR " + p.lastError : (p.lastValue ?? "—")} (${p.reads} reads)`),
+              el("button", { class: "btn-ghost", onclick: () => { hist.removePoint(p); histPersist(); renderAll(); } }, "Remove"),
+            ))),
+  );
+
+  return el("div", { class: "plugin-controls" }, controlCard, addCard, pointsCard);
+}
+
+// ============================================================================
+// Third-party MCP tools (install / page / remove)
+// ============================================================================
+
+function mcpStatusPill(m) {
+  if (platform && platform.isBooted(m.id)) return { label: "Connected", cls: "pill-running" };
+  return { label: "Off", cls: "pill-muted" };
+}
+
+function renderMcpToolPage(m) {
+  const booted = platform && platform.isBooted(m.id);
+  const caps = (m.provides || []).map((p) => `${p.capability}.v${String(p.version).split(".")[0]}`);
+  const entry = m.entry || {};
+  return el("div", { class: "plugin-controls" },
+    el("section", { class: "plugin-section" },
+      el("h3", {}, "Third-party MCP tool"),
+      el("p", { class: "muted small" },
+        booted
+          ? "Connected — its capabilities are available to other tools via the kernel."
+          : "Not connected — the MCP server failed to start (check the command is installed)."),
+      el("p", { class: "muted small" }, `Provides: ${caps.length ? caps.join(", ") : "—"}`),
+      el("p", { class: "muted small" }, `Permissions: ${(m.permissions || []).join(", ") || "none"}`),
+      el("p", { class: "muted small" }, `Command: ${entry.command || "?"} ${(entry.args || []).join(" ")}`),
+      el("div", { class: "tool-actions" },
+        el("button", { class: "btn-ghost", onclick: () => mcpRemove(m.id) }, "Remove tool"),
+      ),
+    ),
+  );
+}
+
+// Install a kind:"mcp" tool from a pasted manifest: validate, get permission
+// approval, persist, then reload so the kernel boots it.
+async function mcpInstallFromJson(jsonText) {
+  let manifest;
+  try { manifest = JSON.parse(jsonText); }
+  catch (e) { alert(`Invalid JSON: ${e.message}`); return; }
+
+  const { valid, errors } = validateManifest(manifest);
+  if (!valid) { alert(`Invalid manifest:\n${errors.join("\n")}`); return; }
+  if (manifest.kind !== "mcp") { alert('Only kind:"mcp" tools can be installed here.'); return; }
+  const exists = ALL_MANIFESTS.some((t) => t.id === manifest.id);
+  if (exists) { alert(`A tool with id "${manifest.id}" already exists.`); return; }
+
+  // SECURITY: installing an MCP tool runs a native program on every launch, so
+  // always require an explicit, command-disclosing confirmation — even when the
+  // manifest declares no permissions. This (not the permission list) is the real
+  // gate: the user is deciding whether to trust an executable.
+  const entry = manifest.entry || {};
+  const cmdLine = `${entry.command || "?"} ${(entry.args || []).join(" ")}`.trim();
+  const envKeys = entry.env ? Object.keys(entry.env) : [];
+  const ok = confirm(
+    `Install "${manifest.name}"?\n\n` +
+    `⚠ This runs a program on your computer every time the app launches:\n  ${cmdLine}\n` +
+    (envKeys.length ? `Environment: ${envKeys.join(", ")}\n` : "") +
+    `\nCapabilities it will provide: ${(manifest.provides || []).map((p) => p.capability).join(", ") || "none"}\n` +
+    `Permissions requested: ${(manifest.permissions || []).join(", ") || "none"}\n\n` +
+    `Only install tools from sources you trust — this is arbitrary code execution.`,
+  );
+  if (!ok) { alert("Install cancelled."); return; }
+
+  // Record the approved permission set (the command was already consented to above).
+  const granted = await approveInstall(manifest, () => true);
+
+  userState.installedTools = [...(userState.installedTools || []), manifest];
+  userState.installedGrants = { ...(userState.installedGrants || {}), [manifest.id]: [...granted] };
+  saveUserState();
+  alert(`Installed "${manifest.name}". The app will reload to start it.`);
+  location.reload();
+}
+
+async function mcpRemove(id) {
+  if (!confirm("Remove this MCP tool?")) return;
+  try { await invoke("mcp_stop", { id }); } catch (_) {}
+  userState.installedTools = (userState.installedTools || []).filter((t) => t.id !== id);
+  const grants = { ...(userState.installedGrants || {}) };
+  delete grants[id];
+  userState.installedGrants = grants;
+  if (currentPluginId() === id) userState.view = "library";
+  saveUserState();
+  location.reload();
+}
+
+// ============================================================================
 // Library card (compact)
 // ============================================================================
 
-function renderToolCard(tool) {
+// Shared library affordances, so the card and the list-row can't drift apart.
+function toolStarBtn(tool) {
   const fav = isFavorite(tool.id);
-  const status = tool.renderStatusPill ? tool.renderStatusPill() : null;
-
-  const star = el("button", {
+  return el("button", {
     class: `star-btn ${fav ? "star-on" : ""}`,
     title: fav ? "Unfavorite" : "Favorite",
     "aria-pressed": fav ? "true" : "false",
     onclick: (e) => { e.stopPropagation(); setFavorite(tool.id, !fav); },
   }, fav ? "★" : "☆");
+}
 
-  const hideBtn = el("button", {
-    class: "btn-ghost",
+// Compact "hide" affordance — revealed on hover/focus (see .tool-hide in styles.css).
+// The whole card/row is the open action, so this replaces the old "Open →" button.
+function toolHideBtn(tool) {
+  return el("button", {
+    class: "tool-hide",
+    title: "Hide from library",
+    "aria-label": `Hide ${tool.name}`,
     onclick: (e) => { e.stopPropagation(); setHidden(tool.id, true); },
-  }, "Hide");
+  }, "×");
+}
 
-  const openBtn = el("button", {
-    class: "btn btn-primary",
-    onclick: (e) => { e.stopPropagation(); setView(pluginView(tool.id)); },
-  }, "Open →");
+function toolStatusPill(tool) {
+  const status = tool.renderStatusPill ? tool.renderStatusPill() : null;
+  return status ? el("span", { class: `pill ${status.cls}` }, status.label) : null;
+}
 
+function renderToolCard(tool) {
   return el("article",
     {
       class: "tool-card",
       id: `tool-card-${tool.id}`,
+      title: tool.tagline || tool.name,
+      role: "button",
+      tabindex: "0",
       onclick: () => setView(pluginView(tool.id)),
+      onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setView(pluginView(tool.id)); } },
     },
     el("div", { class: "tool-icon" }, tool.emoji),
     el("div", { class: "tool-body" },
       el("div", { class: "tool-header" },
         el("h3", {}, tool.name),
         el("div", { class: "card-header-right" },
-          status && el("span", { class: `pill ${status.cls}` }, status.label),
-          star,
+          toolStatusPill(tool),
+          toolStarBtn(tool),
+          toolHideBtn(tool),
         ),
       ),
       el("p", { class: "tool-tagline" }, tool.tagline),
-      el("div", { class: "tool-actions card-footer" }, hideBtn, openBtn),
     ),
+  );
+}
+
+// Compact one-line-per-tool row for the list view. The empty-span fallback keeps
+// the fixed 6-column grid aligned when a tool has no status pill.
+function renderToolRow(tool) {
+  return el("li",
+    {
+      class: "tool-row",
+      id: `tool-card-${tool.id}`,
+      title: tool.tagline || tool.name,
+      role: "button",
+      tabindex: "0",
+      onclick: () => setView(pluginView(tool.id)),
+      onkeydown: (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setView(pluginView(tool.id)); } },
+    },
+    el("span", { class: "tool-row-icon" }, tool.emoji),
+    el("span", { class: "tool-row-name" }, tool.name),
+    el("span", { class: "tool-row-tag" }, tool.tagline),
+    toolStatusPill(tool) || el("span", {}),
+    toolStarBtn(tool),
+    toolHideBtn(tool),
   );
 }
 
@@ -2905,9 +3587,24 @@ function renderLibrary() {
   const visible = TOOLS.filter((t) => !isHidden(t.id));
   const hidden = TOOLS.filter((t) => isHidden(t.id));
 
+  const listView = userState.libraryView === "list";
+  const viewToggle = el("div", { class: "lib-toggle", role: "group", "aria-label": "Library layout" },
+    el("button", {
+      class: listView ? "" : "active",
+      title: "Grid view", "aria-pressed": String(!listView),
+      onclick: () => setLibraryView("grid"),
+    }, "▦ Grid"),
+    el("button", {
+      class: listView ? "active" : "",
+      title: "List view", "aria-pressed": String(listView),
+      onclick: () => setLibraryView("list"),
+    }, "☰ List"),
+  );
+
   root.appendChild(el("div", { class: "view-header" },
     el("h2", {}, "Library"),
     el("div", { class: "view-header-right" },
+      viewToggle,
       el("label", { class: "checkbox-row" },
         el("input", {
           type: "checkbox",
@@ -2925,6 +3622,10 @@ function renderLibrary() {
         ? "All tools are hidden. Toggle “Show hidden” to restore them."
         : "No tools available.",
     ));
+  } else if (listView) {
+    const list = el("ul", { class: "tool-list" });
+    for (const tool of visible) list.appendChild(renderToolRow(tool));
+    root.appendChild(list);
   } else {
     const grid = el("section", { class: "tool-grid" });
     for (const tool of visible) grid.appendChild(renderToolCard(tool));
@@ -2937,6 +3638,22 @@ function renderLibrary() {
     for (const tool of hidden) list.appendChild(renderHiddenRow(tool));
     root.appendChild(list);
   }
+}
+
+// Body for the per-tool "About" modal: the description plus a source link.
+function aboutModalBody(tool) {
+  const parts = [
+    el("p", { class: "modal-desc" }, tool.description || "No description available."),
+  ];
+  if (tool.repo) {
+    parts.push(el("p", { class: "modal-foot" },
+      el("a", {
+        href: "#",
+        onclick: (e) => { e.preventDefault(); openExternal(tool.repo); },
+      }, "Source on GitHub →"),
+    ));
+  }
+  return parts;
 }
 
 function renderPluginPage(id) {
@@ -2957,11 +3674,20 @@ function renderPluginPage(id) {
     }, "← Library"),
   ));
 
+  const hasAbout = Boolean(tool.description || tool.repo);
   root.appendChild(el("header", { class: "plugin-header" },
     el("div", { class: "plugin-header-left" },
       el("div", { class: "tool-icon plugin-icon" }, tool.emoji),
       el("div", {},
-        el("h2", { class: "plugin-title" }, tool.name),
+        el("div", { class: "plugin-title-row" },
+          el("h2", { class: "plugin-title" }, tool.name),
+          hasAbout && el("button", {
+            class: "info-btn",
+            title: "About this tool",
+            "aria-label": `About ${tool.name}`,
+            onclick: () => openModal({ title: `About ${tool.name}`, body: aboutModalBody(tool) }),
+          }, "ⓘ"),
+        ),
         el("p", { class: "plugin-tagline" }, tool.tagline),
       ),
     ),
@@ -2979,17 +3705,7 @@ function renderPluginPage(id) {
   // Plugin-specific page body.
   if (tool.renderPage) root.appendChild(tool.renderPage(tool));
 
-  // Description / source row.
-  root.appendChild(el("section", { class: "plugin-section" },
-    el("h3", {}, "About"),
-    el("p", { class: "plugin-desc" }, tool.description),
-    el("p", {},
-      el("a", {
-        href: "#",
-        onclick: (e) => { e.preventDefault(); openExternal(tool.repo); },
-      }, "Source on GitHub →"),
-    ),
-  ));
+  // (The former "About" section now lives behind the ⓘ button in the header.)
 
   // Per-plugin activity log.
   const logEntries = pluginLogs.get(tool.id) || [];
@@ -3051,6 +3767,33 @@ function renderSettings() {
         href: "#",
         onclick: (e) => { e.preventDefault(); openExternal("https://github.com/S-Tier-Building-Automation/STierUtilities"); },
       }, "github.com/S-Tier-Building-Automation/STierUtilities"),
+    ),
+  ));
+
+  // ===== Third-party tools (MCP) =====
+  const installed = userState.installedTools || [];
+  const mcpTextarea = el("textarea", {
+    class: "nm-input",
+    rows: "6",
+    style: "width:100%; font-family:monospace; font-size:12px;",
+    placeholder: '{ "id": "my-tool", "name": "My Tool", "version": "0.1.0", "apiVersion": "1", "kind": "mcp", "entry": { "transport": "stdio", "command": "my-mcp.exe" }, "provides": [{ "capability": "my.thing", "version": "1.0" }], "permissions": [] }',
+  });
+  root.appendChild(el("section", { class: "settings-card" },
+    el("h3", {}, "Third-party tools (MCP)"),
+    el("p", { class: "muted small" },
+      "Install a tool that plugs in as an MCP server. Paste its manifest below; you'll approve its permissions, then the app restarts to connect it. Its capabilities become available to other tools."),
+    installed.length
+      ? el("ul", { class: "hidden-list" },
+          ...installed.map((m) => el("li", { class: "hidden-row" },
+            el("span", { class: "hidden-row-icon" }, (m.ui && m.ui.emoji) || "🧩"),
+            el("span", { class: "hidden-row-name" }, `${m.name} (${m.id})`),
+            el("span", { class: "hidden-row-tag" }, platform && platform.isBooted(m.id) ? "connected" : "off"),
+            el("button", { class: "btn-ghost", onclick: () => mcpRemove(m.id) }, "Remove"),
+          )))
+      : el("p", { class: "muted small" }, "No third-party tools installed."),
+    mcpTextarea,
+    el("div", { class: "tool-actions", style: "margin-top:8px;" },
+      el("button", { class: "btn btn-primary", onclick: () => mcpInstallFromJson(mcpTextarea.value) }, "Install MCP tool"),
     ),
   ));
 
@@ -3325,6 +4068,63 @@ window.addEventListener("DOMContentLoaded", async () => {
     ctPending = ctClonePending(s.settings);
   } catch (err) {
     logTo("clipboardtyper", `Could not read state: ${err}`, "error");
+  }
+
+  // Boot the platform kernel: validate the tool manifests, resolve the
+  // capability dependency graph, and register native capability implementations
+  // (network.adapters, netscan, media.convert, bacnet.read, …). Defensive — a
+  // kernel failure must never take down the rest of the UI.
+  try {
+    telemetry = createTimeseries();
+    scheduler = createScheduler();
+    rebuildCatalog();
+    const installed = ALL_MANIFESTS.filter((m) => m.kind === "mcp");
+    const factories = new Map([
+      ...buildFactories(invoke, { timeseries: telemetry, scheduler }),
+      ...buildMcpFactories(invoke, installed),
+    ]);
+    const installGrants = new Map(
+      Object.entries(userState.installedGrants || {}).map(([id, perms]) => [id, new Set(perms)]),
+    );
+    platform = createKernel({
+      manifests: ALL_MANIFESTS,
+      factories,
+      grant: grantsFromInstall(installGrants),
+      onLog: (e) => console.debug(`[platform:${e.toolId}] ${e.msg}`),
+    });
+    const res = await platform.boot();
+    if (!res.ok) console.warn("[platform] capability graph issues:", res.errors);
+
+    // Observability Pack controller. The service starts degraded (ring buffer);
+    // connecting attaches the live InfluxDB transport. The periodic flush is a
+    // no-op until then, so it's safe to run unconditionally.
+    pack = createPackController({ invoke, timeseries: telemetry });
+    setInterval(() => { pack.flush().catch(() => {}); }, 10000);
+
+    // Granular per-component install progress (download %, rate, ETA, extract…)
+    // from the Rust downloader, rendered as a live progress bar.
+    listen("observability://install", (e) => {
+      obsProgress = e.payload || null;
+      if (currentPluginId() === "observability") renderAll();
+    });
+
+    // Restore any previously-configured Historian points + resume logging.
+    histRestore();
+
+    // Passive pack-update check: surface in the Observability activity log if an
+    // app update bumped a pinned component version past what's installed.
+    pack.packStatus()
+      .then((s) => {
+        obsPack = s;
+        if (s && s.updatesAvailable) {
+          const outdated = (s.components || []).filter((c) => c.present && c.needsUpdate)
+            .map((c) => `${OBS_COMPONENT_NAMES[c.name] || c.name} ${c.installedVersion}→${c.pinnedVersion}`).join(", ");
+          logTo("observability", `Pack update available: ${outdated}. Open Observability → "Update & restart pack".`, "info");
+        }
+      })
+      .catch(() => {});
+  } catch (err) {
+    console.error("[platform] kernel boot failed:", err);
   }
 
   // Load saved network profiles up front so the library card shows a count.
