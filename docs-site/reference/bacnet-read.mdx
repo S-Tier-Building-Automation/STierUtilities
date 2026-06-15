@@ -1,0 +1,56 @@
+---
+title: "bacnet.read"
+description: "The reusable BACnet/IP read contract: Who-Is discovery and reading a point's properties."
+---
+
+<Note>Provided by **BACnet Service** — contract v1.0 — Service</Note>
+
+The reusable BACnet/IP read contract: Who-Is discovery and reading a point's properties. Owned by the headless bacnet-core service so any tool can read BACnet without embedding a stack.
+
+## Consume it
+
+```js
+// 1. Declare it in your tool manifest:
+requires: [{ capability: "bacnet.read", version: "^1.0" }]
+
+// 2. Resolve it from your scoped host and call it:
+const bacnetRead = host.use("bacnet.read.v1");
+const result = await bacnetRead.listDevices(…);
+```
+
+## Methods
+
+### `listDevices(opts?)`
+
+Returns `Promise<BacnetDevice[]>`.
+
+Broadcast/unicast Who-Is discovery. opts: \{ target?, lowLimit?, highLimit?, durationMs? \}.
+
+### `readPoint(device, objectType, instance)`
+
+Returns `Promise<Property[]>`.
+
+Read every property of one object on a device.
+
+### `canSuggestTargets()`
+
+Returns `boolean`.
+
+Whether netscan-backed discovery-target suggestions are available.
+
+### `suggestTargets(cidr)`
+
+Returns `Promise<ScanResult> | null`.
+
+Suggest live hosts on a subnet as discovery targets (delegates to netscan).
+
+## Provider permissions
+
+The provider holds these platform permissions on your behalf:
+
+`network.udp`
+
+## Used by
+
+- BACnet Explorer
+- BACnet Historian

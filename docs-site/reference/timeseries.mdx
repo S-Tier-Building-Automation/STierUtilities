@@ -1,0 +1,68 @@
+---
+title: "timeseries"
+description: "Shared telemetry sink."
+---
+
+<Note>Provided by **Observability** — contract v1.0 — Service</Note>
+
+Shared telemetry sink. Write structured metric points here instead of talking to InfluxDB directly; they always land in a local ring buffer and stream to InfluxDB/Grafana when the Observability Pack is running.
+
+## Consume it
+
+```js
+// 1. Declare it in your tool manifest:
+requires: [{ capability: "timeseries", version: "^1.0" }]
+
+// 2. Resolve it from your scoped host and call it:
+const timeseries = host.use("timeseries.v1");
+const result = await timeseries.write(…);
+```
+
+## Methods
+
+### `write({ measurement, tags?, fields, ts? })`
+
+Returns `Point`.
+
+Record one point. `fields` needs ≥1 number/boolean/string value; `ts` defaults to now. Throws on a malformed point.
+
+### `recent(n = 50)`
+
+Returns `Point[]`.
+
+The most recent points from the ring buffer — works even with no backend installed.
+
+### `query(q)`
+
+Returns `Promise<any>`.
+
+Query the backend. Throws in degraded mode (no Observability Pack installed).
+
+### `panelUrl(spec)`
+
+Returns `string | null`.
+
+An embeddable Grafana panel URL, or null when no dashboard backend exists.
+
+### `stats()`
+
+Returns `{ buffered, ring, written, dropped, degraded, backend }`.
+
+Buffer/ring counters and whether a live backend is attached.
+
+## Notes
+
+<Note>Degrades gracefully: with no backend it keeps only the ring buffer, so consumers work unchanged.</Note>
+
+## Provider permissions
+
+The provider holds these platform permissions on your behalf:
+
+`timeseries.write` · `timeseries.read` · `scheduler.register` · `fs.appdata` · `process.spawn`
+
+## Used by
+
+- BACnet Historian
+- ClipboardTyper *(optional)*
+- HEIC & MOV *(optional)*
+- Network Manager *(optional)*

@@ -1,0 +1,54 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "name": "S-Tier Utilities Platform",
+  "theme": "mint",
+  "colors": {
+    "primary": "#6366f1",
+    "light": "#818cf8",
+    "dark": "#6366f1"
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get started",
+            "pages": [
+              "index",
+              "concepts/authoring"
+            ]
+          },
+          {
+            "group": "Capability reference",
+            "pages": [
+              "reference/overview"
+            ]
+          },
+          {
+            "group": "Services",
+            "pages": [
+              "reference/bacnet-historian",
+              "reference/bacnet-read",
+              "reference/scheduler",
+              "reference/timeseries"
+            ]
+          },
+          {
+            "group": "Apps",
+            "pages": [
+              "reference/media-convert",
+              "reference/netscan",
+              "reference/network-adapters"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/S-Tier-Building-Automation/STierUtilities"
+    }
+  }
+}

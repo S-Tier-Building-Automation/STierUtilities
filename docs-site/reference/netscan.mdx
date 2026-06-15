@@ -1,0 +1,51 @@
+---
+title: "netscan"
+description: "Subnet sweeps and single-host reachability over the local network."
+---
+
+<Note>Provided by **Network Manager** — contract v1.0 — App</Note>
+
+Subnet sweeps and single-host reachability over the local network.
+
+## Consume it
+
+```js
+// 1. Declare it in your tool manifest:
+requires: [{ capability: "netscan", version: "^1.0" }]
+
+// 2. Resolve it from your scoped host and call it:
+const netscan = host.use("netscan.v1");
+const result = await netscan.scan(…);
+```
+
+## Methods
+
+### `scan(cidr)`
+
+Returns `Promise<ScanResult>`.
+
+Sweep a subnet given as "ip/prefix" (e.g. "192.168.1.0/24"). Returns live hosts + totals.
+
+### `isReachable(ip)`
+
+Returns `Promise<{ reachable, rttMs }>`.
+
+One ICMP echo to a single host.
+
+### `localSubnetFor(adapterName)`
+
+Returns `Promise<{ ip, prefix, network, hostCount } | null>`.
+
+Derive the sweepable subnet for an adapter from its live IPv4 state.
+
+## Provider permissions
+
+The provider holds these platform permissions on your behalf:
+
+`fs.appdata` · `elevation.request` · `network.raw`
+
+## Used by
+
+- BACnet Explorer *(optional)*
+- BACnet Historian *(optional)*
+- BACnet Service *(optional)*

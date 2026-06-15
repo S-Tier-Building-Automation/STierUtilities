@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "tauri": "tauri",
-    "test": "node --test \"src/**/*.test.js\""
+    "test": "node --test \"src/**/*.test.js\"",
+    "docs:gen": "node scripts/generate-docs.mjs"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2"
