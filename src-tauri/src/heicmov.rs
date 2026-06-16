@@ -10,6 +10,11 @@ use tauri_plugin_shell::ShellExt;
 
 const MEDIA_FILTER: &[&str] = &["heic", "heif", "mov"];
 
+/// Byte budget for the preview cache. Previews are keyed by path+mtime and never
+/// self-expire, so `prune_cache` evicts oldest entries past this to keep the
+/// on-disk cache bounded.
+const PREVIEW_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaKind {
@@ -17,17 +22,12 @@ pub enum MediaKind {
     Video,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageFormat {
+    #[default]
     Jpeg,
     Png,
-}
-
-impl Default for ImageFormat {
-    fn default() -> Self {
-        Self::Jpeg
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,7 +112,11 @@ fn prune_cache(dir: &Path, max_bytes: u64) -> Result<usize, String> {
             _ => continue,
         };
         total += meta.len();
-        files.push((entry.path(), meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
+        files.push((
+            entry.path(),
+            meta.len(),
+            meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        ));
     }
     if total <= max_bytes {
         return Ok(0);
@@ -132,30 +136,6 @@ fn prune_cache(dir: &Path, max_bytes: u64) -> Result<usize, String> {
     Ok(removed)
 }
 
-/// Prune the preview cache to a budget (default 512 MiB).
-#[tauri::command]
-pub async fn heicmov_prune_cache(app: AppHandle, max_bytes: Option<u64>) -> Result<usize, String> {
-    let dir = heicmov_cache_dir(&app)?;
-    prune_cache(&dir, max_bytes.unwrap_or(512 * 1024 * 1024))
-}
-
-/// Delete the entire preview cache. Returns the number of files removed.
-#[tauri::command]
-pub async fn heicmov_clear_cache(app: AppHandle) -> Result<usize, String> {
-    let dir = heicmov_cache_dir(&app)?;
-    let mut removed = 0;
-    if dir.exists() {
-        for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-            if let Ok(e) = entry {
-                if e.metadata().map(|m| m.is_file()).unwrap_or(false) && std::fs::remove_file(e.path()).is_ok() {
-                    removed += 1;
-                }
-            }
-        }
-    }
-    Ok(removed)
-}
-
 fn sidecar_output(output: Output) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
@@ -168,7 +148,10 @@ fn sidecar_output(output: Output) -> Result<(), String> {
         stderr.trim().to_string()
     };
     if msg.is_empty() {
-        Err(format!("ffmpeg exited with status {:?}", output.status.code()))
+        Err(format!(
+            "ffmpeg exited with status {:?}",
+            output.status.code()
+        ))
     } else {
         Err(msg)
     }
@@ -206,11 +189,7 @@ async fn run_ffprobe(app: &AppHandle, args: Vec<String>) -> Result<String, Strin
     Err(stderr.trim().to_string())
 }
 
-fn output_path_for(
-    input: &Path,
-    output_dir: Option<&Path>,
-    image_format: ImageFormat,
-) -> PathBuf {
+fn output_path_for(input: &Path, output_dir: Option<&Path>, image_format: ImageFormat) -> PathBuf {
     let stem = input
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -296,7 +275,10 @@ pub async fn heicmov_probe(app: AppHandle, path: String) -> Result<ProbeResult, 
         if stream.get("codec_type").and_then(|t| t.as_str()) != Some(stream_type) {
             continue;
         }
-        width = stream.get("width").and_then(|w| w.as_u64()).map(|w| w as u32);
+        width = stream
+            .get("width")
+            .and_then(|w| w.as_u64())
+            .map(|w| w as u32);
         height = stream
             .get("height")
             .and_then(|h| h.as_u64())
@@ -356,6 +338,8 @@ pub async fn heicmov_make_preview(app: AppHandle, path: String) -> Result<Previe
                 ],
             )
             .await?;
+            // Keep the on-disk preview cache bounded (best-effort).
+            let _ = prune_cache(&cache_dir, PREVIEW_CACHE_BUDGET_BYTES);
             Ok(PreviewResult {
                 preview_path: preview_path.to_string_lossy().into_owned(),
                 mime: "image/jpeg".into(),
@@ -386,6 +370,8 @@ pub async fn heicmov_make_preview(app: AppHandle, path: String) -> Result<Previe
                 ],
             )
             .await?;
+            // Keep the on-disk preview cache bounded (best-effort).
+            let _ = prune_cache(&cache_dir, PREVIEW_CACHE_BUDGET_BYTES);
             Ok(PreviewResult {
                 preview_path: preview_path.to_string_lossy().into_owned(),
                 mime: "video/mp4".into(),
@@ -426,11 +412,7 @@ pub async fn heicmov_convert(
             continue;
         }
 
-        let output = output_path_for(
-            &input,
-            out_dir.as_deref(),
-            image_format,
-        );
+        let output = output_path_for(&input, out_dir.as_deref(), image_format);
 
         if output.exists() && !overwrite {
             results.push(ConvertFileResult {
@@ -546,7 +528,10 @@ mod tests {
 
         // Prune to 2 KiB: should remove at least 3 files and leave <= budget.
         let removed = prune_cache(&dir, 2 * 1024).unwrap();
-        assert!(removed >= 3, "expected to evict at least 3 files, got {removed}");
+        assert!(
+            removed >= 3,
+            "expected to evict at least 3 files, got {removed}"
+        );
         assert!(dir_total(&dir) <= 2 * 1024);
 
         let _ = std::fs::remove_dir_all(&dir);

@@ -7,6 +7,7 @@
 import { createTimeseries } from "../platform/services/timeseries.js";
 import { createScheduler } from "../platform/services/scheduler.js";
 import { createHistorian } from "./historian.js";
+import { createBrowserInventoryStorage, createInventory } from "./inventory.js";
 
 // ---- pure helpers (exported for tests) ----
 
@@ -77,6 +78,16 @@ export function buildFactories(invoke, options = {}) {
     host.provide("bacnet.historian", "1.0", createHistorian({ bacnet, scheduler, timeseries }));
   });
 
+  factories.set("building-workspace", async (host) => {
+    host.use("bacnet.read.v1");
+    host.use("bacnet.historian.v1");
+    host.use("scheduler.v1");
+    host.use("timeseries.v1");
+    host.provide("inventory", "1.0", createInventory({
+      storage: options.inventoryStorage || createBrowserInventoryStorage(),
+    }));
+  });
+
   // networkmanager provides the network primitives other tools reuse.
   factories.set("networkmanager", async (host) => {
     const ts = host.tryUse("timeseries.v1"); // optional telemetry sink
@@ -133,7 +144,7 @@ export function buildFactories(invoke, options = {}) {
 
   // bacnet-core is the headless BACnet service: it provides the reusable
   // bacnet.read capability and *consumes* netscan (optional) to suggest
-  // discovery targets. The BACnet Explorer App and the Historian both resolve
+  // discovery targets. The BACnet Inspector and Historian both resolve
   // bacnet.read from here rather than embedding their own BACnet code.
   factories.set("bacnet-core", async (host) => {
     const netscan = host.tryUse("netscan.v1"); // null if networkmanager absent/disabled
@@ -149,6 +160,21 @@ export function buildFactories(invoke, options = {}) {
       /** Read all properties of one object on a device. `device` is a device ref. */
       readPoint: (device, objectType, instance) =>
         invoke("bacnet_read_properties", { device, objectType, instance }),
+      /** Read a device's object-list and object names. */
+      listObjects: (device, deviceInstance) =>
+        invoke("bacnet_read_objects", { device, deviceInstance }),
+      /** Write a BACnet property, including Null relinquish values. */
+      writeProperty: ({ device, objectType, instance, property, value, priority = null, arrayIndex = null }) =>
+        invoke("bacnet_write_property", { device, objectType, instance, property, value, priority, arrayIndex }),
+      /** Read trend-log or trend-log-multiple records. */
+      readTrend: ({ device, objectType, instance, maxRecords }) =>
+        invoke("bacnet_read_trend", { device, objectType, instance, maxRecords }),
+      /** Subscribe to COV notifications. */
+      subscribeCov: ({ device, deviceInstance, objectType, instance, confirmed = false }) =>
+        invoke("bacnet_subscribe_cov", { device, deviceInstance, objectType, instance, confirmed }),
+      /** Cancel a COV subscription created by subscribeCov. */
+      unsubscribeCov: ({ device, objectType, instance, processId }) =>
+        invoke("bacnet_unsubscribe_cov", { device, objectType, instance, processId }),
       /** Whether discovery-target suggestions are available (netscan present). */
       canSuggestTargets: () => netscan != null,
       /** Suggest live hosts on a subnet as discovery targets (requires netscan). */

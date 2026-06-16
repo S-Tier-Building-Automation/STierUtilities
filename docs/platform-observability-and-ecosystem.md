@@ -3,7 +3,8 @@
 > Status: **Implemented (v0.6 dev)** · Author: architecture review · Target: v0.6 → v1.0
 >
 > **Implementation status:** all seven roadmap phases are built and unit-tested
-> (241 tests: 113 JS via `node --test`, 128 Rust via `cargo test`). See
+> (149 JS tests via `npm test`; Rust tests are run with
+> `cargo test --manifest-path src-tauri/Cargo.toml`). See
 > [§9 Implementation status](#9--implementation-status) for the phase-by-phase
 > file + test map. The heavy I/O that can't run in CI (downloading the ~400 MB
 > pack binaries, spawning InfluxDB/Grafana/Telegraf) is implemented and compiles,
@@ -164,22 +165,24 @@ Every tool — first-party or third-party — declares itself. A machine-readabl
 
 ```jsonc
 {
-  "id": "bacnet",
-  "name": "BACnet Explorer",
+  "id": "building-workspace",
+  "name": "Building Workspace",
   "version": "1.2.0",
   "apiVersion": "1",                       // platform/kernel API contract
   "kind": "native",                        // native | mcp | webview
   "provides": [
-    { "capability": "bacnet.read", "version": "1.0" }
+    { "capability": "inventory", "version": "1.0" }
   ],
   "requires": [
-    { "capability": "netscan",    "version": "^1.0", "optional": true },
-    { "capability": "timeseries", "version": "^1.0", "optional": true },
-    { "capability": "scheduler",  "version": "^1.0", "optional": true }
+    { "capability": "bacnet.read",      "version": "^1.0" },
+    { "capability": "bacnet.historian", "version": "^1.0" },
+    { "capability": "timeseries",       "version": "^1.0" },
+    { "capability": "scheduler",        "version": "^1.0" },
+    { "capability": "netscan",          "version": "^1.0", "optional": true }
   ],
-  "permissions": ["network.udp", "timeseries.write", "fs.appdata"],
-  "ui": { "emoji": "🏢", "tagline": "Discover BACnet/IP devices…" },
-  "dashboards": ["dashboards/bacnet-points.json"]
+  "permissions": ["inventory.read", "inventory.write", "timeseries.read", "timeseries.write"],
+  "ui": { "emoji": "🏗️", "tagline": "Model, trend, commission, and report BACnet points." },
+  "dashboards": ["dashboards/building-workspace.json"]
 }
 ```
 
@@ -226,7 +229,7 @@ This is the payoff. Concrete edges we can build immediately from the gap review:
 
 - `netscan` **provides** `netscan.v1` (`scan`, `isReachable`, `localSubnetFor`). `bacnet` and `networkmanager` **consume** it instead of each enumerating adapters/subnets themselves.
 - A new shared `inventory.v1` capability caches "hosts/devices seen recently." `netscan` and `bacnet` write to it; any tool reads "what's on the network right now."
-- `bacnet` **provides** `bacnet.read.v1` (`listDevices`, `readPoint`). A future "BACnet Historian" or a Niagara-migration tool consumes it without reimplementing the BACnet/IP stack.
+- `bacnet-core` **provides** `bacnet.read.v1` (`listDevices`, `listObjects`, `readPoint`, `writeProperty`, `readTrend`, `subscribeCov`, `unsubscribeCov`). Building Workspace, the Historian, commissioning checks, and the advanced inspector consume it without reimplementing the BACnet/IP stack.
 - A generic **sidecar-runner** and **batch-processor** (extracted from `heicmov`) become a `media.convert.v1` capability other tools reuse for previews/exports.
 
 The rule: **if two tools do the same thing, promote it to a capability and make one provide it.**
@@ -235,7 +238,7 @@ The rule: **if two tools do the same thing, promote it to a capability and make 
 
 ## 5. Gap review of the existing tools
 
-Findings condensed from a full read of each module. Common to *all five*: Windows-only (except BACnet, which is portable UDP), **no historization**, **no scheduling/background runs**, **no tests beyond the BACnet codec**, and **no shared services** — exactly the holes the platform fills.
+Findings condensed from the original full read of each module. At that time, the common gaps were Windows-only behavior for most tools, no historization, no scheduling/background runs, limited test coverage outside the BACnet codec, and no shared services — exactly the holes the platform work has been closing.
 
 ### ClipboardTyper — [clipboardtyper.rs](../src-tauri/src/clipboardtyper.rs)
 - **Does:** global low-level mouse hook; middle-click types clipboard via `SendInput` scan codes; grid/cell rules; timing knobs. Config in `clipboardtyper.json`.
@@ -257,10 +260,10 @@ Findings condensed from a full read of each module. Common to *all five*: Window
 - **Gaps:** **results are frontend-only — no persistence/export** (close app mid-scan → gone); no baseline/diff ("host X disappeared since yesterday"); prefix locked /16–/30; tuning constants hardcoded; on-link only.
 - **Platform fit:** **provide** `netscan.v1` + write to `inventory.v1`; with `scheduler` + `timeseries`, nightly sweeps become a **host-presence heatmap** and transient-device detection in Grafana. Highest reuse value of the network tools.
 
-### BACnet Explorer — [bacnet.rs](../src-tauri/src/bacnet.rs), [bacnet_codec.rs](../src-tauri/src/bacnet_codec.rs)
-- **Does:** Who-Is discovery (incl. behind routers), object-list walk, ReadProperty(Multiple) with segmentation + per-property fallback, WriteProperty w/ priority, ReadRange trend reads, SubscribeCOV with a 180 s keep-alive. Ephemeral UDP port to coexist with Niagara. Solid codec test coverage.
-- **Gaps:** **nothing is persisted** — devices, reads, and trends evaporate on close; **no continuous/scheduled polling**; COV lifecycle is fragile across webview reloads; single-shot reads only (no caching/batching); no historian.
-- **Platform fit — the flagship opportunity.** `provides` `bacnet.read.v1`; `requires` `netscan` (discovery), `timeseries` (historize), `scheduler` (poll). COV + scheduled reads stream into InfluxDB; Grafana dashboards visualize point values and trends across the whole site. **This single integration is the strongest justification for the entire TIG effort.**
+### BACnet service, Building Workspace, and Advanced Inspector — [bacnet.rs](../src-tauri/src/bacnet.rs), [bacnet_codec.rs](../src-tauri/src/bacnet_codec.rs)
+- **Does:** `bacnet-core` owns the reusable BACnet/IP contract: Who-Is discovery, object-list walks, ReadProperty(Multiple) with segmentation + per-property fallback, WriteProperty w/ priority, ReadRange trend reads, and SubscribeCOV lifecycle. Building Workspace consumes that service to model sites/buildings/floors/devices/points, import discovered devices, historize selected points, generate dashboard JSON, run commissioning checks, and export reports. The raw YABE-style view is now an **Advanced BACnet Inspector**, hidden by default, for field-debugging object/property/COV/trend details.
+- **Closed gaps:** BACnet is no longer only a throwaway inspector. Devices and points can be modeled into inventory, historian points persist through user/org state, scheduled polling writes `bacnet_point` metrics, and reports/dashboard definitions can be generated from the model.
+- **Remaining gaps:** service discovery state is still webview-local for this phase; COV is still an advanced-inspector escape hatch rather than a first-class modeled workflow; stricter Haystack 4 validation and Niagara population are intentionally deferred.
 
 ---
 
@@ -297,7 +300,7 @@ Flow: scheduler fires every 60 s → historian calls `bacnet.read.v1.readPoint()
 | **3 — Observability Pack** | `observability` supervisor (download/start/stop/health) for InfluxDB v2 + Grafana + Telegraf; provisioned datasource + per-tool dashboards; `panelUrl()` embedding | The big lift. Optional download, localhost-only, generated tokens/ports. |
 | **4 — BACnet Historian** | The §6 tool: scheduler + COV/scheduled reads → InfluxDB → embedded Grafana | The flagship feature that justifies phases 0–3. |
 | **5 — Third-party tools (MCP)** | `kind: "mcp"` loader; permission prompts on install; wrap the Niagara MCP server as a tool; tiny "tool registry"/sideload | Opens the ecosystem; reuses the existing MCP investment. |
-| **6 — Hardening** | Secrets → OS keychain; webview tier; tests for scheduler/telemetry/COV; cache eviction for heicmov; signed third-party manifests | Productionization. |
+| **6 — Hardening** | Secrets foundation, tests for scheduler/telemetry/COV, cache eviction for heicmov, integration coverage | Productionization. OS keychain and signed third-party manifests remain release-hardening backlog items. |
 
 Phases 0–2 are pure refactors + a degradable service — shippable incrementally with no installer-size hit. The size cost (and most of the risk) is isolated to Phase 3, behind an opt-in download.
 
@@ -306,7 +309,7 @@ Phases 0–2 are pure refactors + a degradable service — shippable incremental
 ## 8. Risks, trade-offs & decisions for the user
 
 - **Installer bloat (decided): keep TIG out of the base bundle.** Optional on-demand "Observability Pack," supervised like FFmpeg. Confirm we're OK with a download-on-first-use UX for the stack.
-- **InfluxDB version:** v2 (mature, easy Grafana) vs. InfluxDB 3 Core (edge-optimized, lighter at high cardinality, newer). **Recommend shipping v2 first, designing the `timeseries` capability to allow a v3 swap.** Decision needed before Phase 3.
+- **InfluxDB version:** v2 is the current implementation. Keep the `timeseries` capability backend-neutral so InfluxDB 3 Core can be evaluated later for high-cardinality BACnet sites.
 - **Embedding Grafana vs. native charts:** embedding is fast to build and gives full dashboarding for free, but ships a 2nd web UI and an anonymous-viewer org. Acceptable for localhost; revisit if we ever expose remotely.
 - **Third-party trust model:** MCP servers are out-of-process but still run code the user installs. Need a permission-prompt + (eventually) manifest-signing story before any "tool store."
 - **Scope of the kernel:** keep it thin. The temptation is to over-engineer a plugin framework; the win is 80% from formalizing *manifests + capabilities + a telemetry service*, not from a maximal sandbox.
@@ -337,22 +340,31 @@ dashboard provisioning (`include_str!` into Grafana's dir + datasource `uid`), p
 persistence (stable ports/token across restarts), graceful shutdown on `ExitRequested`, the
 `pack-controller.bringUp()` orchestration, and the Observability page Install/Start/Stop/Health
 UI + Historian point persistence. An adversarial review of those changes caught + fixed the
-InfluxDB Windows download-URL form (`influxdb2-<ver>-windows.zip`). 250 tests pass; `cargo check` clean.
+InfluxDB Windows download-URL form (`influxdb2-<ver>-windows.zip`). The JS suite currently
+passes with 149 tests; run Rust verification with `cargo test --manifest-path src-tauri/Cargo.toml`.
 
-**Still open:** the **MCP third-party tier** (mock-only — no live client/install UI yet) and
-**live in-app verification** (`pnpm tauri dev` → Install → Start → a metric reaching InfluxDB
-and rendering in Grafana). Everything else is thin wrappers over tested pure logic; the
-integration test proves the whole graph boots and the inter-tool flows work against mocks.
+### 9.1 Release-hardening backlog
+
+These are the remaining documented items before calling the platform release-ready:
+
+| Item | Why it matters | Current pointer |
+| --- | --- | --- |
+| Pin Observability Pack archive hashes | Downloads currently warn and proceed when a SHA-256 pin is absent; release builds should make missing/mismatched hashes a hard error. | [observability.rs](../src-tauri/src/observability.rs) |
+| Move secrets to OS keychain | Tokens are localhost-only today, but Windows Credential Manager is the right storage target for release hardening. | [secrets.rs](../src-tauri/src/secrets.rs) |
+| Live Observability smoke test | Verify in a real app run: `pnpm tauri dev` → Install → Start → write a metric → InfluxDB receives it → Grafana renders it. | Observability page |
+| MCP third-party install UX | The proxy/permission path is tested, but a polished live install/manage flow still needs product work. | Settings MCP install + `mcp-loader` |
+| Sign third-party manifests | Needed before any broader plugin/tool distribution story. | Future manifest trust layer |
+| Niagara population of inventory | Source-ref shape reserves Niagara, but BACnet remains the first implemented population path. | Building Workspace / future `niagara.points.v1` |
 
 ## Appendix A — capabilities proposed in this doc
 
 | Capability | Provided by | Consumed by | Purpose |
 | --- | --- | --- | --- |
 | `timeseries.v1` | observability service | any tool | write/query/embed time-series |
-| `scheduler.v1` | kernel service | historian, netscan, networkmanager | run a job on a cadence |
-| `inventory.v1` | kernel service | netscan, bacnet (write); any (read) | "what's on the network" cache |
+| `scheduler.v1` | observability service | historian, building-workspace, networkmanager | run a job on a cadence |
+| `inventory.v1` | building-workspace | Building Workspace | tagged site/building/floor/equipment/point model |
 | `network.adapters.v1` | networkmanager | netscan, bacnet | list adapters / read IPv4-DNS state |
 | `netscan.v1` | netscan | bacnet, historian | sweep / reachability / subnet-for-adapter |
-| `bacnet.read.v1` | bacnet | bacnet-historian, niagara-migration | list devices / read points |
+| `bacnet.read.v1` | bacnet-core | building-workspace, bacnet-historian, advanced inspector | list devices/objects, read points, write properties, read trends, COV lifecycle |
 | `media.convert.v1` | heicmov | any | sidecar-backed convert/preview |
 | `niagara.points.v1` | niagara (MCP) | historian, dashboards | Niagara/Tridium points + histories |

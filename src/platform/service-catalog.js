@@ -90,14 +90,24 @@ export const CAPABILITY_DOCS = {
 
   "bacnet.read": {
     summary:
-      "The reusable BACnet/IP read contract: Who-Is discovery and reading a " +
-      "point's properties. Owned by the headless bacnet-core service so any tool " +
-      "can read BACnet without embedding a stack.",
+      "The reusable BACnet/IP contract: discovery, object/property reads, writes, " +
+      "trend reads, and COV lifecycle. Owned by the headless bacnet-core service " +
+      "so tools can use BACnet without embedding a stack.",
     methods: [
       { name: "listDevices", sig: "listDevices(opts?)", returns: "Promise<BacnetDevice[]>",
         desc: "Broadcast/unicast Who-Is discovery. opts: { target?, lowLimit?, highLimit?, durationMs? }." },
       { name: "readPoint", sig: "readPoint(device, objectType, instance)", returns: "Promise<Property[]>",
         desc: "Read every property of one object on a device." },
+      { name: "listObjects", sig: "listObjects(device, deviceInstance)", returns: "Promise<BacnetObject[]>",
+        desc: "Read a device object-list and resolve object names." },
+      { name: "writeProperty", sig: "writeProperty({ device, objectType, instance, property, value, priority?, arrayIndex? })", returns: "Promise<any>",
+        desc: "Write a BACnet property, including Null values for relinquish." },
+      { name: "readTrend", sig: "readTrend({ device, objectType, instance, maxRecords })", returns: "Promise<TrendReadResult>",
+        desc: "Read records from trend-log or trend-log-multiple objects." },
+      { name: "subscribeCov", sig: "subscribeCov({ device, deviceInstance, objectType, instance, confirmed? })", returns: "Promise<number>",
+        desc: "Subscribe to COV notifications and return the process id." },
+      { name: "unsubscribeCov", sig: "unsubscribeCov({ device, objectType, instance, processId })", returns: "Promise<any>",
+        desc: "Cancel a COV subscription." },
       { name: "canSuggestTargets", sig: "canSuggestTargets()", returns: "boolean",
         desc: "Whether netscan-backed discovery-target suggestions are available." },
       { name: "suggestTargets", sig: "suggestTargets(cidr)", returns: "Promise<ScanResult> | null",
@@ -119,6 +129,33 @@ export const CAPABILITY_DOCS = {
       { name: "start", sig: "start(intervalMs = 60000)", returns: "void", desc: "Begin logging on a schedule (polls immediately)." },
       { name: "stop", sig: "stop()", returns: "void", desc: "Stop the scheduled logging." },
       { name: "isRunning", sig: "isRunning()", returns: "boolean", desc: "Whether scheduled logging is active." },
+    ],
+  },
+
+  inventory: {
+    summary:
+      "Tagged building model for sites, equipment, points, source references, templates, " +
+      "and commissioning runs. This is the lightweight Haystack-aware layer used by " +
+      "Building Workspace workflows.",
+    methods: [
+      { name: "upsertEntity", sig: "upsertEntity(entity)", returns: "Entity",
+        desc: "Create or update a site, equip, point, template, tag, sourceRef, or commissioningRun entity." },
+      { name: "removeEntity", sig: "removeEntity(id)", returns: "boolean",
+        desc: "Remove one entity by id." },
+      { name: "listEntities", sig: "listEntities(filter?)", returns: "Entity[]",
+        desc: "List entities, optionally filtered by type, text, tag, equipment, or source." },
+      { name: "getEntity", sig: "getEntity(id)", returns: "Entity | null",
+        desc: "Read one entity by id." },
+      { name: "linkSource", sig: "linkSource(entityId, sourceRef)", returns: "Entity",
+        desc: 'Attach a source reference such as "bacnet:123:0:4" to an entity.' },
+      { name: "setTags", sig: "setTags(entityId, tags)", returns: "Entity",
+        desc: "Replace an entity's marker/value tags." },
+      { name: "applyTemplate", sig: "applyTemplate(entityId, templateId)", returns: "Entity",
+        desc: "Merge a template's tags onto a site/equipment/point entity." },
+      { name: "recordCommissioningRun", sig: "recordCommissioningRun(run)", returns: "Entity",
+        desc: "Persist the result of a commissioning workflow run." },
+      { name: "exportSnapshot", sig: "exportSnapshot()", returns: "{ version, exportedAt, entities }",
+        desc: "Export the full local model for dashboards, reports, or backups." },
     ],
   },
 };

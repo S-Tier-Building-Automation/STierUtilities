@@ -4,7 +4,7 @@ A small Tauri-based desktop hub that hosts little Windows utilities I (and frien
 
 Each tool is implemented as a native Rust module inside the Tauri binary — no extra runtimes for end users. One installer, one window, knobs in the UI, done.
 
-The hub ships with a left **sidebar** (favorites + nav), a **Library** view that lists everything in the binary, and a **Settings** view (with built-in update checks). The Library is a compact catalog of tools; each tool has its own **dedicated page** with controls, settings, and a tool-scoped activity log. Star a tool to pin it to the sidebar; hide tools you don't use to keep the library clean.
+The hub ships with a compact **sidebar** for favorites, a **Library** view that lists the normal workflows, a centralized **Activity** page, and an account/app menu for settings, services, updates, and local data. The Library is a compact catalog of tools; each tool has its own dedicated page with controls and operational context. Star a tool to pin it to the sidebar; hidden and advanced tools can be restored from the Library when needed.
 
 The app **auto-updates** through the Tauri updater plugin — release a new tag on this repo and installed copies notify the user and apply the update on next launch.
 
@@ -15,13 +15,14 @@ The app **auto-updates** through the Tauri updater plugin — release a new tag 
 | **ClipboardTyper** | Middle-click anywhere to send clipboard text through Windows `SendInput` scan codes. Useful for local password fields, some RDP/VM screens, and places where Ctrl+V is blocked. Some remote tools, including DeskIn in certain modes, may ignore injected input before timing settings can help. |
 | **HEIC & MOV** | Preview and convert iPhone photos/videos on Windows (FFmpeg sidecar). |
 | **Network Manager** | Save IPv4/DNS adapter profiles, see drift, scan the subnet. |
-| **BACnet Explorer** | Discover BACnet/IP devices, browse objects, read/write points, trends, COV. |
+| **Building Workspace** | Model sites/buildings/floors/devices/points, discover BACnet devices, historize, dashboard, commission, and export reports. |
+| **Advanced BACnet Inspector** | Hidden-by-default field-debug view for raw BACnet object browsing, writes, trends, and COV. |
 | **Observability** | Shared time-series service; optional Telegraf + InfluxDB + Grafana pack. |
 | **BACnet Historian** | Continuously log BACnet points to InfluxDB and chart them in Grafana. |
 
 ## Platform (tools as capabilities)
 
-Tools are no longer a hardcoded list — each declares a **manifest** ([src/tools/manifests.js](src/tools/manifests.js)) saying what capabilities it **provides** and **requires**. A small **kernel** ([src/platform/](src/platform/)) validates the manifests, resolves the dependency graph, and lets tools reuse each other (`host.use("netscan.v1")`) instead of re-solving the same problem. Shared services — `timeseries` (metrics), `scheduler`, `network.adapters` — live here too, and third-party tools can plug in as MCP servers (`kind: "mcp"`). See [docs/platform-observability-and-ecosystem.md](docs/platform-observability-and-ecosystem.md).
+Tools are no longer a hardcoded list — each declares a **manifest** ([src/tools/manifests.js](src/tools/manifests.js)) saying what capabilities it **provides** and **requires**. A small **kernel** ([src/platform/](src/platform/)) validates the manifests, resolves the dependency graph, and lets tools reuse each other (`host.use("netscan.v1")`) instead of re-solving the same problem. Shared services — `timeseries` (metrics), `scheduler`, `network.adapters`, `bacnet.read`, and `inventory` — live here too, and third-party tools can plug in as MCP servers (`kind: "mcp"`). See [docs/platform-observability-and-ecosystem.md](docs/platform-observability-and-ecosystem.md). UI changes should follow the scoped rendering standard in [docs/rendering-standards.md](docs/rendering-standards.md).
 
 ```bash
 npm test                                              # JS kernel + services + tool wiring

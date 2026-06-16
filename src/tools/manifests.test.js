@@ -34,7 +34,7 @@ test("bacnet.read is extracted into the headless bacnet-core service", () => {
   // The service owns the capability...
   assert.ok(reg.providers.get("bacnet.read").some((p) => p.toolId === "bacnet-core"));
   assert.equal(manifestById("bacnet-core").category, "service");
-  // ...and the Explorer App consumes it rather than providing it.
+  // ...and the Inspector App consumes it rather than providing it.
   assert.deepEqual(manifestById("bacnet").provides, []);
   const res = reg.resolutions.get("bacnet").find((r) => r.capability === "bacnet.read");
   assert.equal(res.providerId, "bacnet-core");
@@ -73,8 +73,25 @@ test("bacnet-historian composes bacnet.read + scheduler + timeseries", () => {
   }
 });
 
+test("building-workspace provides inventory and composes the BACnet workflow stack", () => {
+  const reg = buildRegistry(TOOL_MANIFESTS);
+  assert.ok(reg.ok, reg.errors.join("; "));
+  assert.ok(reg.providers.get("inventory").some((p) => p.toolId === "building-workspace"));
+  const res = reg.resolutions.get("building-workspace");
+  const by = (cap) => res.find((r) => r.capability === cap);
+  assert.equal(by("bacnet.read").providerId, "bacnet-core");
+  assert.equal(by("bacnet.historian").providerId, "bacnet-historian");
+  assert.equal(by("scheduler").providerId, "observability");
+  assert.equal(by("timeseries").providerId, "observability");
+  const order = reg.initOrder;
+  for (const dep of ["bacnet-core", "bacnet-historian", "observability"]) {
+    assert.ok(order.indexOf(dep) < order.indexOf("building-workspace"), `${dep} before building-workspace`);
+  }
+});
+
 test("manifestById looks tools up", () => {
-  assert.equal(manifestById("bacnet").name, "BACnet Explorer");
+  assert.equal(manifestById("bacnet").name, "Advanced BACnet Inspector");
+  assert.equal(manifestById("bacnet").ui.defaultHidden, true);
   assert.equal(manifestById("nope"), null);
 });
 

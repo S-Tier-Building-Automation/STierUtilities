@@ -25,9 +25,13 @@ test("bacnet.read is attributed to the bacnet-core service and its consumers", (
   assert.equal(e.provider.category, "service");
   assert.equal(e.ref, "bacnet.read.v1");
   const consumerIds = e.consumers.map((c) => c.id).sort();
-  assert.deepEqual(consumerIds, ["bacnet", "bacnet-historian"]);
+  assert.deepEqual(consumerIds, ["bacnet", "bacnet-historian", "building-workspace"]);
   assert.ok(e.doc.methods.some((m) => m.name === "listDevices"));
   assert.ok(e.doc.methods.some((m) => m.name === "readPoint"));
+  assert.ok(e.doc.methods.some((m) => m.name === "listObjects"));
+  assert.ok(e.doc.methods.some((m) => m.name === "writeProperty"));
+  assert.ok(e.doc.methods.some((m) => m.name === "readTrend"));
+  assert.ok(e.doc.methods.some((m) => m.name === "subscribeCov"));
 });
 
 test("an optional consumer edge is flagged as optional", () => {
