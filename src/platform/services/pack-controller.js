@@ -32,6 +32,12 @@ export function createPackController({ invoke, timeseries, sleep = (ms) => new P
     connected = true;
   }
 
+  // True if we're already connected against exactly the given config, so re-attaching
+  // (which would reset `connected` and swap the transport) can be skipped.
+  function alreadyConnectedWith(cfg) {
+    return connected && cfg != null && config === cfg;
+  }
+
   return {
     status: () => invoke("observability_status"),
     packStatus: () => invoke("observability_pack_status"),
@@ -48,6 +54,12 @@ export function createPackController({ invoke, timeseries, sleep = (ms) => new P
     async connect(cfg) {
       if (cfg) config = cfg;
       await ensureConfig();
+      // Idempotent: if we're already live against this exact config, don't swap the
+      // transport / reset `connected` — just flush whatever is buffered.
+      if (alreadyConnectedWith(config)) {
+        await timeseries.flushAll();
+        return config;
+      }
       attachTransport();
       await timeseries.flushAll();
       return config;
@@ -60,6 +72,12 @@ export function createPackController({ invoke, timeseries, sleep = (ms) => new P
      */
     async bringUp(onStep = () => {}) {
       await ensureConfig();
+      // Idempotent: if the pack is already up and connected against this exact
+      // config, don't tear it back down / re-attach — just report done.
+      if (alreadyConnectedWith(config)) {
+        onStep('done');
+        return config;
+      }
       // install is version-aware: it fast-skips up-to-date components and only
       // (re)downloads what's missing or outdated, so it doubles as the updater.
       onStep('install');

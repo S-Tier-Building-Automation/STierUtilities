@@ -20,7 +20,7 @@ import { validateManifest } from "./manifest.js";
 // fire spurious tools/call RPCs (or throw) during JSON.stringify, string coercion,
 // promise-resolution, or runtime introspection of the capability object.
 const RESERVED_PROXY_KEYS = new Set([
-  "then", "catch", "finally", "toJSON", "toString", "valueOf", "constructor", "inspect", "prototype",
+  "then", "catch", "finally", "toJSON", "toString", "valueOf", "constructor", "inspect", "prototype", "__proto__",
 ]);
 
 export function mcpCapabilityProxy(client, prefix) {

@@ -71,8 +71,11 @@ export function satisfies(version, range) {
     if (r.hasMinor) return v.major === r.major && v.minor === r.minor;
     return v.major === r.major; // "~1" == major lock
   }
-  // exact
-  return v.major === r.major && v.minor === r.minor && v.patch === r.patch;
+  // exact — honor the granularity the range actually specified
+  if (v.major !== r.major) return false;
+  if (r.hasMinor && v.minor !== r.minor) return false;
+  if (r.hasPatch && v.patch !== r.patch) return false;
+  return true;
 }
 
 /**

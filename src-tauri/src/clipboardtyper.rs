@@ -366,10 +366,21 @@ fn type_clipboard() {
         return;
     }
 
+    // Reset the reentrancy flag on every exit path — including a panic — so a
+    // failure mid-type can't wedge the feature with TYPING stuck true. Mirrors the
+    // StartGuard/Drop pattern used by clipboardtyper_start.
+    struct TypingGuard;
+    impl Drop for TypingGuard {
+        fn drop(&mut self) {
+            TYPING.store(false, Ordering::Release);
+        }
+    }
+    let _typing_guard = TypingGuard;
+
     let result = (|| -> Result<usize, String> {
         let raw = read_clipboard()?;
         let text: String = raw
-            .trim_end_matches(|c: char| matches!(c, '\r' | '\n' | '\t' | ' '))
+            .trim_end_matches(|c: char| ['\r', '\n', '\t', ' '].contains(&c))
             .to_string();
         if text.is_empty() {
             return Err("clipboard is empty (or contains non-text)".into());
@@ -459,7 +470,7 @@ fn type_clipboard() {
         Err(e) => (0, Some(e)),
     };
     emit_typed(chars, err);
-    TYPING.store(false, Ordering::Release);
+    // TYPING is reset by `_typing_guard` on drop (also covers a panic above).
 }
 
 fn read_clipboard() -> Result<String, String> {

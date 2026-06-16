@@ -670,6 +670,14 @@ pub fn bvlc_decode(buf: &[u8]) -> Result<Bvlc, String> {
     } else {
         (4, None)
     };
+    // The declared BVLL length must at least cover its own header; a frame that
+    // claims a length shorter than the header is malformed (reject it rather
+    // than parse trailing bytes as if they were the sender's payload).
+    if length < payload_offset {
+        return Err(format!(
+            "BVLC length {length} is shorter than its {payload_offset}-byte header"
+        ));
+    }
     Ok(Bvlc { function, payload_offset, origin })
 }
 
@@ -1395,7 +1403,7 @@ pub fn decode_read_range_ack(payload: &[u8]) -> Result<ReadRangeAck, String> {
 
     // context 3: result-flags BIT STRING (first-item, last-item, more-items).
     let t = decode_tag(payload.get(at..).ok_or_else(err_short)?)?;
-    if !(t.context && !t.opening && !t.closing && t.number == 3) {
+    if !t.context || t.opening || t.closing || t.number != 3 {
         return Err("ReadRange-ACK: expected result-flags tag 3".into());
     }
     let content = payload
@@ -1512,14 +1520,19 @@ fn decode_one_log_record(buf: &[u8]) -> Result<(LogRecord, usize), String> {
     if t.opening && t.context && t.number == 0 {
         at += t.header_len;
         let end = find_closing(buf.get(at..).ok_or_else(err_short)?, 0)?;
-        let inner = &buf[at..at + end];
+        let inner = buf.get(at..at + end).ok_or_else(err_short)?;
         let mut i = 0usize;
-        if let Ok((d, n)) = decode_application_value(&inner[i..]) {
-            i += n;
-            date = Some(d);
+        // Use `inner.get(i..)` rather than `&inner[i..]`: a value that over-reports
+        // its length can push `i` past `inner.len()`, which would panic on a raw
+        // slice. `get` yields None there and we simply stop reading the timestamp.
+        if let Some(rest) = inner.get(i..) {
+            if let Ok((d, n)) = decode_application_value(rest) {
+                i += n;
+                date = Some(d);
+            }
         }
-        if i < inner.len() {
-            if let Ok((tm, _)) = decode_application_value(&inner[i..]) {
+        if let Some(rest) = inner.get(i..) {
+            if let Ok((tm, _)) = decode_application_value(rest) {
                 time = Some(tm);
             }
         }

@@ -23,6 +23,9 @@ serde_json = "1"
 once_cell = "1"
 arboard = "3"
 socket2 = "0.5"
+# OS CSPRNG for the InfluxDB token and local record ids (replaces the old
+# time/heap-address seeded xorshift). Pinned to the 0.2 line already in the tree.
+getrandom = "0.2"
 
 [target.'cfg(windows)'.dependencies]
 rfd = "0.15"

@@ -232,6 +232,7 @@ struct Client {
     /// reply channel). Matching both lets the reader reject a stale/duplicate
     /// reply that belongs to a different transaction reusing this invoke id —
     /// including routed devices that share a router IP but differ by SNET/SADR.
+    #[allow(clippy::type_complexity)]
     pending: Mutex<HashMap<u8, (SocketAddr, Option<(u16, Vec<u8>)>, mpsc::Sender<Outcome>)>>,
     next_invoke: Mutex<u8>,
     discovery: Mutex<Option<Discovery>>,
@@ -294,8 +295,8 @@ impl Client {
 
     /// Picks an invoke ID not currently in flight.
     fn alloc_invoke(&self) -> u8 {
-        let mut next = self.next_invoke.lock().unwrap();
-        let pending = self.pending.lock().unwrap();
+        let mut next = self.next_invoke.lock().unwrap_or_else(|e| e.into_inner());
+        let pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
         for _ in 0..=255u16 {
             let id = *next;
             *next = next.wrapping_add(1);
@@ -320,7 +321,7 @@ impl Client {
         let (tx, rx) = mpsc::channel();
         self.pending
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(invoke_id, (target.sa, target.route.clone(), tx));
         let result = (|| {
             for _ in 0..APDU_ATTEMPTS {
@@ -338,10 +339,10 @@ impl Client {
                 target.sa
             ))
         })();
-        self.pending.lock().unwrap().remove(&invoke_id);
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&invoke_id);
         // Drop any partial reassembly so a late stray segment can't seed a buffer
         // that outlives the transaction.
-        self.segments.lock().unwrap().remove(&invoke_id);
+        self.segments.lock().unwrap_or_else(|e| e.into_inner()).remove(&invoke_id);
         result
     }
 
@@ -350,7 +351,7 @@ impl Client {
     fn pending_peer_matches(&self, invoke_id: u8, src: SocketAddr, route: &Option<(u16, Vec<u8>)>) -> bool {
         self.pending
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&invoke_id)
             .map(|(peer, stored_route, _)| peer.ip() == src.ip() && stored_route == route)
             .unwrap_or(false)
@@ -371,6 +372,7 @@ impl Client {
     /// in-order data, sends a SegmentACK, and on the final segment delivers the
     /// reassembled `Outcome::Complex` to the waiting transaction. `route` carries
     /// the source SNET/SADR so the ack reaches a routed device via its router.
+    #[allow(clippy::too_many_arguments)]
     fn handle_segment(
         &self,
         invoke_id: u8,
@@ -399,7 +401,7 @@ impl Client {
         }
 
         let step = {
-            let mut bufs = self.segments.lock().unwrap();
+            let mut bufs = self.segments.lock().unwrap_or_else(|e| e.into_inner());
             let buf = bufs.entry(invoke_id).or_insert_with(|| SegmentBuffer {
                 service,
                 data: Vec::new(),
@@ -457,7 +459,7 @@ impl Client {
     /// router IP. Compared by IP (a BACnet device replies from its B/IP port
     /// regardless of our source port) plus the NPDU source for routed peers.
     fn complete(&self, invoke_id: u8, src: SocketAddr, route: &Option<(u16, Vec<u8>)>, outcome: Outcome) {
-        if let Some((peer, stored_route, tx)) = self.pending.lock().unwrap().get(&invoke_id) {
+        if let Some((peer, stored_route, tx)) = self.pending.lock().unwrap_or_else(|e| e.into_inner()).get(&invoke_id) {
             if peer.ip() == src.ip() && stored_route == route {
                 let _ = tx.send(outcome);
             }
@@ -465,7 +467,7 @@ impl Client {
     }
 
     fn note_i_am(&self, raw: RawDevice) {
-        let mut guard = self.discovery.lock().unwrap();
+        let mut guard = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(d) = guard.as_mut() {
             let key = device_key(
                 &raw.address.to_string(),
@@ -480,7 +482,7 @@ impl Client {
     }
 
     fn note_routers(&self, router: SocketAddr, networks: Vec<u16>) {
-        let guard = self.discovery.lock().unwrap();
+        let guard = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(d) = guard.as_ref() {
             let _ = d.tx.send(DiscoveryEvent::Routers { router, networks });
         }
@@ -491,7 +493,7 @@ impl Client {
     /// The `AppHandle` is owned only by that thread, never by `Client` — see the
     /// `cov_tx` field note for why this matters.
     fn ensure_cov_emitter(&self, app: &AppHandle) {
-        let mut guard = self.cov_tx.lock().unwrap();
+        let mut guard = self.cov_tx.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_some() {
             return;
         }
@@ -507,8 +509,8 @@ impl Client {
 
     /// Allocates a subscriber-process id not currently in use.
     fn alloc_process(&self) -> u32 {
-        let mut next = self.next_process.lock().unwrap();
-        let cov = self.cov.lock().unwrap();
+        let mut next = self.next_process.lock().unwrap_or_else(|e| e.into_inner());
+        let cov = self.cov.lock().unwrap_or_else(|e| e.into_inner());
         for _ in 0..u32::MAX {
             let id = *next;
             *next = next.wrapping_add(1).max(1);
@@ -524,12 +526,12 @@ impl Client {
     /// the subscription (guards against subscriber-process-id reuse).
     fn note_cov(&self, n: codec::CovNotification) {
         let (device_key, tx) = {
-            let cov = self.cov.lock().unwrap();
+            let cov = self.cov.lock().unwrap_or_else(|e| e.into_inner());
             let Some(entry) = cov.get(&n.process_id) else { return };
             if entry.object != n.monitored_object {
                 return;
             }
-            (entry.device_key.clone(), self.cov_tx.lock().unwrap().clone())
+            (entry.device_key.clone(), self.cov_tx.lock().unwrap_or_else(|e| e.into_inner()).clone())
         };
         let Some(tx) = tx else { return };
         let _ = tx.send(build_cov_event(device_key, n));
@@ -588,7 +590,7 @@ fn bind_bacnet_port_listener() -> Option<UdpSocket> {
 
 /// Parses and routes every incoming frame. Runs for the life of the socket.
 fn reader_loop(client: Arc<Client>, socket: UdpSocket) {
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; 4096];
     loop {
         let (n, src) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
@@ -939,7 +941,7 @@ fn discover_core(
         return Err("no discovery target given".into());
     }
     let (tx, rx) = mpsc::channel();
-    *client.discovery.lock().unwrap() = Some(Discovery { tx, seen: HashSet::new() });
+    *client.discovery.lock().unwrap_or_else(|e| e.into_inner()) = Some(Discovery { tx, seen: HashSet::new() });
 
     let result = (|| {
         let whois = codec::encode_who_is(low, high);
@@ -1022,7 +1024,7 @@ fn discover_core(
         Ok(devices)
     })();
 
-    *client.discovery.lock().unwrap() = None;
+    *client.discovery.lock().unwrap_or_else(|e| e.into_inner()) = None;
     result
 }
 
@@ -1383,7 +1385,7 @@ fn render_value(v: &BacnetValue) -> String {
 const STATUS_FLAG_NAMES: [&str; 4] = ["in-alarm", "fault", "overridden", "out-of-service"];
 
 fn is_binary_object(t: u16) -> bool {
-    matches!(t, 3 | 4 | 5) // binary-input / binary-output / binary-value
+    matches!(t, 3..=5) // binary-input / binary-output / binary-value
 }
 
 /// Property-aware display string for a decoded value set.
@@ -1527,10 +1529,10 @@ pub async fn bacnet_discover(
                 if i >= len {
                     break;
                 }
-                let mut dev = shared.lock().unwrap()[i].clone();
+                let mut dev = shared.lock().unwrap_or_else(|e| e.into_inner())[i].clone();
                 enrich_device(&client, &mut dev);
                 let _ = app.emit("bacnet:device_update", &dev);
-                shared.lock().unwrap()[i] = dev;
+                shared.lock().unwrap_or_else(|e| e.into_inner())[i] = dev;
             }));
         }
         for h in handles {
@@ -1716,7 +1718,7 @@ fn read_trend_core(
             }
             // This batch is older than what we've collected — prepend to keep
             // the overall order chronological (ascending).
-            batch.extend(records.drain(..));
+            batch.append(&mut records);
             records = batch;
             if ack.first_item || got >= anchor {
                 break;
@@ -1794,6 +1796,11 @@ const COV_RESUBSCRIBE_SECS: u64 = 180;
 /// (e.g. a webview reload that never calls unsubscribe).
 const COV_MAX_RESUBSCRIBE_FAILURES: u32 = 2;
 
+/// Upper bound on concurrent COV subscriptions. Each spawns a detached keep-alive
+/// thread, so without a cap a frontend that subscribes on every webview reload
+/// without unsubscribing would leak threads/subscriptions without bound.
+const MAX_COV_SUBSCRIPTIONS: usize = 64;
+
 /// Subscribes to COV notifications for one object. Returns the subscriber
 /// process id; notifications then stream as `bacnet:cov` events until
 /// `bacnet_unsubscribe_cov` is called. A background thread resubscribes before
@@ -1823,12 +1830,22 @@ pub async fn bacnet_subscribe_cov(
         // Register BEFORE subscribing so the initial COV notification a device
         // emits immediately on SubscribeCOV isn't dropped as an unknown process.
         let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        client_run.cov.lock().unwrap().insert(
-            process_id,
-            CovEntry { device_key: dev_key, object, active: Arc::clone(&active) },
-        );
+        {
+            let mut cov = client_run.cov.lock().unwrap_or_else(|e| e.into_inner());
+            // Cap the registry so a frontend that subscribes without unsubscribing
+            // (e.g. on every webview reload) can't leak threads/subscriptions.
+            if cov.len() >= MAX_COV_SUBSCRIPTIONS {
+                return Err(format!(
+                    "too many active COV subscriptions (max {MAX_COV_SUBSCRIPTIONS}); unsubscribe before adding more"
+                ));
+            }
+            cov.insert(
+                process_id,
+                CovEntry { device_key: dev_key, object, active: Arc::clone(&active) },
+            );
+        }
         if let Err(e) = subscribe_cov_core(&client_run, &target, process_id, object, confirmed, Some(COV_LIFETIME_SECS)) {
-            client_run.cov.lock().unwrap().remove(&process_id);
+            client_run.cov.lock().unwrap_or_else(|e| e.into_inner()).remove(&process_id);
             return Err(e);
         }
 
@@ -1853,7 +1870,7 @@ pub async fn bacnet_subscribe_cov(
                         if failures >= COV_MAX_RESUBSCRIBE_FAILURES {
                             // Device unreachable or gone — stop and drop the entry.
                             active.store(false, Ordering::Relaxed);
-                            client_bg.cov.lock().unwrap().remove(&process_id);
+                            client_bg.cov.lock().unwrap_or_else(|e| e.into_inner()).remove(&process_id);
                             return;
                         }
                     }
@@ -1878,7 +1895,7 @@ pub async fn bacnet_unsubscribe_cov(
     let target = resolve_device(&device)?;
     // Stop the keep-alive and drop the registry entry first, so a late
     // notification can't re-arm anything.
-    if let Some(entry) = client.cov.lock().unwrap().remove(&process_id) {
+    if let Some(entry) = client.cov.lock().unwrap_or_else(|e| e.into_inner()).remove(&process_id) {
         entry.active.store(false, Ordering::Relaxed);
     }
     let object = ObjectId::new(object_type, instance);
@@ -2997,14 +3014,11 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut count = 0;
         while Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(500)) {
-                Ok(ev) => {
-                    count += 1;
-                    let summary: Vec<String> =
-                        ev.values.iter().map(|v| format!("{}={}", v.name, v.display)).collect();
-                    println!("  COV #{count}: {} (t-{}s)", summary.join(", "), ev.time_remaining);
-                }
-                Err(_) => {}
+            if let Ok(ev) = rx.recv_timeout(Duration::from_millis(500)) {
+                count += 1;
+                let summary: Vec<String> =
+                    ev.values.iter().map(|v| format!("{}={}", v.name, v.display)).collect();
+                println!("  COV #{count}: {} (t-{}s)", summary.join(", "), ev.time_remaining);
             }
         }
         let _ = subscribe_cov_core(&client, &t, process_id, object, false, None); // cancel

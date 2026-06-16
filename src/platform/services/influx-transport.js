@@ -18,7 +18,7 @@ export function buildGrafanaPanelUrl(config, spec = {}) {
   if (spec.from) params.set("from", String(spec.from));
   if (spec.to) params.set("to", String(spec.to));
   for (const [k, v] of Object.entries(spec.vars || {})) params.set(`var-${k}`, String(v));
-  const dash = spec.dashboard || "";
+  const dash = encodeURIComponent(spec.dashboard || "");
 
   if (spec.panelId != null) {
     params.set("panelId", String(spec.panelId));
@@ -30,6 +30,7 @@ export function buildGrafanaPanelUrl(config, spec = {}) {
 export function createInfluxTransport({ invoke, config }) {
   if (typeof invoke !== "function") throw new Error("createInfluxTransport requires an invoke function");
   if (!config || typeof config.influxPort !== "number") throw new Error("createInfluxTransport requires a PackConfig");
+  if (!Number.isFinite(config.grafanaPort)) throw new Error("createInfluxTransport requires a PackConfig with a numeric grafanaPort");
 
   return {
     /** Deliver a batch of normalized points. Throws on failure so the service re-queues. */
