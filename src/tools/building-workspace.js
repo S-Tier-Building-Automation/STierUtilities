@@ -261,6 +261,15 @@ export function generateBuildingDashboard(snapshot, { siteId = null, buildingId 
     (!floorId || e.floorId === floorId) &&
     (!equipId || e.equipId === equipId));
   const uid = slug(`stier-${uidPart(siteId, "site")}-${uidPart(buildingId, "building")}-${uidPart(floorId, "floor")}-${uidPart(equipId, "all")}`).slice(0, 40);
+  // Scope the telemetry panels to exactly the in-scope modeled points. The
+  // historian writes the tag `point` = the inventory point id, so we filter by
+  // that id set rather than the site/building/floor/equip tags (which carry entity
+  // *names*, and which `compactTags` drops when empty). `exists r.point` skips any
+  // series without the tag, and the sentinel id keeps a scoped-but-empty dashboard
+  // from falling back to unscoped (global) telemetry.
+  const pointIds = points.map((p) => p.id).filter(Boolean);
+  const idSet = (pointIds.length ? pointIds : ["__no_modeled_points__"]).map((id) => JSON.stringify(id)).join(", ");
+  const pointFilter = ` |> filter(fn: (r) => exists r.point and contains(value: r.point, set: [${idSet}]))`;
   return {
     uid,
     title,
@@ -277,14 +286,14 @@ export function generateBuildingDashboard(snapshot, { siteId = null, buildingId 
         id: 1,
         type: "timeseries",
         title: "Present value trend",
-        targets: [{ refId: "A", query: 'from(bucket: "utilities") |> range(start: v.timeRangeStart) |> filter(fn: (r) => r._measurement == "bacnet_point") |> filter(fn: (r) => r._field == "present_value")' }],
+        targets: [{ refId: "A", query: `from(bucket: "utilities") |> range(start: v.timeRangeStart) |> filter(fn: (r) => r._measurement == "bacnet_point") |> filter(fn: (r) => r._field == "present_value")${pointFilter}` }],
         gridPos: { x: 0, y: 0, w: 16, h: 9 },
       },
       {
         id: 2,
         type: "table",
         title: "Latest values",
-        targets: [{ refId: "A", query: 'from(bucket: "utilities") |> range(start: -1h) |> filter(fn: (r) => r._measurement == "bacnet_point") |> last()' }],
+        targets: [{ refId: "A", query: `from(bucket: "utilities") |> range(start: -1h) |> filter(fn: (r) => r._measurement == "bacnet_point")${pointFilter} |> last()` }],
         gridPos: { x: 16, y: 0, w: 8, h: 9 },
       },
       {

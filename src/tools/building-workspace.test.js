@@ -185,6 +185,20 @@ test("dashboard generation is stable and includes building panels", () => {
   assert.equal(dash.uid, "stier-main-main-1-vav-1");
   assert.ok(dash.panels.some((p) => p.title === "Present value trend"));
   assert.ok(dash.panels.some((p) => p.title === "Polling errors"));
+
+  // The telemetry panels must be scoped to the in-scope point ids (via the
+  // `point` tag the historian writes), not fetch global bacnet_point data.
+  const trendQ = dash.panels.find((p) => p.title === "Present value trend").targets[0].query;
+  assert.match(trendQ, /contains\(value: r\.point, set: \["point:rat"\]\)/);
+  assert.match(trendQ, /exists r\.point/);
+  const latestQ = dash.panels.find((p) => p.title === "Latest values").targets[0].query;
+  assert.match(latestQ, /contains\(value: r\.point, set: \["point:rat"\]\)/);
+
+  // A scope with no modeled points must NOT fall back to global telemetry.
+  const empty = generateBuildingDashboard(inv.exportSnapshot(), { equipId: "equip:does-not-exist" });
+  const emptyQ = empty.panels.find((p) => p.title === "Present value trend").targets[0].query;
+  assert.doesNotMatch(emptyQ, /"point:rat"/);
+  assert.match(emptyQ, /__no_modeled_points__/);
 });
 
 test("commissioning runner records pass/fail/skip deterministically", async () => {
