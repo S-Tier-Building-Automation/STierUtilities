@@ -40,6 +40,7 @@ export function createPackController({ invoke, timeseries, sleep = (ms) => new P
     return connected && config != null && cfg != null &&
       config.influxPort === cfg.influxPort &&
       config.grafanaPort === cfg.grafanaPort &&
+      config.telegrafListenerPort === cfg.telegrafListenerPort &&
       config.token === cfg.token &&
       config.org === cfg.org &&
       config.bucket === cfg.bucket;
