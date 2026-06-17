@@ -32,11 +32,31 @@ export function createPackController({ invoke, timeseries, sleep = (ms) => new P
     connected = true;
   }
 
+  // True if we're already connected against an equivalent config, so re-attaching
+  // (which would reset `connected` and swap the transport) can be skipped. Compares
+  // by value, not reference, so a freshly-loaded config object with the same fields
+  // still counts as "already connected".
+  function alreadyConnectedWith(cfg) {
+    return connected && config != null && cfg != null &&
+      config.influxPort === cfg.influxPort &&
+      config.grafanaPort === cfg.grafanaPort &&
+      config.telegrafListenerPort === cfg.telegrafListenerPort &&
+      config.token === cfg.token &&
+      config.org === cfg.org &&
+      config.bucket === cfg.bucket;
+  }
+
   return {
     status: () => invoke("observability_status"),
     packStatus: () => invoke("observability_pack_status"),
     install: () => invoke("observability_install"),
-    stop: () => invoke("observability_stop"),
+    async stop() {
+      // Clear `connected` so a later connect()/bringUp() actually re-attaches the
+      // transport instead of short-circuiting on stale state after a stop/crash.
+      const r = await invoke("observability_stop");
+      connected = false;
+      return r;
+    },
 
     async ensureConfig() { return ensureConfig(); },
     async writeConfigs() { await ensureConfig(); return invoke("observability_write_configs", { config }); },
@@ -48,6 +68,12 @@ export function createPackController({ invoke, timeseries, sleep = (ms) => new P
     async connect(cfg) {
       if (cfg) config = cfg;
       await ensureConfig();
+      // Idempotent: if we're already live against this exact config, don't swap the
+      // transport / reset `connected` — just flush whatever is buffered.
+      if (alreadyConnectedWith(config)) {
+        await timeseries.flushAll();
+        return config;
+      }
       attachTransport();
       await timeseries.flushAll();
       return config;
@@ -60,6 +86,12 @@ export function createPackController({ invoke, timeseries, sleep = (ms) => new P
      */
     async bringUp(onStep = () => {}) {
       await ensureConfig();
+      // Idempotent: if the pack is already up and connected against this exact
+      // config, don't tear it back down / re-attach — just report done.
+      if (alreadyConnectedWith(config)) {
+        onStep('done');
+        return config;
+      }
       // install is version-aware: it fast-skips up-to-date components and only
       // (re)downloads what's missing or outdated, so it doubles as the updater.
       onStep('install');

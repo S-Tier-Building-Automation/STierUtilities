@@ -21,6 +21,7 @@ export const TOOL_MANIFESTS = [
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
+    category: "service",
     provides: [
       { capability: "timeseries", version: "1.0" },
       { capability: "scheduler", version: "1.0" },
@@ -44,6 +45,7 @@ export const TOOL_MANIFESTS = [
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
+    category: "app",
     provides: [],
     requires: [{ capability: "timeseries", version: "^1.0", optional: true }],
     permissions: ["input.inject", "fs.appdata"],
@@ -65,6 +67,7 @@ export const TOOL_MANIFESTS = [
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
+    category: "app",
     provides: [{ capability: "media.convert", version: "1.0" }],
     requires: [{ capability: "timeseries", version: "^1.0", optional: true }],
     permissions: ["process.spawn", "fs.userpick", "fs.appdata"],
@@ -84,6 +87,7 @@ export const TOOL_MANIFESTS = [
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
+    category: "app",
     provides: [
       { capability: "network.adapters", version: "1.0" },
       { capability: "netscan", version: "1.0" },
@@ -106,28 +110,61 @@ export const TOOL_MANIFESTS = [
     },
   },
   {
-    id: "bacnet",
-    name: "BACnet Explorer",
+    // The headless BACnet/IP service — the reference "extract the engine out of
+    // the app" case. It owns the BACnet/IP stack and provides the reusable
+    // bacnet.read capability (Who-Is discovery + point reads). The BACnet
+    // Inspector App and the BACnet Historian both *consume* this contract instead
+    // of embedding their own BACnet code. category:"service" marks it headless —
+    // it boots in the kernel but has no page in the tool catalog.
+    id: "bacnet-core",
+    name: "BACnet Service",
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
+    category: "service",
     provides: [{ capability: "bacnet.read", version: "1.0" }],
+    requires: [{ capability: "netscan", version: "^1.0", optional: true }],
+    permissions: ["network.udp"],
+    ui: {
+      emoji: "📡",
+      tagline: "Headless BACnet/IP read service — discovery and point reads other tools reuse.",
+      description:
+        "The reusable BACnet/IP read capability: broadcast Who-Is discovery and " +
+        "read a point's properties. It owns the BACnet/IP stack on an ephemeral " +
+        "UDP port (so it coexists with Niagara or any other BACnet stack) and " +
+        "exposes a stable bacnet.read contract any platform app can depend on. " +
+        "The BACnet Inspector and the BACnet Historian both consume it rather " +
+        "than reimplementing BACnet. Runs headless — it has no page of its own.",
+      repo: REPO,
+    },
+  },
+  {
+    // The advanced BACnet Inspector App — the YABE-style power UI. It no longer provides
+    // bacnet.read; it *consumes* it from bacnet-core (discovery + point reads),
+    // and exists as an advanced field-debugging UI over the shared contract.
+    id: "bacnet",
+    name: "Advanced BACnet Inspector",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "app",
+    provides: [],
     requires: [
+      { capability: "bacnet.read", version: "^1.0" },
       { capability: "netscan", version: "^1.0", optional: true },
-      { capability: "timeseries", version: "^1.0", optional: true },
-      { capability: "scheduler", version: "^1.0", optional: true },
     ],
-    permissions: ["network.udp", "timeseries.write", "fs.appdata"],
+    permissions: ["fs.appdata"],
     ui: {
       emoji: "🏢",
-      tagline: "Discover BACnet/IP devices, browse objects, read & write points.",
+      tagline: "Advanced raw BACnet/IP inspection, object browsing, writes, COV, and trends.",
       description:
-        "A YABE-style BACnet/IP management tool. Broadcast a Who-Is to discover " +
-        "devices (including ones behind BACnet routers), browse each device's " +
-        "object list, read every property of a point, and write present-value " +
-        "with a command priority — including relinquishing a slot by writing " +
-        "Null. Uses an ephemeral UDP port, so it coexists with Niagara or any " +
+        "An advanced YABE-style BACnet/IP inspector kept as a field-debugging " +
+        "escape hatch. Building Workspace is the normal SI workflow; this view " +
+        "uses the same bacnet-core service for discovery, object lists, reads, " +
+        "writes, COV, and trend-log inspection when raw protocol visibility is " +
+        "needed. Uses an ephemeral UDP port, so it coexists with Niagara or any " +
         "other BACnet stack running on this machine.",
+      defaultHidden: true,
       repo: REPO,
     },
   },
@@ -140,6 +177,7 @@ export const TOOL_MANIFESTS = [
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
+    category: "service",
     provides: [{ capability: "bacnet.historian", version: "1.0" }],
     requires: [
       { capability: "bacnet.read", version: "^1.0" },
@@ -156,8 +194,37 @@ export const TOOL_MANIFESTS = [
         "Pick BACnet points to historize; the Historian polls them on a schedule " +
         "and streams present-value into the time-series service. With the " +
         "Observability Pack running, the same data charts live in Grafana. It " +
-        "reuses the BACnet Explorer's reads, the scheduler, and the telemetry " +
+        "reuses the BACnet service, scheduler, and telemetry " +
         "service — no duplicated BACnet, scheduling, or storage code.",
+      repo: REPO,
+    },
+  },
+  {
+    id: "building-workspace",
+    name: "Building Workspace",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "app",
+    provides: [{ capability: "inventory", version: "1.0" }],
+    requires: [
+      { capability: "bacnet.read", version: "^1.0" },
+      { capability: "bacnet.historian", version: "^1.0" },
+      { capability: "timeseries", version: "^1.0" },
+      { capability: "scheduler", version: "^1.0" },
+      { capability: "netscan", version: "^1.0", optional: true },
+    ],
+    permissions: ["inventory.read", "inventory.write", "timeseries.write", "timeseries.read", "scheduler.register"],
+    dashboards: ["dashboards/building-workspace.json"],
+    ui: {
+      emoji: "🏗️",
+      tagline: "Model, trend, commission, and report BACnet points from one SI workspace.",
+      description:
+        "A BACnet-first building automation workflow: import discovered devices and " +
+        "objects into a lightweight tagged model, apply equipment templates, historize " +
+        "points, generate dashboard definitions, run commissioning checks, and export " +
+        "Markdown/CSV reports. Local-first and built on the same platform capabilities " +
+        "as the BACnet Inspector, Historian, and Observability Pack.",
       repo: REPO,
     },
   },

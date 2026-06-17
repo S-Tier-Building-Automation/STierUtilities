@@ -10,6 +10,11 @@ use tauri_plugin_shell::ShellExt;
 
 const MEDIA_FILTER: &[&str] = &["heic", "heif", "mov"];
 
+/// Byte budget for the preview cache. Previews are keyed by path+mtime and never
+/// self-expire, so `prune_cache` evicts oldest entries past this to keep the
+/// on-disk cache bounded.
+const PREVIEW_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MediaKind {
@@ -17,17 +22,12 @@ pub enum MediaKind {
     Video,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageFormat {
+    #[default]
     Jpeg,
     Png,
-}
-
-impl Default for ImageFormat {
-    fn default() -> Self {
-        Self::Jpeg
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,7 +99,7 @@ fn heicmov_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
 /// Evict oldest cache files until the directory is under `max_bytes`. Returns the
 /// number of files removed. The preview cache is keyed by path+mtime and never
 /// self-expires, so this keeps it bounded (addresses the unbounded-growth gap).
-fn prune_cache(dir: &Path, max_bytes: u64) -> Result<usize, String> {
+fn prune_cache(dir: &Path, max_bytes: u64, keep_path: Option<&Path>) -> Result<usize, String> {
     if !dir.exists() {
         return Ok(0);
     }
@@ -107,12 +107,21 @@ fn prune_cache(dir: &Path, max_bytes: u64) -> Result<usize, String> {
     let mut total: u64 = 0;
     for entry in std::fs::read_dir(dir).map_err(|e| e.to_string())? {
         let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        // Never evict the file the caller just produced (it's about to be loaded).
+        if keep_path.is_some_and(|keep| path == keep) {
+            continue;
+        }
         let meta = match entry.metadata() {
             Ok(m) if m.is_file() => m,
             _ => continue,
         };
         total += meta.len();
-        files.push((entry.path(), meta.len(), meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)));
+        files.push((
+            path,
+            meta.len(),
+            meta.modified().unwrap_or(SystemTime::UNIX_EPOCH),
+        ));
     }
     if total <= max_bytes {
         return Ok(0);
@@ -132,30 +141,6 @@ fn prune_cache(dir: &Path, max_bytes: u64) -> Result<usize, String> {
     Ok(removed)
 }
 
-/// Prune the preview cache to a budget (default 512 MiB).
-#[tauri::command]
-pub async fn heicmov_prune_cache(app: AppHandle, max_bytes: Option<u64>) -> Result<usize, String> {
-    let dir = heicmov_cache_dir(&app)?;
-    prune_cache(&dir, max_bytes.unwrap_or(512 * 1024 * 1024))
-}
-
-/// Delete the entire preview cache. Returns the number of files removed.
-#[tauri::command]
-pub async fn heicmov_clear_cache(app: AppHandle) -> Result<usize, String> {
-    let dir = heicmov_cache_dir(&app)?;
-    let mut removed = 0;
-    if dir.exists() {
-        for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-            if let Ok(e) = entry {
-                if e.metadata().map(|m| m.is_file()).unwrap_or(false) && std::fs::remove_file(e.path()).is_ok() {
-                    removed += 1;
-                }
-            }
-        }
-    }
-    Ok(removed)
-}
-
 fn sidecar_output(output: Output) -> Result<(), String> {
     if output.status.success() {
         return Ok(());
@@ -168,7 +153,10 @@ fn sidecar_output(output: Output) -> Result<(), String> {
         stderr.trim().to_string()
     };
     if msg.is_empty() {
-        Err(format!("ffmpeg exited with status {:?}", output.status.code()))
+        Err(format!(
+            "ffmpeg exited with status {:?}",
+            output.status.code()
+        ))
     } else {
         Err(msg)
     }
@@ -206,11 +194,7 @@ async fn run_ffprobe(app: &AppHandle, args: Vec<String>) -> Result<String, Strin
     Err(stderr.trim().to_string())
 }
 
-fn output_path_for(
-    input: &Path,
-    output_dir: Option<&Path>,
-    image_format: ImageFormat,
-) -> PathBuf {
+fn output_path_for(input: &Path, output_dir: Option<&Path>, image_format: ImageFormat) -> PathBuf {
     let stem = input
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
@@ -296,7 +280,10 @@ pub async fn heicmov_probe(app: AppHandle, path: String) -> Result<ProbeResult, 
         if stream.get("codec_type").and_then(|t| t.as_str()) != Some(stream_type) {
             continue;
         }
-        width = stream.get("width").and_then(|w| w.as_u64()).map(|w| w as u32);
+        width = stream
+            .get("width")
+            .and_then(|w| w.as_u64())
+            .map(|w| w as u32);
         height = stream
             .get("height")
             .and_then(|h| h.as_u64())
@@ -356,6 +343,14 @@ pub async fn heicmov_make_preview(app: AppHandle, path: String) -> Result<Previe
                 ],
             )
             .await?;
+            // Keep the on-disk preview cache bounded (best-effort), off the async
+            // executor thread since pruning does synchronous directory I/O. Protect
+            // the preview we just generated so it can't be evicted before it loads.
+            let cache_dir_clone = cache_dir.clone();
+            let keep_path = preview_path.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let _ = prune_cache(&cache_dir_clone, PREVIEW_CACHE_BUDGET_BYTES, Some(&keep_path));
+            });
             Ok(PreviewResult {
                 preview_path: preview_path.to_string_lossy().into_owned(),
                 mime: "image/jpeg".into(),
@@ -386,6 +381,14 @@ pub async fn heicmov_make_preview(app: AppHandle, path: String) -> Result<Previe
                 ],
             )
             .await?;
+            // Keep the on-disk preview cache bounded (best-effort), off the async
+            // executor thread since pruning does synchronous directory I/O. Protect
+            // the preview we just generated so it can't be evicted before it loads.
+            let cache_dir_clone = cache_dir.clone();
+            let keep_path = preview_path.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let _ = prune_cache(&cache_dir_clone, PREVIEW_CACHE_BUDGET_BYTES, Some(&keep_path));
+            });
             Ok(PreviewResult {
                 preview_path: preview_path.to_string_lossy().into_owned(),
                 mime: "video/mp4".into(),
@@ -426,11 +429,7 @@ pub async fn heicmov_convert(
             continue;
         }
 
-        let output = output_path_for(
-            &input,
-            out_dir.as_deref(),
-            image_format,
-        );
+        let output = output_path_for(&input, out_dir.as_deref(), image_format);
 
         if output.exists() && !overwrite {
             results.push(ConvertFileResult {
@@ -545,10 +544,33 @@ mod tests {
         assert_eq!(dir_total(&dir), 5 * 1024);
 
         // Prune to 2 KiB: should remove at least 3 files and leave <= budget.
-        let removed = prune_cache(&dir, 2 * 1024).unwrap();
-        assert!(removed >= 3, "expected to evict at least 3 files, got {removed}");
+        let removed = prune_cache(&dir, 2 * 1024, None).unwrap();
+        assert!(
+            removed >= 3,
+            "expected to evict at least 3 files, got {removed}"
+        );
         assert!(dir_total(&dir) <= 2 * 1024);
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn prune_cache_never_evicts_kept_file() {
+        let dir = std::env::temp_dir().join(format!("stier_heicmov_keep_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The "kept" file alone exceeds the budget; it must survive anyway, since
+        // the caller is about to load it as the freshly-generated preview.
+        let keep = dir.join("just-generated.bin");
+        std::fs::write(&keep, vec![0u8; 4 * 1024]).unwrap();
+        for i in 0..3 {
+            std::fs::write(dir.join(format!("old{i}.bin")), vec![0u8; 1024]).unwrap();
+        }
+        // Budget 0 means every *evictable* file must go — but the kept file is
+        // excluded from eviction entirely, so it survives regardless.
+        let removed = prune_cache(&dir, 0, Some(&keep)).unwrap();
+        assert!(keep.exists(), "the just-generated preview must not be evicted");
+        assert_eq!(removed, 3, "expected the 3 older files to be evicted");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -558,7 +580,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("a.bin"), vec![0u8; 100]).unwrap();
-        assert_eq!(prune_cache(&dir, 10 * 1024).unwrap(), 0);
+        assert_eq!(prune_cache(&dir, 10 * 1024, None).unwrap(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -566,6 +588,6 @@ mod tests {
     fn prune_cache_missing_dir_is_ok() {
         let dir = std::env::temp_dir().join("stier_heicmov_does_not_exist_xyz");
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(prune_cache(&dir, 1024).unwrap(), 0);
+        assert_eq!(prune_cache(&dir, 1024, None).unwrap(), 0);
     }
 }

@@ -10,6 +10,8 @@ import { buildFactories } from "./tools/capabilities.js";
 import { createKernel } from "./platform/host.js";
 import { createTimeseries } from "./platform/services/timeseries.js";
 import { createScheduler } from "./platform/services/scheduler.js";
+import { createMemoryInventoryStorage } from "./tools/inventory.js";
+import { generateBuildingDashboard, historianPointFromEntity, pointEntityFromBacnet, exportCommissioningCsv, exportCommissioningMarkdown } from "./tools/building-workspace.js";
 
 function mockInvoke(returns = {}) {
   return async (cmd, args) => (cmd in returns ? returns[cmd](args) : null);
@@ -18,7 +20,7 @@ function mockInvoke(returns = {}) {
 async function bootRealPlatform(invoke, telemetry, scheduler) {
   const kernel = createKernel({
     manifests: TOOL_MANIFESTS,
-    factories: buildFactories(invoke, { timeseries: telemetry, scheduler }),
+    factories: buildFactories(invoke, { timeseries: telemetry, scheduler, inventoryStorage: createMemoryInventoryStorage() }),
   });
   const res = await kernel.boot();
   assert.ok(res.ok, res.errors.join("; "));
@@ -27,15 +29,60 @@ async function bootRealPlatform(invoke, telemetry, scheduler) {
 
 test("the whole tool catalog boots with a clean capability graph", async () => {
   const kernel = await bootRealPlatform(mockInvoke(), createTimeseries(), createScheduler());
-  for (const id of ["observability", "clipboardtyper", "heicmov", "networkmanager", "bacnet", "bacnet-historian"]) {
+  for (const id of ["observability", "clipboardtyper", "heicmov", "networkmanager", "bacnet-core", "bacnet", "bacnet-historian", "building-workspace"]) {
     assert.ok(kernel.isBooted(id), `${id} should be booted`);
   }
   for (const cap of [
     "timeseries.v1", "scheduler.v1", "network.adapters.v1", "netscan.v1",
-    "media.convert.v1", "bacnet.read.v1", "bacnet.historian.v1",
+    "media.convert.v1", "bacnet.read.v1", "bacnet.historian.v1", "inventory.v1",
   ]) {
     assert.ok(kernel.capability(cap), `${cap} should resolve`);
   }
+});
+
+test("building workflow imports, historizes, charts, and exports reports", async () => {
+  const telemetry = createTimeseries({ now: () => 1 });
+  const invoke = mockInvoke({
+    bacnet_read_properties: () => [{ id: 85, name: "present-value", values: [{ kind: "real", value: 73.1 }] }],
+  });
+  const kernel = await bootRealPlatform(invoke, telemetry, createScheduler());
+  const inventory = kernel.capability("inventory.v1");
+  const historian = kernel.capability("bacnet.historian.v1");
+
+  const site = inventory.upsertEntity({ id: "site:main", type: "site", name: "Main" });
+  const building = inventory.upsertEntity({ id: "building:hq", type: "building", siteId: site.id, parentId: site.id, name: "HQ" });
+  const floor = inventory.upsertEntity({ id: "floor:1", type: "floor", siteId: site.id, buildingId: building.id, parentId: building.id, name: "Level 1" });
+  const equip = inventory.applyTemplate(inventory.upsertEntity({
+    id: "equip:vav-1",
+    type: "equip",
+    siteId: site.id,
+    buildingId: building.id,
+    floorId: floor.id,
+    parentId: floor.id,
+    name: "VAV-1",
+  }).id, "vav");
+  const point = inventory.upsertEntity(pointEntityFromBacnet({
+    siteId: site.id,
+    buildingId: building.id,
+    floorId: floor.id,
+    equipId: equip.id,
+    device: { instance: 12 },
+    object: { objectType: 0, instance: 0, typeName: "analog-input", name: "RAT" },
+  }));
+  historian.addPoint(historianPointFromEntity(point, { site, building, floor, equip }));
+  await historian.pollOnce();
+
+  assert.equal(telemetry.recent().at(-1).tags.site, "Main");
+  assert.equal(telemetry.recent().at(-1).tags.floor, "Level 1");
+  const dashboard = generateBuildingDashboard(inventory.exportSnapshot(), { siteId: site.id, buildingId: building.id, floorId: floor.id, equipId: equip.id });
+  assert.equal(dashboard.uid, "stier-main-hq-1-vav-1");
+
+  const run = inventory.recordCommissioningRun({
+    status: "fail",
+    steps: [{ pointId: point.id, pointName: point.name, check: "range", status: "fail", value: 99 }],
+  });
+  assert.match(exportCommissioningMarkdown(inventory.exportSnapshot(), run), /RAT/);
+  assert.match(exportCommissioningCsv(run), /range/);
 });
 
 test("a netscan sweep flows into the degraded telemetry without a backend", async () => {

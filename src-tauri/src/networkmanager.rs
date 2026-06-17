@@ -37,31 +37,21 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 // Enums (shared with the frontend; serialize as lowercase strings)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Ipv4Mode {
+    #[default]
     Dhcp,
     Static,
 }
 
-impl Default for Ipv4Mode {
-    fn default() -> Self {
-        Self::Dhcp
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DnsMode {
     Automatic,
     Manual,
+    #[default]
     NoChange,
-}
-
-impl Default for DnsMode {
-    fn default() -> Self {
-        Self::NoChange
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -185,7 +175,13 @@ struct PsState {
 
 fn run_powershell(script: &str) -> Result<String, String> {
     let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script])
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
         .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| format!("failed to launch PowerShell: {e}"))?;
@@ -358,7 +354,10 @@ fn compare_profile_to_state(
         detail,
     };
 
-    if !profile.adapter_name.eq_ignore_ascii_case(&state.adapter_name) {
+    if !profile
+        .adapter_name
+        .eq_ignore_ascii_case(&state.adapter_name)
+    {
         return not_active(format!(
             "Profile targets {}, not {}.",
             profile.adapter_name, state.adapter_name
@@ -426,11 +425,21 @@ fn compare_profile_to_state(
             } else {
                 "Primary DNS"
             };
-            return not_active(format!("{label} is none; profile expects {}.", expected[actual.len()]));
+            return not_active(format!(
+                "{label} is none; profile expects {}.",
+                expected[actual.len()]
+            ));
         }
         if actual.len() > expected.len() {
-            let label = if actual.len() > 1 { "alternate DNS" } else { "DNS" };
-            return not_active(format!("Windows has extra {label} {}.", actual[expected.len()]));
+            let label = if actual.len() > 1 {
+                "alternate DNS"
+            } else {
+                "DNS"
+            };
+            return not_active(format!(
+                "Windows has extra {label} {}.",
+                actual[expected.len()]
+            ));
         }
         for index in 1..expected.len() {
             if !same_ip(&expected[index], &actual[index]) {
@@ -571,17 +580,13 @@ pub fn networkmanager_compare(
 }
 
 #[tauri::command]
-pub fn networkmanager_validate(profile: NetworkProfile) -> Result<(), String> {
-    validate_profile(&profile)
-}
-
-#[tauri::command]
 pub fn networkmanager_load_profiles(app: AppHandle) -> Result<Vec<NetworkProfile>, String> {
     let path = profiles_path(&app)?;
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let data = std::fs::read_to_string(&path).map_err(|e| format!("could not read profiles: {e}"))?;
+    let data =
+        std::fs::read_to_string(&path).map_err(|e| format!("could not read profiles: {e}"))?;
     if data.trim().is_empty() {
         return Ok(Vec::new());
     }
@@ -595,28 +600,26 @@ pub fn networkmanager_save_profiles(
 ) -> Result<(), String> {
     let path = profiles_path(&app)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("could not create profile dir: {e}"))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create profile dir: {e}"))?;
     }
-    let json =
-        serde_json::to_string_pretty(&profiles).map_err(|e| format!("could not serialize profiles: {e}"))?;
+    let json = serde_json::to_string_pretty(&profiles)
+        .map_err(|e| format!("could not serialize profiles: {e}"))?;
     // Write to a sibling temp file and atomically replace the destination, so a
     // crash or power loss mid-write can't truncate profiles.json and wipe every
     // saved profile (the frontend auto-saves on edits). On Windows std::fs::rename
     // replaces an existing file (MOVEFILE_REPLACE_EXISTING).
     let tmp = path.with_file_name(format!(
         "{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("profiles.json")
+        path.file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("profiles.json")
     ));
     std::fs::write(&tmp, json.as_bytes()).map_err(|e| format!("could not write profiles: {e}"))?;
     std::fs::rename(&tmp, &path).map_err(|e| {
         let _ = std::fs::remove_file(&tmp);
         format!("could not replace profiles file: {e}")
     })
-}
-
-#[tauri::command]
-pub fn networkmanager_profiles_path(app: AppHandle) -> Result<String, String> {
-    Ok(profiles_path(&app)?.to_string_lossy().to_string())
 }
 
 #[tauri::command]
@@ -772,17 +775,26 @@ fn elevated_apply_steps(plan_b64: &str) -> Vec<ApplyStep> {
 
     let plan: ApplyPlan = match base64_decode(plan_b64)
         .ok_or_else(|| "could not decode apply plan".to_string())
-        .and_then(|b| serde_json::from_slice(&b).map_err(|e| format!("could not parse apply plan: {e}")))
-    {
+        .and_then(|b| {
+            serde_json::from_slice(&b).map_err(|e| format!("could not parse apply plan: {e}"))
+        }) {
         Ok(p) => p,
         Err(e) => {
-            steps.push(ApplyStep { step: "Apply".into(), ok: false, detail: e });
+            steps.push(ApplyStep {
+                step: "Apply".into(),
+                ok: false,
+                detail: e,
+            });
             return steps;
         }
     };
 
     if let Err(e) = validate_plan(&plan) {
-        steps.push(ApplyStep { step: "Apply".into(), ok: false, detail: e });
+        steps.push(ApplyStep {
+            step: "Apply".into(),
+            ok: false,
+            detail: e,
+        });
         return steps;
     }
 
@@ -815,9 +827,17 @@ fn elevated_apply_steps(plan_b64: &str) -> Vec<ApplyStep> {
             } else {
                 out
             };
-            steps.push(ApplyStep { step: "IPv4".into(), ok, detail });
+            steps.push(ApplyStep {
+                step: "IPv4".into(),
+                ok,
+                detail,
+            });
         }
-        Err(e) => steps.push(ApplyStep { step: "IPv4".into(), ok: false, detail: e }),
+        Err(e) => steps.push(ApplyStep {
+            step: "IPv4".into(),
+            ok: false,
+            detail: e,
+        }),
     }
 
     // ---- DNS (independent of the IPv4 result) ----
@@ -850,13 +870,25 @@ fn elevated_apply_steps(plan_b64: &str) -> Vec<ApplyStep> {
             command,
         ];
         match run_capture("powershell.exe", &ps_args) {
-            Ok((true, _)) => steps.push(ApplyStep { step: "DNS".into(), ok: true, detail: success_detail }),
+            Ok((true, _)) => steps.push(ApplyStep {
+                step: "DNS".into(),
+                ok: true,
+                detail: success_detail,
+            }),
             Ok((false, out)) => steps.push(ApplyStep {
                 step: "DNS".into(),
                 ok: false,
-                detail: if out.is_empty() { "DNS step failed".into() } else { out },
+                detail: if out.is_empty() {
+                    "DNS step failed".into()
+                } else {
+                    out
+                },
             }),
-            Err(e) => steps.push(ApplyStep { step: "DNS".into(), ok: false, detail: e }),
+            Err(e) => steps.push(ApplyStep {
+                step: "DNS".into(),
+                ok: false,
+                detail: e,
+            }),
         }
     }
 
@@ -889,8 +921,7 @@ pub fn run_elevated_worker(plan_b64: &str, result_path: &str) -> i32 {
 
 /// Standard base64 (no line breaks). Avoids pulling in a crate just for this.
 fn base64_encode(input: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
@@ -1052,7 +1083,8 @@ fn apply_blocking(app: &AppHandle, profile: &NetworkProfile) -> Result<ApplyOutc
         dns_mode: profile.dns_mode,
         dns_servers: expected_dns(profile),
     };
-    let plan_json = serde_json::to_string(&plan).map_err(|e| format!("could not serialize plan: {e}"))?;
+    let plan_json =
+        serde_json::to_string(&plan).map_err(|e| format!("could not serialize plan: {e}"))?;
     let plan_b64 = base64_encode(plan_json.as_bytes());
 
     let run = launch_elevated_self(&plan_b64, &result_path);
@@ -1116,7 +1148,8 @@ mod tests {
 
     #[test]
     fn parse_steps_single_object_and_bom() {
-        let steps = parse_apply_steps("\u{feff}{\"step\":\"Apply\",\"ok\":false,\"detail\":\"boom\"}");
+        let steps =
+            parse_apply_steps("\u{feff}{\"step\":\"Apply\",\"ok\":false,\"detail\":\"boom\"}");
         assert_eq!(steps.len(), 1);
         assert_eq!(steps[0].step, "Apply");
         assert!(!steps[0].ok);
@@ -1151,8 +1184,18 @@ mod tests {
 
     #[test]
     fn base64_round_trips() {
-        for s in ["", "f", "fo", "foo", "foobar", "{\"a\":1,\"b\":\"x y/z+=\"}"] {
-            assert_eq!(base64_decode(&base64_encode(s.as_bytes())).unwrap(), s.as_bytes());
+        for s in [
+            "",
+            "f",
+            "fo",
+            "foo",
+            "foobar",
+            "{\"a\":1,\"b\":\"x y/z+=\"}",
+        ] {
+            assert_eq!(
+                base64_decode(&base64_encode(s.as_bytes())).unwrap(),
+                s.as_bytes()
+            );
         }
         assert!(base64_decode("not base64 ***").is_none());
     }
@@ -1214,7 +1257,9 @@ mod tests {
         assert!(result_path_is_safe(good.to_str().unwrap()));
 
         // Right directory, wrong leaf name.
-        assert!(!result_path_is_safe(app_dir.join("evil.txt").to_str().unwrap()));
+        assert!(!result_path_is_safe(
+            app_dir.join("evil.txt").to_str().unwrap()
+        ));
 
         // `..` is resolved away, so the real parent (<bundle-id>) is not the cache dir.
         let traversal = app_dir.join("..").join("apply-result-x.json");
@@ -1223,13 +1268,22 @@ mod tests {
         // Right leaf name, but the parent dir isn't <bundle-id>/networkmanager.
         let wrong_dir = base.join("networkmanager");
         fs::create_dir_all(&wrong_dir).expect("create wrong dir");
-        assert!(!result_path_is_safe(wrong_dir.join("apply-result-x.json").to_str().unwrap()));
+        assert!(!result_path_is_safe(
+            wrong_dir.join("apply-result-x.json").to_str().unwrap()
+        ));
 
         // Non-existent parent can't be canonicalized.
-        assert!(!result_path_is_safe(base.join("nope").join("apply-result-x.json").to_str().unwrap()));
+        assert!(!result_path_is_safe(
+            base.join("nope")
+                .join("apply-result-x.json")
+                .to_str()
+                .unwrap()
+        ));
 
         // A real system dir outside the app tree.
-        assert!(!result_path_is_safe("C:\\Windows\\System32\\apply-result-x.json"));
+        assert!(!result_path_is_safe(
+            "C:\\Windows\\System32\\apply-result-x.json"
+        ));
 
         // Relative paths are rejected outright.
         assert!(!result_path_is_safe("apply-result-x.json"));
@@ -1239,10 +1293,21 @@ mod tests {
 
     #[test]
     fn subnet_mask_validation() {
-        for ok in ["255.255.255.0", "255.255.252.0", "255.0.0.0", "255.255.255.255"] {
+        for ok in [
+            "255.255.255.0",
+            "255.255.252.0",
+            "255.0.0.0",
+            "255.255.255.255",
+        ] {
             assert!(ensure_subnet_mask(ok).is_ok(), "{ok} should be valid");
         }
-        for bad in ["255.0.255.0", "0.0.0.0", "255.255.255.1", "not-an-ip", "256.0.0.0"] {
+        for bad in [
+            "255.0.255.0",
+            "0.0.0.0",
+            "255.255.255.1",
+            "not-an-ip",
+            "256.0.0.0",
+        ] {
             assert!(ensure_subnet_mask(bad).is_err(), "{bad} should be invalid");
         }
     }

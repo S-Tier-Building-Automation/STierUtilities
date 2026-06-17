@@ -3,12 +3,14 @@
 //!
 //! NOTE: this is a localhost-only store. The token authenticates writes to an
 //! InfluxDB bound to 127.0.0.1, so the threat model is a co-resident local
-//! process. A future hardening step moves this to the OS keychain (Credential
-//! Manager / Keychain / Secret Service) — see the design doc. The token generator
-//! below is intentionally simple (not a CSPRNG); it's adequate for a local token
-//! but should be replaced alongside the keychain move.
+//! process. The file lives under the per-user app config dir, whose profile ACL
+//! already blocks *other* users; isolating it from a *same-user* process is the
+//! job of the OS keychain (Credential Manager), which remains the planned next
+//! step — see the design doc. The token itself is now generated from the OS
+//! CSPRNG (was a time/heap-address seeded xorshift, which was predictable).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
@@ -31,31 +33,32 @@ pub fn save(path: &Path, secrets: &Secrets) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let json = serde_json::to_string_pretty(secrets).map_err(|e| e.to_string())?;
-    // Atomic-ish write via a temp file + rename, matching networkmanager's pattern.
-    let tmp = path.with_extension("json.tmp");
+    // Atomic-ish write via a temp file + rename. The temp name is unique per
+    // process + call so two concurrent saves can't clobber each other's temp.
+    static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+    let tmp = path.with_extension(format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
     std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    let res = std::fs::rename(&tmp, path).map_err(|e| e.to_string());
+    if res.is_err() {
+        // Don't leak the temp file in the config dir if the rename failed.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
-/// Generate a 128-hex-char token. NOT a CSPRNG — see the module note.
+/// Generate a 128-hex-char token from the OS CSPRNG (getrandom: BCryptGenRandom
+/// on Windows). A failing CSPRNG is unrecoverable for a security token, so we
+/// panic rather than emit a weak one.
 pub fn generate_token() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0) as u64;
-    // Mix in a heap address for a little per-process/run entropy.
-    let probe = Box::new(0u8);
-    let addr = (&*probe as *const u8) as u64;
-    let mut state = nanos ^ addr ^ 0x9E37_79B9_7F4A_7C15;
+    let mut bytes = [0u8; 64];
+    getrandom::getrandom(&mut bytes).expect("OS CSPRNG (getrandom) failed");
     let mut out = String::with_capacity(128);
-    for _ in 0..8 {
-        // xorshift64*
-        state ^= state >> 12;
-        state ^= state << 25;
-        state ^= state >> 27;
-        let v = state.wrapping_mul(0x2545_F491_4F6C_DD1D);
-        out.push_str(&format!("{v:016x}"));
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
     }
     out
 }

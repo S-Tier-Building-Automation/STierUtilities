@@ -8,17 +8,21 @@ mod observability;
 mod timeseries;
 
 #[cfg(windows)]
+mod auth;
+#[cfg(windows)]
 mod clipboardtyper;
 #[cfg(windows)]
 mod heicmov;
 #[cfg(windows)]
 mod mcp;
 #[cfg(windows)]
-mod secrets;
-#[cfg(windows)]
 mod netscan;
 #[cfg(windows)]
 mod networkmanager;
+#[cfg(windows)]
+mod secrets;
+#[cfg(windows)]
+mod startup;
 
 /// Open the app's data/config directory — where tool settings and saved
 /// profiles live (e.g. clipboardtyper.json, networkmanager/profiles.json) — in
@@ -61,6 +65,17 @@ pub fn run() {
     #[cfg(windows)]
     let builder = builder.invoke_handler(tauri::generate_handler![
         app_open_data_dir,
+        auth::auth_get_state,
+        auth::auth_create_local_session,
+        auth::auth_sign_out,
+        auth::auth_switch_org,
+        auth::auth_create_org,
+        auth::auth_load_user_state,
+        auth::auth_save_user_state,
+        auth::auth_export_snapshot,
+        auth::auth_pick_sync_folder,
+        auth::auth_clear_sync_folder,
+        auth::auth_sync_now,
         clipboardtyper::clipboardtyper_start,
         clipboardtyper::clipboardtyper_stop,
         clipboardtyper::clipboardtyper_set_armed,
@@ -72,17 +87,13 @@ pub fn run() {
         heicmov::heicmov_make_preview,
         heicmov::heicmov_convert,
         heicmov::heicmov_open_path,
-        heicmov::heicmov_prune_cache,
-        heicmov::heicmov_clear_cache,
         secrets::secrets_influx_token,
         networkmanager::networkmanager_list_adapters,
         networkmanager::networkmanager_read_state,
         networkmanager::networkmanager_capture_profile,
         networkmanager::networkmanager_compare,
-        networkmanager::networkmanager_validate,
         networkmanager::networkmanager_load_profiles,
         networkmanager::networkmanager_save_profiles,
-        networkmanager::networkmanager_profiles_path,
         networkmanager::networkmanager_open_profiles_dir,
         networkmanager::networkmanager_apply_profile,
         netscan::netscan_scan,
@@ -92,7 +103,6 @@ pub fn run() {
         observability::observability_pack_status,
         observability::observability_write_configs,
         observability::observability_health,
-        observability::observability_download_urls,
         observability::observability_install,
         observability::observability_start,
         observability::observability_stop,
@@ -100,10 +110,9 @@ pub fn run() {
         observability::observability_load_config,
         observability::observability_save_config,
         observability::timeseries_write,
+        startup::app_startup_status,
         mcp::mcp_start,
         mcp::mcp_call,
-        mcp::mcp_list_tools,
-        mcp::mcp_list_servers,
         mcp::mcp_stop,
         bacnet::bacnet_discover,
         bacnet::bacnet_read_objects,
@@ -113,6 +122,12 @@ pub fn run() {
         bacnet::bacnet_subscribe_cov,
         bacnet::bacnet_unsubscribe_cov,
     ]);
+
+    #[cfg(windows)]
+    let builder = builder.setup(|app| {
+        startup::start_startup_warmup(app.handle().clone());
+        Ok(())
+    });
 
     // Build, then run with an event loop so we can stop any spawned Observability
     // Pack services on exit — otherwise influxd/grafana/telegraf would be orphaned

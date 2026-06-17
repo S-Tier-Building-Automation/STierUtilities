@@ -34,6 +34,10 @@ function deviceTag(device) {
   return String(device.deviceInstance ?? device.instance ?? device.id ?? "?");
 }
 
+function compactTags(tags) {
+  return Object.fromEntries(Object.entries(tags).filter(([, v]) => v != null && String(v) !== ""));
+}
+
 const JOB_ID = "bacnet-historian";
 
 export function createHistorian({ bacnet, scheduler, timeseries, now = () => Date.now() }) {
@@ -49,8 +53,19 @@ export function createHistorian({ bacnet, scheduler, timeseries, now = () => Dat
 
   const api = {
     addPoint(point) {
+      const tag = String(deviceTag(point && point.device)).trim();
+      // Reject not just the "?" sentinel but other unusable identifiers
+      // (NaN deviceInstance, empty id) that would otherwise form a junk key.
+      if (!tag || tag === "?" || tag === "NaN" || tag === "undefined" || tag === "null") {
+        throw new Error("historian addPoint requires a resolvable device identifier (deviceInstance/instance/id)");
+      }
       const existing = points.find((p) => keyOf(p) === keyOf(point));
-      if (existing) return existing;
+      if (existing) {
+        // Merge configuration fields only; preserve accumulated read state.
+        const { lastValue, lastError, reads } = existing;
+        Object.assign(existing, point, { lastValue, lastError, reads });
+        return existing;
+      }
       const rec = { ...point, lastValue: null, lastError: null, reads: 0 };
       points.push(rec);
       return rec;
@@ -60,6 +75,10 @@ export function createHistorian({ bacnet, scheduler, timeseries, now = () => Dat
       const i = points.findIndex((p) => keyOf(p) === keyOf(point));
       if (i >= 0) points.splice(i, 1);
       return i >= 0;
+    },
+
+    clearPoints() {
+      points.splice(0, points.length);
     },
 
     points() {
@@ -82,7 +101,16 @@ export function createHistorian({ bacnet, scheduler, timeseries, now = () => Dat
             if (timeseries) {
               timeseries.write({
                 measurement: "bacnet_point",
-                tags: { device: deviceTag(p.device), object: `${p.objectType}:${p.instance}`, label: p.label || "" },
+                tags: compactTags({
+                  site: p.site,
+                  building: p.building,
+                  floor: p.floor,
+                  equip: p.equip,
+                  point: p.pointId,
+                  device: deviceTag(p.device),
+                  object: `${p.objectType}:${p.instance}`,
+                  label: p.label || "",
+                }),
                 fields: { present_value: value },
                 ts,
               });

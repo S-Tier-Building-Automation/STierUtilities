@@ -657,8 +657,14 @@ pub fn bvlc_decode(buf: &[u8]) -> Result<Bvlc, String> {
     }
     let function = buf[1];
     let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-    if length > buf.len() {
-        return Err(format!("BVLC length {length} exceeds datagram {}", buf.len()));
+    // The BVLC length field is the full BVLL message length. For a UDP datagram
+    // (one message per datagram) it must equal the received size exactly —
+    // anything else means trailing bytes or a truncated/over-declared frame.
+    if length != buf.len() {
+        return Err(format!(
+            "BVLC length {length} does not match datagram {}",
+            buf.len()
+        ));
     }
     let (payload_offset, origin) = if function == BVLC_FORWARDED_NPDU {
         if buf.len() < 10 {
@@ -1395,12 +1401,17 @@ pub fn decode_read_range_ack(payload: &[u8]) -> Result<ReadRangeAck, String> {
 
     // context 3: result-flags BIT STRING (first-item, last-item, more-items).
     let t = decode_tag(payload.get(at..).ok_or_else(err_short)?)?;
-    if !(t.context && !t.opening && !t.closing && t.number == 3) {
+    if !t.context || t.opening || t.closing || t.number != 3 {
         return Err("ReadRange-ACK: expected result-flags tag 3".into());
     }
     let content = payload
         .get(at + t.header_len..at + t.header_len + t.lvt as usize)
         .ok_or_else(err_short)?;
+    // A BIT STRING needs the unused-bits octet plus at least one data octet;
+    // otherwise a truncated result-flags would be read as all-false (wrong paging).
+    if content.len() < 2 {
+        return Err("ReadRange-ACK: result-flags bitstring is too short".into());
+    }
     let bit = |i: usize| content.get(1 + i / 8).map(|b| (b >> (7 - (i % 8))) & 1 == 1).unwrap_or(false);
     let (first_item, last_item, more_items) = (bit(0), bit(1), bit(2));
     at += t.header_len + t.lvt as usize;
@@ -1512,14 +1523,19 @@ fn decode_one_log_record(buf: &[u8]) -> Result<(LogRecord, usize), String> {
     if t.opening && t.context && t.number == 0 {
         at += t.header_len;
         let end = find_closing(buf.get(at..).ok_or_else(err_short)?, 0)?;
-        let inner = &buf[at..at + end];
+        let inner = buf.get(at..at + end).ok_or_else(err_short)?;
         let mut i = 0usize;
-        if let Ok((d, n)) = decode_application_value(&inner[i..]) {
-            i += n;
-            date = Some(d);
+        // Use `inner.get(i..)` rather than `&inner[i..]`: a value that over-reports
+        // its length can push `i` past `inner.len()`, which would panic on a raw
+        // slice. `get` yields None there and we simply stop reading the timestamp.
+        if let Some(rest) = inner.get(i..) {
+            if let Ok((d, n)) = decode_application_value(rest) {
+                i += n;
+                date = Some(d);
+            }
         }
-        if i < inner.len() {
-            if let Ok((tm, _)) = decode_application_value(&inner[i..]) {
+        if let Some(rest) = inner.get(i..) {
+            if let Ok((tm, _)) = decode_application_value(rest) {
                 time = Some(tm);
             }
         }

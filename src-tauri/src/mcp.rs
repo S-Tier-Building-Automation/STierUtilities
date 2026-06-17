@@ -26,6 +26,37 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const PROTOCOL_VERSION: &str = "2024-11-05";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Interpreters / script hosts that must never be launched as an MCP "server".
+/// A real MCP server is a dedicated executable; these are general-purpose script
+/// runners (classic LOLBins) that would turn "spawn this program" into "run
+/// arbitrary inline script", defeating the frontend's command-disclosing consent.
+/// Defense-in-depth: the frontend already shows and confirms the exact command,
+/// but the backend refuses these regardless of how the manifest reached it.
+const BLOCKED_MCP_COMMANDS: &[&str] = &[
+    "cmd", "powershell", "pwsh", "wscript", "cscript", "mshta", "rundll32", "regsvr32", "regsvcs",
+    "installutil", "msbuild", "msiexec", "bitsadmin", "certutil", "conhost",
+];
+
+/// Reject empty commands and known script-host interpreters before spawning.
+/// Matches on the bare program name (directory + extension stripped), case-insensitively.
+fn validate_mcp_command(command: &str) -> Result<(), String> {
+    let trimmed = command.trim();
+    if trimmed.is_empty() {
+        return Err("MCP command is empty".into());
+    }
+    let base = std::path::Path::new(trimmed)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(trimmed)
+        .to_ascii_lowercase();
+    if BLOCKED_MCP_COMMANDS.contains(&base.as_str()) {
+        return Err(format!(
+            "refusing to launch MCP server via '{base}': script-host interpreters are not allowed as MCP commands"
+        ));
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Pure message framing (unit-tested)
 // ---------------------------------------------------------------------------
@@ -54,7 +85,9 @@ pub fn classify_message(v: &Value) -> McpMessage {
     if let Some(id) = v.get("id").and_then(|x| x.as_i64()) {
         McpMessage::Response { id }
     } else if let Some(m) = v.get("method").and_then(|x| x.as_str()) {
-        McpMessage::Notification { method: m.to_string() }
+        McpMessage::Notification {
+            method: m.to_string(),
+        }
     } else {
         McpMessage::Other
     }
@@ -79,7 +112,11 @@ pub fn parse_tools(result: &Value) -> Vec<ToolInfo> {
                     let name = t.get("name").and_then(|n| n.as_str())?.to_string();
                     Some(ToolInfo {
                         name,
-                        description: t.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+                        description: t
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .unwrap_or("")
+                            .to_string(),
                         input_schema: t.get("inputSchema").cloned().unwrap_or(Value::Null),
                     })
                 })
@@ -108,7 +145,8 @@ struct ServerHandle {
     tools: Vec<ToolInfo>,
 }
 
-static SERVERS: Lazy<Mutex<HashMap<String, ServerHandle>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+static SERVERS: Lazy<Mutex<HashMap<String, ServerHandle>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
 
 fn spawn_reader(stdout: ChildStdout, pending: Arc<Mutex<HashMap<i64, mpsc::Sender<Value>>>>) {
     thread::spawn(move || {
@@ -158,12 +196,17 @@ fn request(handle: &ServerHandle, method: &str, params: Value) -> Result<Value, 
             }
         }
     }
-    let _guard = PendingGuard { pending: &handle.pending, id };
+    let _guard = PendingGuard {
+        pending: &handle.pending,
+        id,
+    };
 
     let line = build_request(id, method, &params);
     {
         let mut stdin = handle.stdin.lock().unwrap();
-        stdin.write_all(line.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
+        stdin
+            .write_all(line.as_bytes())
+            .map_err(|e| format!("write failed: {e}"))?;
         stdin.flush().map_err(|e| e.to_string())?;
     }
 
@@ -179,7 +222,9 @@ fn request(handle: &ServerHandle, method: &str, params: Value) -> Result<Value, 
 fn notify(handle: &ServerHandle, method: &str, params: Value) -> Result<(), String> {
     let line = build_notification(method, &params);
     let mut stdin = handle.stdin.lock().unwrap();
-    stdin.write_all(line.as_bytes()).map_err(|e| format!("write failed: {e}"))?;
+    stdin
+        .write_all(line.as_bytes())
+        .map_err(|e| format!("write failed: {e}"))?;
     stdin.flush().map_err(|e| e.to_string())
 }
 
@@ -201,7 +246,13 @@ fn with_stderr(err: String, buf: &Arc<Mutex<Vec<String>>>) -> String {
     if lines.is_empty() {
         return err;
     }
-    let tail: Vec<&str> = lines.iter().rev().take(8).rev().map(|s| s.as_str()).collect();
+    let tail: Vec<&str> = lines
+        .iter()
+        .rev()
+        .take(8)
+        .rev()
+        .map(|s| s.as_str())
+        .collect();
     format!("{err}\nserver stderr:\n{}", tail.join("\n"))
 }
 
@@ -232,8 +283,13 @@ fn mcp_start_blocking(
     env: Option<HashMap<String, String>>,
 ) -> Result<ServerInfo, String> {
     if let Some(h) = SERVERS.lock().unwrap().get(&id) {
-        return Ok(ServerInfo { tool_count: h.tools.len(), tools: h.tools.clone() });
+        return Ok(ServerInfo {
+            tool_count: h.tools.len(),
+            tools: h.tools.clone(),
+        });
     }
+
+    validate_mcp_command(&command)?;
 
     let mut cmd = Command::new(&command);
     cmd.args(&args)
@@ -246,7 +302,9 @@ fn mcp_start_blocking(
             cmd.env(k, v);
         }
     }
-    let mut child = cmd.spawn().map_err(|e| format!("failed to start MCP server '{id}': {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to start MCP server '{id}': {e}"))?;
     let stdin = child.stdin.take().ok_or("MCP server has no stdin")?;
     let stdout = child.stdout.take().ok_or("MCP server has no stdout")?;
 
@@ -299,7 +357,10 @@ fn mcp_start_blocking(
     handle.tools = tools.clone();
 
     SERVERS.lock().unwrap().insert(id, handle);
-    Ok(ServerInfo { tool_count: tools.len(), tools })
+    Ok(ServerInfo {
+        tool_count: tools.len(),
+        tools,
+    })
 }
 
 /// Call a tool on a running MCP server.
@@ -310,7 +371,10 @@ pub async fn mcp_call(id: String, name: String, arguments: Option<Value>) -> Res
     tauri::async_runtime::spawn_blocking(move || -> Result<Value, String> {
         let handle = {
             let servers = SERVERS.lock().unwrap();
-            servers.get(&id).cloned().ok_or_else(|| format!("MCP server '{id}' is not running"))?
+            servers
+                .get(&id)
+                .cloned()
+                .ok_or_else(|| format!("MCP server '{id}' is not running"))?
         };
         // Fail fast (and deregister) if the server process has died, instead of
         // blocking the full request timeout on a dead pipe.
@@ -323,19 +387,6 @@ pub async fn mcp_call(id: String, name: String, arguments: Option<Value>) -> Res
     })
     .await
     .map_err(|e| format!("mcp call task panicked: {e}"))?
-}
-
-/// List the tools a running MCP server advertised at startup.
-#[tauri::command]
-pub fn mcp_list_tools(id: String) -> Result<Vec<ToolInfo>, String> {
-    let servers = SERVERS.lock().unwrap();
-    servers.get(&id).map(|h| h.tools.clone()).ok_or_else(|| format!("MCP server '{id}' is not running"))
-}
-
-/// Ids of all running MCP servers.
-#[tauri::command]
-pub fn mcp_list_servers() -> Vec<String> {
-    SERVERS.lock().unwrap().keys().cloned().collect()
 }
 
 /// Stop and remove a running MCP server.
@@ -373,6 +424,19 @@ mod tests {
     }
 
     #[test]
+    fn validate_mcp_command_blocks_script_hosts_and_empties() {
+        assert!(validate_mcp_command("stier-niagara-mcp").is_ok());
+        assert!(validate_mcp_command(r"C:\plugins\my-mcp.exe").is_ok());
+        assert!(validate_mcp_command("").is_err());
+        assert!(validate_mcp_command("   ").is_err());
+        // Blocked regardless of path, case, or extension.
+        assert!(validate_mcp_command("powershell").is_err());
+        assert!(validate_mcp_command("PowerShell.exe").is_err());
+        assert!(validate_mcp_command(r"C:\Windows\System32\cmd.exe").is_err());
+        assert!(validate_mcp_command("mshta").is_err());
+    }
+
+    #[test]
     fn build_notification_has_no_id() {
         let line = build_notification("notifications/initialized", &json!({}));
         let v: Value = serde_json::from_str(line.trim()).unwrap();
@@ -382,12 +446,20 @@ mod tests {
 
     #[test]
     fn classify_distinguishes_responses_notifications_and_other() {
-        assert_eq!(classify_message(&json!({ "id": 3, "result": {} })), McpMessage::Response { id: 3 });
+        assert_eq!(
+            classify_message(&json!({ "id": 3, "result": {} })),
+            McpMessage::Response { id: 3 }
+        );
         assert_eq!(
             classify_message(&json!({ "method": "notifications/message" })),
-            McpMessage::Notification { method: "notifications/message".into() },
+            McpMessage::Notification {
+                method: "notifications/message".into()
+            },
         );
-        assert_eq!(classify_message(&json!({ "jsonrpc": "2.0" })), McpMessage::Other);
+        assert_eq!(
+            classify_message(&json!({ "jsonrpc": "2.0" })),
+            McpMessage::Other
+        );
     }
 
     #[test]

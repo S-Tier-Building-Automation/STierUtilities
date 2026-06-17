@@ -1,0 +1,36 @@
+{
+  "__comment": "Starter dashboard for Building Workspace. The workspace can generate a site/equipment-specific JSON variant from inventory.v1; this default is provisioned by the Observability Pack.",
+  "uid": "stier-building-workspace",
+  "title": "S-Tier Building Workspace",
+  "tags": ["s-tier", "building-workspace"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "BACnet present values",
+      "gridPos": { "x": 0, "y": 0, "w": 16, "h": 9 },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"utilities\") |> range(start: v.timeRangeStart) |> filter(fn: (r) => r._measurement == \"bacnet_point\") |> filter(fn: (r) => r._field == \"present_value\")"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Latest point values",
+      "gridPos": { "x": 16, "y": 0, "w": 8, "h": 9 },
+      "targets": [
+        {
+          "refId": "A",
+          "query": "from(bucket: \"utilities\") |> range(start: -1h) |> filter(fn: (r) => r._measurement == \"bacnet_point\") |> last()"
+        }
+      ]
+    }
+  ]
+}

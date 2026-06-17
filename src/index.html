@@ -23,29 +23,30 @@
           </svg>
         </button>
 
+        <nav class="app-header-nav" aria-label="Main navigation">
+          <button class="header-nav-item" data-view="library" type="button">
+            <span>📚</span> Library
+          </button>
+          <button class="header-nav-item" data-view="activity" type="button">
+            <span>📋</span> Activity
+          </button>
+        </nav>
+
         <div class="app-header-title" id="header-breadcrumb"></div>
 
         <div class="app-header-spacer" data-tauri-drag-region></div>
 
         <nav class="app-header-actions">
-          <button class="header-btn" id="header-files" type="button" title="Open the app data folder">
-            <span class="header-ico">📁</span><span>Files</span>
-          </button>
-          <button class="header-btn" id="header-docs" type="button" title="Open documentation on GitHub">
-            <span class="header-ico">📖</span><span>Docs</span>
-          </button>
-          <button class="header-btn" id="header-settings" type="button" title="Open Settings">
-            <span class="header-ico">⚙️</span><span>Settings</span>
-          </button>
           <button
             class="header-btn"
-            id="header-about"
+            id="header-account-menu"
             type="button"
-            title="About"
+            title="Account and app menu"
+            aria-label="Account and app menu"
             aria-haspopup="true"
             aria-expanded="false"
           >
-            <span class="header-ico">ℹ️</span><span>About</span>
+            <span class="header-ico">◎</span>
           </button>
         </nav>
 
@@ -83,27 +84,10 @@
             <li class="sidebar-empty">No favorites yet. Tap the star on a tool.</li>
           </ul>
         </div>
-
-        <div class="sidebar-spacer"></div>
-
-        <nav class="sidebar-nav">
-          <button class="sidebar-nav-item" data-view="library">
-            <span>📚</span> Library
-          </button>
-          <button class="sidebar-nav-item" data-view="settings">
-            <span>⚙️</span> Settings
-          </button>
-        </nav>
       </aside>
 
       <main class="content">
         <div id="view-root"></div>
-
-        <footer class="footer">
-          <span>by <a id="gh-link" href="#">stier1ba</a></span>
-          <span class="dot">&middot;</span>
-          <span id="version-label">v0.5.4</span>
-        </footer>
       </main>
     </div>
   </body>

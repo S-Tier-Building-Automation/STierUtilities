@@ -1,12 +1,30 @@
 import { TOOL_MANIFESTS } from "./tools/manifests.js";
 import { createKernel } from "./platform/host.js";
 import { buildFactories } from "./tools/capabilities.js";
+import { buildServiceCatalog } from "./platform/service-catalog.js";
 import { createTimeseries } from "./platform/services/timeseries.js";
 import { createScheduler } from "./platform/services/scheduler.js";
 import { createPackController } from "./platform/services/pack-controller.js";
 import { validateManifest } from "./platform/manifest.js";
 import { grantsFromInstall, approveInstall } from "./platform/mcp-loader.js";
 import { buildMcpFactories } from "./platform/services/mcp-client.js";
+import {
+  bwDeviceInboxCandidates,
+  bwDeviceKey,
+  bwFindModeledDeviceForBacnet,
+  bwImportPlanItems,
+  bwModelQueuedDevices,
+  bwQueueInboxDevices,
+  bwRemoveQueuedDevices,
+  exportCommissioningCsv,
+  exportCommissioningMarkdown,
+  generateBuildingDashboard,
+  historianPointFromEntity,
+  pointEntityFromBacnet,
+  runCommissioning,
+  suggestEquipmentName,
+} from "./tools/building-workspace.js";
+import { createUserStateInventoryStorage } from "./tools/inventory.js";
 
 const { invoke, convertFileSrc } = window.__TAURI__.core;
 const { listen } = window.__TAURI__.event;
@@ -31,6 +49,7 @@ const TOOL_RENDERERS = {
   bacnet: { renderStatusPill: bacStatusPill, renderPage: renderBacnetPage },
   observability: { renderStatusPill: obsStatusPill, renderPage: renderObservabilityPage },
   "bacnet-historian": { renderStatusPill: histStatusPill, renderPage: renderHistorianPage },
+  "building-workspace": { renderStatusPill: bwStatusPill, renderPage: renderBuildingWorkspacePage },
 };
 
 // Map a manifest to a catalog entry. First-party tools use their dedicated
@@ -57,12 +76,16 @@ function manifestToTool(m) {
 // the catalog derived from it. Both are rebuilt (rebuildCatalog) once user state
 // is loaded and after any install/remove. The kernel boots from ALL_MANIFESTS.
 let ALL_MANIFESTS = [...TOOL_MANIFESTS];
-let TOOLS = ALL_MANIFESTS.map(manifestToTool);
+// The nav-facing catalog excludes headless services (e.g. bacnet-core): they
+// provide capabilities and boot in the kernel — which reads ALL_MANIFESTS — but
+// have no page, so they must not show up as empty, unclickable tiles. A tool is
+// catalog-visible iff manifestToTool gave it a renderPage (apps + mcp tools).
+let TOOLS = ALL_MANIFESTS.map(manifestToTool).filter((t) => t.renderPage);
 
 function rebuildCatalog() {
   const installed = (userState.installedTools || []).filter((m) => validateManifest(m).valid);
   ALL_MANIFESTS = [...TOOL_MANIFESTS, ...installed];
-  TOOLS = ALL_MANIFESTS.map(manifestToTool);
+  TOOLS = ALL_MANIFESTS.map(manifestToTool).filter((t) => t.renderPage);
 }
 
 function toolById(id) { return TOOLS.find((t) => t.id === id); }
@@ -76,6 +99,8 @@ let platform = null;
 let telemetry = null;
 let scheduler = null;
 let pack = null;
+// Handle for the periodic pack.flush() interval, cleared on pagehide.
+let packFlushTimer = null;
 
 /** Scoped host for a tool's page, or null if the kernel isn't booted. */
 function platformHost(toolId) {
@@ -89,8 +114,43 @@ function platformHost(toolId) {
 
 const STORAGE_KEY = "microtools.user_state.v2";
 
+let authState = null;
+let authUserStateSaveTimer = null;
+let authFolderSyncTimer = null;
+let authSyncBusy = false;
+let authSyncMessage = "";
+const authDraft = {
+  name: "",
+  email: "",
+  orgName: "",
+  newOrgName: "",
+};
+
 const userState = loadUserState();
 rebuildCatalog(); // fold installed third-party (mcp) tools into the catalog
+
+function normalizeUserState(stored = {}) {
+  const persistedAt = Number(stored._persistedAt);
+  return {
+    _persistedAt: Number.isFinite(persistedAt) ? persistedAt : 0,
+    favorites: stored.favorites || {},
+    hidden: stored.hidden || {},
+    showHidden: Boolean(stored.showHidden),
+    libraryView: stored.libraryView === "list" ? "list" : "grid",
+    nmRailWidth: Number.isFinite(stored.nmRailWidth) ? stored.nmRailWidth : 240,
+    view: typeof stored.view === "string" ? stored.view : "library",
+    sidebarCollapsed: Boolean(stored.sidebarCollapsed),
+    activityToolFilter: typeof stored.activityToolFilter === "string" ? stored.activityToolFilter : "all",
+    activityKindFilter: typeof stored.activityKindFilter === "string" ? stored.activityKindFilter : "all",
+    historian: stored.historian || null,
+    buildingWorkspace: stored.buildingWorkspace || null,
+    inventory: stored.inventory || null,
+    inventoryLegacyMigrated: Boolean(stored.inventoryLegacyMigrated),
+    networkManager: stored.networkManager || null,
+    installedTools: Array.isArray(stored.installedTools) ? stored.installedTools : [],
+    installedGrants: stored.installedGrants || {},
+  };
+}
 
 function loadUserState() {
   let stored = {};
@@ -99,26 +159,270 @@ function loadUserState() {
   } catch (_) {
     stored = {};
   }
-  return {
-    favorites: stored.favorites || {},
-    hidden: stored.hidden || {},
-    showHidden: Boolean(stored.showHidden),
-    libraryView: stored.libraryView === "list" ? "list" : "grid",
-    nmRailWidth: Number.isFinite(stored.nmRailWidth) ? stored.nmRailWidth : 240,
-    view: typeof stored.view === "string" ? stored.view : "library",
-    sidebarCollapsed: Boolean(stored.sidebarCollapsed),
-    historian: stored.historian || null,
-    installedTools: Array.isArray(stored.installedTools) ? stored.installedTools : [],
-    installedGrants: stored.installedGrants || {},
-  };
+  return normalizeUserState(stored);
 }
 
 function saveUserState() {
+  userState._persistedAt = Date.now();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(userState));
+  queueAuthUserStateSave();
+}
+
+function createAppInventoryStorage() {
+  return createUserStateInventoryStorage({
+    getState: () => userState,
+    setInventory: (inventory, meta = {}) => {
+      userState.inventory = inventory;
+      if (meta.legacyMigrated) userState.inventoryLegacyMigrated = true;
+      saveUserState();
+    },
+  });
+}
+
+function queueAuthUserStateSave() {
+  if (!authState || !authState.session) return;
+  clearTimeout(authUserStateSaveTimer);
+  authUserStateSaveTimer = setTimeout(() => {
+    invoke("auth_save_user_state", { userId: null, orgId: null, state: userState })
+      .then(() => queueAuthFolderSync())
+      .catch((err) => console.warn("[auth] could not persist user state:", err));
+  }, 200);
+}
+
+function queueAuthFolderSync() {
+  if (!authState || !authState.session || !authState.syncFolder) return;
+  clearTimeout(authFolderSyncTimer);
+  authFolderSyncTimer = setTimeout(() => {
+    invoke("auth_sync_now")
+      .then((result) => {
+        if (result && result.state) authState = result.state;
+      })
+      .catch((err) => console.warn("[auth] background sync failed:", err));
+  }, 1800);
+}
+
+function flushUserStatePersistence() {
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(userState));
+  if (authUserStateSaveTimer) {
+    clearTimeout(authUserStateSaveTimer);
+    authUserStateSaveTimer = null;
+  }
+  if (authState && authState.session) {
+    invoke("auth_save_user_state", { userId: null, orgId: null, state: userState })
+      .catch((err) => console.warn("[auth] final state save failed:", err));
+  }
+}
+
+function activeAuthUser() {
+  if (!authState || !authState.session) return null;
+  return (authState.users || []).find((u) => u.id === authState.session.userId) || null;
+}
+
+function activeAuthOrg() {
+  if (!authState || !authState.session) return null;
+  return (authState.orgs || []).find((o) => o.id === authState.session.orgId) || null;
+}
+
+function hasMeaningfulSavedState(value) {
+  return value && typeof value === "object" && Object.keys(value).length > 0;
+}
+
+async function authBootstrapUserState() {
+  try {
+    authState = await invoke("auth_get_state");
+    if (authState && authState.syncFolder) {
+      try {
+        const result = await invoke("auth_sync_now");
+        if (result && result.state) {
+          authState = result.state;
+          authSyncMessage = result.message || "";
+        }
+      } catch (err) {
+        authSyncMessage = `Startup sync failed: ${err}`;
+        console.warn("[auth] startup sync failed:", err);
+      }
+    }
+    if (!authState || !authState.session) return;
+    await authLoadActiveUserState({ migrateIfEmpty: true });
+  } catch (err) {
+    console.warn("[auth] native state unavailable; using browser-local preferences:", err);
+  }
+}
+
+async function authLoadActiveUserState({ migrateIfEmpty = true, preferNative = false } = {}) {
+  if (!authState || !authState.session) return;
+  const saved = await invoke("auth_load_user_state", { userId: null, orgId: null });
+  if (hasMeaningfulSavedState(saved)) {
+    const nativeState = normalizeUserState(saved);
+    if (!preferNative && (userState._persistedAt || 0) > (nativeState._persistedAt || 0)) {
+      await invoke("auth_save_user_state", { userId: null, orgId: null, state: userState });
+      queueAuthFolderSync();
+    } else {
+      Object.assign(userState, nativeState);
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(userState));
+    }
+    rebuildCatalog();
+    applyScopedUserState();
+  } else if (migrateIfEmpty) {
+    await invoke("auth_save_user_state", { userId: null, orgId: null, state: userState });
+    applyScopedUserState();
+  } else {
+    Object.assign(userState, normalizeUserState({}));
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(userState));
+    applyScopedUserState();
+  }
+}
+
+async function authCreateLocalAccount() {
+  const name = authDraft.name.trim();
+  const email = authDraft.email.trim();
+  const orgName = authDraft.orgName.trim();
+  try {
+    authState = await invoke("auth_create_local_session", {
+      name,
+      email,
+      orgName,
+    });
+    await invoke("auth_save_user_state", { userId: null, orgId: null, state: userState });
+    queueAuthFolderSync();
+    renderAll();
+  } catch (err) {
+    alert(`Could not create local account: ${err}`);
+  }
+}
+
+async function authSwitchOrg(orgId) {
+  if (!orgId || !authState || authState.session?.orgId === orgId) return;
+  try {
+    await invoke("auth_save_user_state", { userId: null, orgId: null, state: userState });
+    authState = await invoke("auth_switch_org", { orgId });
+    await authLoadActiveUserState({ migrateIfEmpty: false, preferNative: true });
+    renderAll();
+  } catch (err) {
+    alert(`Could not switch organization: ${err}`);
+  }
+}
+
+async function authCreateOrg() {
+  const orgName = authDraft.newOrgName.trim();
+  if (!orgName) return;
+  try {
+    await invoke("auth_save_user_state", { userId: null, orgId: null, state: userState });
+    authState = await invoke("auth_create_org", { orgName });
+    authDraft.newOrgName = "";
+    await invoke("auth_save_user_state", { userId: null, orgId: null, state: userState });
+    queueAuthFolderSync();
+    renderAll();
+  } catch (err) {
+    alert(`Could not create organization: ${err}`);
+  }
+}
+
+async function authSignOut() {
+  try {
+    authState = await invoke("auth_sign_out");
+    renderAll();
+  } catch (err) {
+    alert(`Could not sign out: ${err}`);
+  }
+}
+
+async function authExportSnapshot() {
+  try {
+    const snapshot = await invoke("auth_export_snapshot");
+    const text = JSON.stringify(snapshot, null, 2);
+    await navigator.clipboard.writeText(text);
+    alert("Account snapshot copied to clipboard.");
+  } catch (err) {
+    alert(`Could not export account snapshot: ${err}`);
+  }
+}
+
+async function authPickSyncFolder() {
+  try {
+    authSyncBusy = true;
+    authSyncMessage = "Opening folder picker...";
+    renderAll();
+    const picked = await invoke("auth_pick_sync_folder");
+    if (!picked) {
+      authSyncBusy = false;
+      authSyncMessage = "";
+      renderAll();
+      return;
+    }
+    authState = picked;
+    await authSyncNow({ quiet: true });
+  } catch (err) {
+    authSyncBusy = false;
+    alert(`Could not connect sync folder: ${err}`);
+    renderAll();
+  }
+}
+
+async function authClearSyncFolder() {
+  try {
+    authState = await invoke("auth_clear_sync_folder");
+    authSyncMessage = "";
+    renderAll();
+  } catch (err) {
+    alert(`Could not clear sync folder: ${err}`);
+  }
+}
+
+async function authSyncNow({ quiet = false } = {}) {
+  try {
+    if (!quiet) {
+      authSyncBusy = true;
+      authSyncMessage = "Syncing...";
+      renderAll();
+    }
+    if (authState && authState.session) {
+      await invoke("auth_save_user_state", { userId: null, orgId: null, state: userState });
+    }
+    const result = await invoke("auth_sync_now");
+    authState = result.state;
+    authSyncMessage = result.message || "Sync complete.";
+    await authLoadActiveUserState({ migrateIfEmpty: true, preferNative: true });
+  } catch (err) {
+    authSyncMessage = `Sync failed: ${err}`;
+    if (!quiet) alert(authSyncMessage);
+  } finally {
+    authSyncBusy = false;
+    renderAll();
+  }
+}
+
+async function resetPreferences() {
+  if (!confirm("Reset all preferences (favorites, hidden tools, view)?")) return;
+  localStorage.removeItem(STORAGE_KEY);
+  userState.favorites = {};
+  userState.hidden = {};
+  userState.showHidden = false;
+  userState.libraryView = "grid";
+  userState.view = "library";
+  userState.sidebarCollapsed = false;
+  try {
+    if (authState && authState.session) {
+      await invoke("auth_save_user_state", { userId: null, orgId: null, state: userState });
+      queueAuthFolderSync();
+    }
+  } catch (err) {
+    console.warn("[auth] could not reset scoped preferences:", err);
+  }
+  saveUserState();
+  applySidebarCollapsed();
+  renderAll();
 }
 
 function isFavorite(id) { return Boolean(userState.favorites[id]); }
-function isHidden(id) { return Boolean(userState.hidden[id]); }
+function isDefaultHidden(id) {
+  const manifest = ALL_MANIFESTS.find((m) => m.id === id);
+  return Boolean(manifest?.ui?.defaultHidden);
+}
+function isHidden(id) {
+  if (Object.prototype.hasOwnProperty.call(userState.hidden, id)) return Boolean(userState.hidden[id]);
+  return isDefaultHidden(id);
+}
 
 function setFavorite(id, on) {
   if (on) userState.favorites[id] = true;
@@ -134,7 +438,8 @@ function setHidden(id, on) {
     // a "page for a hidden tool" state.
     if (currentPluginId() === id) userState.view = "library";
   } else {
-    delete userState.hidden[id];
+    if (isDefaultHidden(id)) userState.hidden[id] = false;
+    else delete userState.hidden[id];
   }
   saveUserState();
   renderAll();
@@ -175,7 +480,7 @@ function setSidebarCollapsed(on) {
 }
 
 function currentView() {
-  if (userState.view === "library" || userState.view === "settings") {
+  if (userState.view === "library" || userState.view === "settings" || userState.view === "services" || userState.view === "activity" || userState.view === "account") {
     return userState.view;
   }
   if (typeof userState.view === "string" && userState.view.startsWith("plugin:")) {
@@ -190,6 +495,14 @@ function currentPluginId() {
 }
 
 function pluginView(id) { return `plugin:${id}`; }
+
+function applyScopedUserState() {
+  rebuildCatalog();
+  bwRestoreState();
+  applySidebarCollapsed();
+  inventoryInstance()?.reload?.();
+  histRestore({ replace: true });
+}
 
 // ============================================================================
 // Live tool state (ClipboardTyper)
@@ -207,7 +520,7 @@ function ctClonePending(settings) {
 let ctPending = ctClonePending(ct.settings);
 
 // ============================================================================
-// Per-plugin activity log
+// Centralized activity log
 // ============================================================================
 
 const pluginLogs = new Map(); // toolId -> array (newest first), max 100
@@ -220,16 +533,33 @@ function logTo(toolId, msg, kind = "info") {
   }
   arr.unshift({ time: new Date(), msg, kind });
   while (arr.length > 100) arr.pop();
-  // Hot-reload the log section if we're currently on that plugin page.
-  if (currentPluginId() === toolId) {
-    const node = document.getElementById("plugin-log-list");
-    if (node) node.replaceChildren(...arr.map(renderLogEntry));
-  }
+  if (currentView() === "activity") renderActivityPage();
 }
 
-function renderLogEntry(entry) {
-  return el("li", { class: `log-${entry.kind}` },
+function activityToolLabel(toolId) {
+  const tool = toolById(toolId) || ALL_MANIFESTS.map(manifestToTool).find((t) => t.id === toolId);
+  return tool ? `${tool.emoji || ""} ${tool.name}`.trim() : toolId;
+}
+
+function activityEntries() {
+  return [...pluginLogs.entries()]
+    .flatMap(([toolId, entries]) => entries.map((entry) => ({ ...entry, toolId, toolLabel: activityToolLabel(toolId) })))
+    .sort((a, b) => b.time - a.time);
+}
+
+function filteredActivityEntries() {
+  const toolFilter = userState.activityToolFilter || "all";
+  const kindFilter = userState.activityKindFilter || "all";
+  return activityEntries().filter((entry) =>
+    (toolFilter === "all" || entry.toolId === toolFilter) &&
+    (kindFilter === "all" || entry.kind === kindFilter));
+}
+
+function renderActivityLogEntry(entry) {
+  return el("li", { class: `log-${entry.kind} activity-log-row` },
     el("span", { class: "log-time" }, entry.time.toLocaleTimeString()),
+    el("span", { class: "activity-source" }, entry.toolLabel),
+    el("span", { class: `activity-kind activity-kind-${entry.kind}` }, entry.kind),
     el("span", { class: "log-msg" }, entry.msg),
   );
 }
@@ -263,7 +593,7 @@ async function openExternal(url) {
 }
 
 // ============================================================================
-// App header (sidebar toggle + Files / Docs / Settings / About)
+// App header (sidebar toggle + account menu)
 // ============================================================================
 
 const REPO_URL = "https://github.com/S-Tier-Building-Automation/STierUtilities";
@@ -277,57 +607,113 @@ async function openAppDataDir() {
   }
 }
 
-// --- About popover ---
+// --- Account popover ---
 
-function aboutMenuEl() { return document.getElementById("about-menu"); }
-function aboutBtnEl() { return document.getElementById("header-about"); }
+function accountMenuEl() { return document.getElementById("account-menu"); }
+function accountMenuBtnEl() { return document.getElementById("header-account-menu"); }
 
-function buildAboutMenu() {
-  return el("div", { class: "header-menu", id: "about-menu", role: "menu", hidden: true },
-    el("h4", {}, "S-Tier Utilities"),
-    el("p", { class: "menu-ver" }, `Version ${APP_VERSION}`),
-    el("button", {
-      class: "btn btn-primary",
-      onclick: () => { closeAboutMenu(); checkForUpdates({ manual: true }); },
-    }, "Check for updates"),
-    el("a", {
-      class: "menu-link", href: "#",
-      onclick: (e) => { e.preventDefault(); closeAboutMenu(); openExternal(REPO_URL); },
-    }, "GitHub repository"),
+function menuButton(label, { icon = "", detail = "", cls = "", onclick } = {}) {
+  return el("button", { class: `menu-row ${cls}`.trim(), role: "menuitem", onclick },
+    el("span", { class: "menu-row-icon" }, icon),
+    el("span", { class: "menu-row-label" }, label),
+    detail && el("span", { class: "menu-row-detail" }, detail),
   );
 }
 
-function onAboutOutside(e) {
-  const m = aboutMenuEl();
-  if (!m || m.hidden) return;
-  if (m.contains(e.target) || aboutBtnEl()?.contains(e.target)) return;
-  closeAboutMenu();
+function buildAccountMenu() {
+  const progressBar = el("div", { class: "progress-bar", id: "update-progress" },
+    el("div", { class: "progress-fill", id: "update-progress-fill" }));
+  progressBar.style.display = "none";
+  const user = activeAuthUser();
+  const org = activeAuthOrg();
+  const signedIn = Boolean(authState && authState.session);
+  const syncLabel = authState?.syncFolder
+    ? (authState.lastSyncedAt ? `Synced ${new Date(authState.lastSyncedAt * 1000).toLocaleString()}` : "Sync folder connected")
+    : "Local profile";
+  return el("div", { class: "header-menu account-menu", id: "account-menu", role: "menu", hidden: true },
+    el("div", { class: "menu-account" },
+      el("div", { class: "menu-account-icon" }, signedIn ? "◎" : "○"),
+      el("div", { class: "menu-account-copy" },
+        el("div", { class: "menu-account-primary" }, signedIn ? (user?.email || user?.name || "Local account") : "No profile connected"),
+        el("div", { class: "menu-account-secondary" }, signedIn ? (org?.name || "Personal account") : "Create or connect a local profile"),
+      ),
+    ),
+    el("div", { class: "menu-separator" }),
+    menuButton("Profile & sync", {
+      icon: "◎",
+      detail: syncLabel,
+      onclick: () => { closeAccountMenu(); setView("account"); },
+    }),
+    menuButton("Settings", {
+      icon: "⚙",
+      detail: "Preferences",
+      onclick: () => { closeAccountMenu(); setView("settings"); },
+    }),
+    menuButton("Services & Capabilities", {
+      icon: "◇",
+      detail: "Developer API",
+      onclick: () => { closeAccountMenu(); setView("services"); },
+    }),
+    el("div", { class: "menu-separator" }),
+    menuButton("Open app data folder", {
+      icon: "📁",
+      onclick: () => { closeAccountMenu(); openAppDataDir(); },
+    }),
+    el("div", { class: "menu-separator" }),
+    el("div", { class: "menu-app-update" },
+      el("span", { class: "menu-app-version", id: "update-status" }, `S-Tier Utilities Ver. ${APP_VERSION}`),
+      el("button", {
+        class: "menu-inline-btn",
+        type: "button",
+        onclick: () => { checkForUpdates({ manual: true }); },
+      }, "Check for update"),
+    ),
+    progressBar,
+    menuButton("GitHub repository", {
+      icon: "↗",
+      onclick: () => { closeAccountMenu(); openExternal(REPO_URL); },
+    }),
+    signedIn && menuButton("Sign out", {
+      icon: "↩",
+      cls: "menu-row-danger",
+      onclick: () => { closeAccountMenu(); authSignOut(); },
+    }),
+  );
 }
-function onAboutKey(e) { if (e.key === "Escape") closeAboutMenu(); }
 
-function openAboutMenu() {
-  const m = aboutMenuEl();
+function onAccountMenuOutside(e) {
+  const m = accountMenuEl();
+  if (!m || m.hidden) return;
+  if (m.contains(e.target) || accountMenuBtnEl()?.contains(e.target)) return;
+  closeAccountMenu();
+}
+function onAccountMenuKey(e) { if (e.key === "Escape") closeAccountMenu(); }
+
+function openAccountMenu() {
+  const old = accountMenuEl();
+  if (old) old.replaceWith(buildAccountMenu());
+  const m = accountMenuEl();
   if (!m) return;
   m.hidden = false;
-  aboutBtnEl()?.setAttribute("aria-expanded", "true");
+  accountMenuBtnEl()?.setAttribute("aria-expanded", "true");
   // Defer so the click that opened the menu doesn't immediately close it.
   setTimeout(() => {
-    document.addEventListener("click", onAboutOutside, true);
-    document.addEventListener("keydown", onAboutKey);
+    document.addEventListener("click", onAccountMenuOutside, true);
+    document.addEventListener("keydown", onAccountMenuKey);
   }, 0);
 }
-function closeAboutMenu() {
-  const m = aboutMenuEl();
+function closeAccountMenu() {
+  const m = accountMenuEl();
   if (!m || m.hidden) return;
   m.hidden = true;
-  aboutBtnEl()?.setAttribute("aria-expanded", "false");
-  document.removeEventListener("click", onAboutOutside, true);
-  document.removeEventListener("keydown", onAboutKey);
+  accountMenuBtnEl()?.setAttribute("aria-expanded", "false");
+  document.removeEventListener("click", onAccountMenuOutside, true);
+  document.removeEventListener("keydown", onAccountMenuKey);
 }
-function toggleAboutMenu() {
-  const m = aboutMenuEl();
-  if (m && m.hidden) openAboutMenu();
-  else closeAboutMenu();
+function toggleAccountMenu() {
+  const m = accountMenuEl();
+  if (m && m.hidden) openAccountMenu();
+  else closeAccountMenu();
 }
 
 // --- Generic modal (used for the per-tool "About" pop-out) ---
@@ -907,12 +1293,11 @@ function renderHeicMovPage() {
       el("div", { class: "hm-convert-options" },
         el("label", { class: "hm-option" }, "Image format",
           el("select", {
-            value: hm.imageFormat,
             disabled: hm.busy ? "disabled" : undefined,
             onchange: (e) => { hm.imageFormat = e.target.value; },
           },
-            el("option", { value: "jpeg" }, "JPEG"),
-            el("option", { value: "png" }, "PNG"),
+            el("option", { value: "jpeg", selected: hm.imageFormat === "jpeg" ? "selected" : undefined }, "JPEG"),
+            el("option", { value: "png", selected: hm.imageFormat === "png" ? "selected" : undefined }, "PNG"),
           ),
         ),
         el("label", { class: "checkbox-row hm-option" },
@@ -949,19 +1334,29 @@ function renderHeicMovPage() {
 // Network Manager (status pill + page)
 // ============================================================================
 
+const nmCachedSnapshot = userState.networkManager?.adapterSnapshot || null;
+const nmCachedAdapters = Array.isArray(nmCachedSnapshot?.adapters) ? nmCachedSnapshot.adapters : [];
+const nmCachedStateByAdapter = nmCachedSnapshot?.stateByAdapter && typeof nmCachedSnapshot.stateByAdapter === "object"
+  ? nmCachedSnapshot.stateByAdapter
+  : {};
+const nmCachedSelectedAdapter = typeof userState.networkManager?.selectedAdapter === "string" ? userState.networkManager.selectedAdapter : "";
+
 let nm = {
-  adapters: [],            // NetworkAdapterInfo[]
+  adapters: nmCachedAdapters, // NetworkAdapterInfo[]
   profiles: [],            // NetworkProfile[]
-  selectedId: null,        // selected profile id (mutually exclusive with selectedAdapter)
-  selectedAdapter: null,   // selected adapter name, when inspecting a live NIC
-  stateByAdapter: {},      // adapterName -> AdapterNetworkState
+  selectedId: nmCachedSelectedAdapter ? null : (typeof userState.networkManager?.selectedProfileId === "string" ? userState.networkManager.selectedProfileId : null), // selected profile id (mutually exclusive with selectedAdapter)
+  selectedAdapter: nmCachedSelectedAdapter || null, // selected adapter name, when inspecting a live NIC
+  stateByAdapter: nmCachedStateByAdapter, // adapterName -> AdapterNetworkState
   matchById: {},           // profileId -> ProfileMatchResult
   busy: false,
   busyLabel: "",
-  loaded: false,           // adapters/state read at least once this session
-  tab: "configure",        // "configure" (merged adapters+profiles) | "scan"
+  loaded: nmCachedAdapters.length > 0, // adapters/state read at least once or hydrated from cache
+  adapterSnapshotStale: nmCachedAdapters.length > 0,
+  adapterSnapshotAt: typeof nmCachedSnapshot?.readAt === "string" ? nmCachedSnapshot.readAt : "",
+  autoRefreshAttempted: false,
+  tab: userState.networkManager?.tab === "scan" ? "scan" : "configure", // "configure" (merged adapters+profiles) | "scan"
   scan: {
-    adapterName: "",       // adapter whose subnet we sweep
+    adapterName: typeof userState.networkManager?.scanAdapterName === "string" ? userState.networkManager.scanAdapterName : "", // adapter whose subnet we sweep
     scanning: false,
     scanned: 0,
     total: 0,
@@ -1048,10 +1443,42 @@ async function nmSaveNow() {
   }
 }
 
+function nmSaveUiState() {
+  userState.networkManager = {
+    ...(userState.networkManager || {}),
+    selectedAdapter: nm.selectedAdapter || "",
+    selectedProfileId: nm.selectedId || "",
+    tab: nm.tab,
+    scanAdapterName: nm.scan.adapterName || "",
+    adapterSnapshot: userState.networkManager?.adapterSnapshot || null,
+  };
+  saveUserState();
+}
+
+function nmSaveAdapterSnapshot() {
+  const readAt = new Date().toISOString();
+  nm.adapterSnapshotAt = readAt;
+  userState.networkManager = {
+    ...(userState.networkManager || {}),
+    selectedAdapter: nm.selectedAdapter || "",
+    selectedProfileId: nm.selectedId || "",
+    tab: nm.tab,
+    scanAdapterName: nm.scan.adapterName || "",
+    adapterSnapshot: {
+      readAt,
+      adapters: nm.adapters,
+      stateByAdapter: nm.stateByAdapter,
+    },
+  };
+  saveUserState();
+}
+
 async function nmLoadProfiles() {
   try {
     nm.profiles = await invoke("networkmanager_load_profiles");
-    if (nm.profiles.length && !nm.selectedId) nm.selectedId = nm.profiles[0].id;
+    if (nm.selectedId && !nm.profiles.some((p) => p.id === nm.selectedId)) nm.selectedId = null;
+    if (nm.profiles.length && !nm.selectedId && !nm.selectedAdapter) nm.selectedId = nm.profiles[0].id;
+    nmSaveUiState();
   } catch (err) {
     logTo("networkmanager", `Could not load profiles: ${err}`, "error");
   }
@@ -1078,9 +1505,25 @@ async function nmRecomputeMatch(p) {
 
 async function nmRecomputeAll() { await Promise.all(nm.profiles.map(nmRecomputeMatch)); }
 
-async function nmRefresh() {
+async function nmApplyStartupSnapshot(snapshot) {
+  if (!snapshot || !Array.isArray(snapshot.adapters)) return false;
+  nm.adapters = snapshot.adapters;
+  nm.stateByAdapter = snapshot.stateByAdapter && typeof snapshot.stateByAdapter === "object"
+    ? snapshot.stateByAdapter
+    : {};
+  nm.loaded = true;
+  nm.adapterSnapshotStale = false;
+  nm.autoRefreshAttempted = true;
+  await nmRecomputeAll();
+  nmSaveAdapterSnapshot();
+  logTo("networkmanager", `Loaded ${nm.adapters.length} adapter${nm.adapters.length === 1 ? "" : "s"} from native startup warmup.`, "ok");
+  return true;
+}
+
+async function nmRefresh({ automatic = false } = {}) {
+  nm.autoRefreshAttempted = true;
   nm.busy = true;
-  nm.busyLabel = "Reading adapters";
+  nm.busyLabel = nm.loaded ? "Refreshing adapters" : "Reading adapters";
   renderAll();
   try {
     nm.adapters = await invoke("networkmanager_list_adapters");
@@ -1100,9 +1543,12 @@ async function nmRefresh() {
     );
     await nmRecomputeAll();
     nm.loaded = true;
+    nm.adapterSnapshotStale = false;
+    nmSaveAdapterSnapshot();
     logTo("networkmanager", `Read ${nm.adapters.length} adapter${nm.adapters.length === 1 ? "" : "s"}.`, "ok");
   } catch (err) {
-    logTo("networkmanager", `Refresh failed: ${err}`, "error");
+    if (!automatic || !nm.loaded) logTo("networkmanager", `Refresh failed: ${err}`, "error");
+    else logTo("networkmanager", `Background adapter refresh failed: ${err}`, "warn");
   } finally {
     nm.busy = false;
     nm.busyLabel = "";
@@ -1112,6 +1558,7 @@ async function nmRefresh() {
 
 function nmEnsureLoaded() {
   if (!nm.loaded && !nm.busy) nmRefresh();
+  else if (nm.adapterSnapshotStale && !nm.busy && !nm.autoRefreshAttempted) nmRefresh({ automatic: true });
 }
 
 function nmDefaultAdapter() {
@@ -1130,6 +1577,7 @@ async function nmNew() {
   nm.selectedAdapter = null;
   await nmRecomputeMatch(p);
   nmSaveSoon();
+  nmSaveUiState();
   logTo("networkmanager", `Created "${p.name}".`, "info");
   renderAll();
 }
@@ -1143,6 +1591,7 @@ async function nmDuplicate() {
   nm.selectedAdapter = null;
   await nmRecomputeMatch(p);
   nmSaveSoon();
+  nmSaveUiState();
   renderAll();
 }
 
@@ -1156,6 +1605,7 @@ function nmDelete() {
   const next = nm.profiles[idx] || nm.profiles[idx - 1] || null;
   nm.selectedId = next?.id || null;
   nmSaveSoon();
+  nmSaveUiState();
   logTo("networkmanager", `Deleted "${sel.name}".`, "warn");
   renderAll();
 }
@@ -1164,6 +1614,7 @@ function nmSelect(id) {
   if (nm.selectedId === id && !nm.selectedAdapter) return;
   nm.selectedId = id;
   nm.selectedAdapter = null;
+  nmSaveUiState();
   renderAll();
 }
 
@@ -1173,6 +1624,7 @@ function nmSelectAdapter(name) {
   if (nm.selectedAdapter === name) return;
   nm.selectedAdapter = name;
   nm.selectedId = null;
+  nmSaveUiState();
   renderAll();
 }
 
@@ -1536,12 +1988,12 @@ function nmScanInitListeners() {
     const h = e.payload;
     if (!nm.scan.hosts.some((x) => x.ip === h.ip)) nm.scan.hosts.push(h);
     nmScanRenderLive();
-  });
+  }).catch((e) => console.warn("listen netscan:host failed:", e));
   listen("netscan:progress", (e) => {
     nm.scan.scanned = e.payload.scanned;
     nm.scan.total = e.payload.total;
     nmScanRenderLive();
-  });
+  }).catch((e) => console.warn("listen netscan:progress failed:", e));
   listen("netscan:done", (e) => {
     // Merge rather than replace: streamed `netscan:host` rows may already carry
     // hostnames that arrived first; keep them.
@@ -1551,12 +2003,12 @@ function nmScanInitListeners() {
     nm.scan.done = true;
     nm.scan.scanning = false;
     renderAll();
-  });
+  }).catch((e) => console.warn("listen netscan:done failed:", e));
   listen("netscan:hostnames", (e) => {
     const map = new Map((e.payload || []).map((x) => [x.ip, x.hostname]));
     for (const h of nm.scan.hosts) { const n = map.get(h.ip); if (n) h.hostname = n; }
     nmScanRenderLive();
-  });
+  }).catch((e) => console.warn("listen netscan:hostnames failed:", e));
 }
 
 async function nmScanStart() {
@@ -1710,7 +2162,7 @@ function nmScanResultRows() {
     el("td", { class: "nm-scan-ip" }, h.ip),
     el("td", {}, h.hostname || el("span", { class: "muted" }, "—")),
     el("td", { class: "nm-scan-mac" }, h.mac || el("span", { class: "muted" }, "—")),
-    el("td", { class: "nm-scan-rtt" }, `${h.rttMs} ms`),
+    el("td", { class: "nm-scan-rtt" }, h.rttMs != null ? `${h.rttMs} ms` : "—"),
   ));
 }
 
@@ -1758,7 +2210,7 @@ function nmScanTab() {
   const picker = el("select", {
     class: "nm-input",
     disabled: nm.scan.scanning ? "disabled" : undefined,
-    onchange: (e) => { nm.scan.adapterName = e.target.value; renderAll(); },
+    onchange: (e) => { nm.scan.adapterName = e.target.value; nmSaveUiState(); renderAll(); },
   },
     ...candidates.map((a) => el("option", {
       value: a.name,
@@ -1796,12 +2248,12 @@ function nmScanTab() {
 
   const showFilter = nm.scan.scanning || nm.scan.done || nm.scan.hosts.length > 0;
 
-  return el("div", { class: "plugin-controls" },
+  return el("div", { class: "plugin-controls plugin-controls-fill" },
     head,
-    el("section", { class: "plugin-section" },
+    el("section", { class: "plugin-section plugin-section-fill" },
       showFilter ? nmScanFilterBar() : null,
       // Static scroll wrapper; refresh swaps the inner <table> in place (no re-nesting).
-      el("div", { class: "table-scroll" }, table),
+      el("div", { class: "table-scroll table-scroll-fill" }, table),
     ),
   );
 }
@@ -1809,12 +2261,25 @@ function nmScanTab() {
 function nmTabBar() {
   const tab = (id, label) => el("button", {
     class: `nm-tab ${nm.tab === id ? "nm-tab-active" : ""}`,
-    onclick: () => { nm.tab = id; renderAll(); },
+    onclick: () => { nm.tab = id; nmSaveUiState(); renderAll(); },
   }, label);
   return el("div", { class: "nm-tabs" },
     tab("configure", "Configure"),
     tab("scan", "Scan"),
   );
+}
+
+function nmAdapterCacheNotice() {
+  if (!nm.loaded || !nm.adapterSnapshotStale) return null;
+  const readAt = nm.adapterSnapshotAt ? new Date(nm.adapterSnapshotAt) : null;
+  const stamp = readAt && !Number.isNaN(readAt.getTime()) ? readAt.toLocaleString() : "a previous session";
+  return el("div", { class: "nm-cache-notice" },
+    el("span", {}, `Showing cached adapter data from ${stamp}.`),
+    el("button", {
+      class: "btn-ghost",
+      disabled: nm.busy ? "disabled" : undefined,
+      onclick: () => nmRefresh(),
+    }, nm.busy ? "Refreshing..." : "Refresh now"));
 }
 
 // ---- resizable rail (the splitter between the rail and the config panel) ----
@@ -2001,7 +2466,7 @@ function nmConfigureTab() {
   const md = el("div", { id: "nm-config-md", class: "nm-config-md" }, rail, splitter, panel);
   md.style.gridTemplateColumns = `${nmRailWidthPx()}px 8px minmax(0, 1fr)`;
 
-  return el("div", { class: "plugin-controls" },
+  return el("div", { class: "plugin-controls plugin-controls-fill" },
     el("div", { class: "nm-config-head" },
       el("button", {
         class: "btn-ghost",
@@ -2016,19 +2481,23 @@ function nmConfigureTab() {
 function renderNetworkManagerPage() {
   nmEnsureLoaded();
   const body = nm.tab === "scan" ? nmScanTab() : nmConfigureTab();
-  return el("div", { class: "plugin-controls nm-root" },
+  return el("div", { class: "plugin-controls plugin-controls-fill nm-root" },
     nmTabBar(),
+    nmAdapterCacheNotice(),
     body,
   );
 }
 
 
 // ============================================================================
-// BACnet Explorer (status pill + page)
+// Advanced BACnet Inspector (status pill + page)
 // ============================================================================
 
 let bac = {
   discovering: false,
+  discoveryStartedAt: 0,
+  discoveryDurationMs: 5000,
+  discoveryTimer: null,
   devices: [],            // BacnetDevice[] from the backend (key, address, instance, …)
   deviceFilter: "",       // free-text over instance/name/address/vendor/model
   deviceSortKey: "instance", // "instance" | "name" | "address" | "vendor" | "model"
@@ -2048,6 +2517,8 @@ let bac = {
   lowLimit: "",
   highLimit: "",
   listenersReady: false,
+  discoveryRan: false,
+  lastDiscoveryCount: null,
 };
 
 function bacStatusPill() {
@@ -2077,6 +2548,66 @@ function bacDeviceLabel(d) {
   return `${d.name || `device ${d.instance}`} (${d.instance})${route}`;
 }
 
+function bacDiscoveryProgressState() {
+  if (!bac.discovering || !bac.discoveryStartedAt) return null;
+  const elapsed = Math.max(0, Date.now() - bac.discoveryStartedAt);
+  const duration = Math.max(500, bac.discoveryDurationMs || 5000);
+  const listening = elapsed < duration;
+  const pct = listening ? Math.min(92, Math.round((elapsed / duration) * 92)) : 96;
+  const remainingMs = Math.max(0, duration - elapsed);
+  return {
+    pct,
+    finalizing: !listening,
+    phase: listening ? "Listening for I-Am replies" : "Finalizing device details",
+    remainingText: listening ? `~${Math.max(1, Math.ceil(remainingMs / 1000))}s left` : "almost done",
+    found: bac.devices.length,
+  };
+}
+
+function bacDiscoveryProgressEl(id = "bac-discovery-progress") {
+  const state = bacDiscoveryProgressState();
+  if (!state) return null;
+  return el("div", { id, class: "bac-discovery-progress" },
+    el("div", { class: "bac-discovery-progress-head" },
+      el("span", {}, state.phase),
+      el("span", { class: "muted small" }, `${state.found} found · ${state.remainingText}`)),
+    el("div", { class: "bac-discovery-bar" },
+      el("div", {
+        class: `bac-discovery-fill ${state.finalizing ? "bac-discovery-finalizing" : ""}`,
+        style: `width:${state.pct}%`,
+      })));
+}
+
+function bacRenderDiscoveryProgressLive() {
+  for (const id of ["bac-discovery-progress", "bw-discovery-progress"]) {
+    const node = document.getElementById(id);
+    if (!node) continue;
+    const next = bacDiscoveryProgressEl(id);
+    if (next) node.replaceWith(next);
+    else node.remove();
+  }
+  const count = document.getElementById("bw-device-inbox-count");
+  if (count) {
+    const queued = Object.values(bw.deviceInbox?.candidates || {}).filter((c) => c?.status === "queued").length;
+    count.textContent = bac.discovering ? "Discovering..." : `${bac.devices.length} discovered · ${queued} queued`;
+  }
+  const bacCount = document.getElementById("bac-device-count");
+  if (bacCount) bacCount.textContent = bacDeviceCountText();
+}
+
+function bacStartDiscoveryClock(durationMs = 5000) {
+  if (bac.discoveryTimer) clearInterval(bac.discoveryTimer);
+  bac.discoveryDurationMs = durationMs;
+  bac.discoveryStartedAt = Date.now();
+  bac.discoveryTimer = setInterval(bacRenderDiscoveryProgressLive, 250);
+}
+
+function bacStopDiscoveryClock() {
+  if (bac.discoveryTimer) clearInterval(bac.discoveryTimer);
+  bac.discoveryTimer = null;
+  bacRenderDiscoveryProgressLive();
+}
+
 // ---- events ----
 
 function bacEnsureListeners() {
@@ -2086,19 +2617,19 @@ function bacEnsureListeners() {
     const d = e.payload;
     if (!bac.devices.some((x) => x.key === d.key)) bac.devices.push(d);
     bacScheduleDevicesRender();
-  });
+  }).catch((e) => console.warn("listen bacnet:device failed:", e));
   listen("bacnet:device_update", (e) => {
     const d = e.payload;
     const i = bac.devices.findIndex((x) => x.key === d.key);
     if (i >= 0) bac.devices[i] = d;
     else bac.devices.push(d);
     bacScheduleDevicesRender();
-  });
+  }).catch((e) => console.warn("listen bacnet:device_update failed:", e));
   listen("bacnet:objects_progress", (e) => {
     bac.objectsProgress = e.payload;
     const node = document.getElementById("bac-objects-status");
     if (node) node.textContent = `Walking object-list… ${e.payload.done}/${e.payload.total}`;
-  });
+  }).catch((e) => console.warn("listen bacnet:objects_progress failed:", e));
   listen("bacnet:object_names", (e) => {
     // Names stream from a detached pass; ignore batches for a device we've
     // already navigated away from.
@@ -2109,7 +2640,7 @@ function bacEnsureListeners() {
       if (n) o.name = n;
     }
     bacApplyObjectFilter();
-  });
+  }).catch((e) => console.warn("listen bacnet:object_names failed:", e));
   listen("bacnet:cov", (e) => {
     const p = e.payload;
     if (!p) return;
@@ -2122,12 +2653,12 @@ function bacEnsureListeners() {
     bac.cov.updates += 1;
     bac.cov.lastAt = Date.now();
     bacApplyCovUpdate(p.values || []);
-  });
+  }).catch((e) => console.warn("listen bacnet:cov failed:", e));
 }
 
 // ---- actions ----
 
-// Inter-tool dependency in action: BACnet Explorer borrows Network Manager's
+// Inter-tool dependency in action: BACnet Inspector borrows Network Manager's
 // subnet scanner (the `netscan` capability) to find live hosts to aim discovery
 // at — instead of reimplementing an ICMP sweep. Only offered when the kernel
 // resolved the optional dependency, so it degrades cleanly if Network Manager
@@ -2154,11 +2685,41 @@ async function bacSuggestTargets() {
   }
 }
 
+// The Inspector consumes the extracted bacnet-core service. If the kernel
+// didn't boot, it falls back to direct backend calls so the advanced tool still
+// works — the platform must never take the UI down.
+function bacnetRead() {
+  const cap = platformHost("bacnet")?.tryUse("bacnet.read.v1");
+  if (cap) return cap;
+  return {
+    listDevices: (o = {}) => invoke("bacnet_discover", {
+      target: o.target ?? null, lowLimit: o.lowLimit ?? null,
+      highLimit: o.highLimit ?? null, durationMs: o.durationMs ?? null,
+    }),
+    readPoint: (device, objectType, instance) =>
+      invoke("bacnet_read_properties", { device, objectType, instance }),
+    listObjects: (device, deviceInstance) =>
+      invoke("bacnet_read_objects", { device, deviceInstance }),
+    writeProperty: ({ device, objectType, instance, property, value, priority = null, arrayIndex = null }) =>
+      invoke("bacnet_write_property", { device, objectType, instance, property, value, priority, arrayIndex }),
+    readTrend: ({ device, objectType, instance, maxRecords }) =>
+      invoke("bacnet_read_trend", { device, objectType, instance, maxRecords }),
+    subscribeCov: ({ device, deviceInstance, objectType, instance, confirmed = false }) =>
+      invoke("bacnet_subscribe_cov", { device, deviceInstance, objectType, instance, confirmed }),
+    unsubscribeCov: ({ device, objectType, instance, processId }) =>
+      invoke("bacnet_unsubscribe_cov", { device, objectType, instance, processId }),
+  };
+}
+
 async function bacDiscover() {
   if (bac.discovering) return;
   bacEnsureListeners();
   if (bac.cov.processId != null) await bacCovStop();
+  const durationMs = 5000;
   bac.discovering = true;
+  bac.discoveryRan = true;
+  bac.lastDiscoveryCount = null;
+  bacStartDiscoveryClock(durationMs);
   bac.devices = [];
   bac.selectedDeviceKey = null;
   bac.objects = [];
@@ -2168,18 +2729,21 @@ async function bacDiscover() {
   const low = parseInt(bac.lowLimit, 10);
   const high = parseInt(bac.highLimit, 10);
   try {
-    const devices = await invoke("bacnet_discover", {
+    const devices = await bacnetRead().listDevices({
       target: bac.target.trim() || null,
       lowLimit: Number.isFinite(low) ? low : null,
       highLimit: Number.isFinite(high) ? high : null,
-      durationMs: null,
+      durationMs,
     });
     bac.devices = devices;
+    bac.lastDiscoveryCount = devices.length;
     logTo("bacnet", `Discovery finished — ${devices.length} device${devices.length === 1 ? "" : "s"}.`, devices.length ? "ok" : "warn");
   } catch (err) {
+    bac.lastDiscoveryCount = null;
     logTo("bacnet", `Discovery failed: ${err}`, "error");
   } finally {
     bac.discovering = false;
+    bacStopDiscoveryClock();
     renderAll();
   }
 }
@@ -2198,10 +2762,7 @@ async function bacSelectDevice(key) {
   bac.objectsProgress = null;
   renderAll();
   try {
-    const objects = await invoke("bacnet_read_objects", {
-      device: bacDeviceRef(dev),
-      deviceInstance: dev.instance,
-    });
+    const objects = await bacnetRead().listObjects(bacDeviceRef(dev), dev.instance);
     // A faster click may have switched devices while this was in flight; don't
     // overwrite the newer selection with stale results.
     if (bac.selectedDeviceKey !== key) return;
@@ -2233,11 +2794,9 @@ async function bacSelectObject(key) {
   bac.propsLoading = true;
   renderAll();
   try {
-    const props = await invoke("bacnet_read_properties", {
-      device: bacDeviceRef(dev),
-      objectType: obj.objectType,
-      instance: obj.instance,
-    });
+    const props = await bacnetRead().readPoint(
+      bacDeviceRef(dev), obj.objectType, obj.instance,
+    );
     // Guard against a newer object selection resolving first.
     if (bac.selectedObjectKey !== key) return;
     bac.props = props;
@@ -2273,9 +2832,7 @@ async function bacCovStop() {
   if (dev && objectKey) {
     const [t, i] = objectKey.split(":").map((n) => parseInt(n, 10));
     try {
-      await invoke("bacnet_unsubscribe_cov", {
-        device: bacDeviceRef(dev), objectType: t, instance: i, processId,
-      });
+      await bacnetRead().unsubscribeCov({ device: bacDeviceRef(dev), objectType: t, instance: i, processId });
     } catch (_) { /* device drops us at lifetime expiry anyway */ }
   }
 }
@@ -2295,7 +2852,7 @@ async function bacToggleCov() {
   bac.cov.busy = true;
   renderAll();
   try {
-    const processId = await invoke("bacnet_subscribe_cov", {
+    const processId = await bacnetRead().subscribeCov({
       device: bacDeviceRef(dev),
       deviceInstance: dev.instance,
       objectType: obj.objectType,
@@ -2393,7 +2950,7 @@ async function bacWrite(relinquish = false) {
     ? `relinquish p${priority}`
     : `write ${JSON.stringify(value)}${priority != null ? ` @ p${priority}` : ""}`;
   try {
-    await invoke("bacnet_write_property", {
+    await bacnetRead().writeProperty({
       device: bacDeviceRef(dev),
       objectType: obj.objectType,
       instance: obj.instance,
@@ -2423,6 +2980,10 @@ function bacScheduleDevicesRender() {
 }
 
 function bacRenderDevicesLive() {
+  if (currentPluginId() === "building-workspace") {
+    bwRenderDeviceInboxLive();
+    return;
+  }
   if (currentPluginId() !== "bacnet") return;
   const body = document.getElementById("bac-device-rows");
   if (body) body.replaceChildren(...bacDeviceRows());
@@ -2646,8 +3207,23 @@ function bacObjectRows() {
     },
       el("span", { class: "bac-object-type" }, `${o.typeName}:${o.instance}`),
       el("span", { class: "bac-object-name" }, o.name || ""),
+      el("button", {
+        class: "btn-ghost bac-object-action",
+        title: "Import this object into Building Workspace and historize it",
+        onclick: (e) => { e.stopPropagation(); bwHistorizeSelectedObject(o); },
+      }, "Historize"),
     );
   });
+}
+
+function bacAdapterTarget(adapterName = bwSelectedNetworkAdapterName()) {
+  return adapterName ? bacSweepTargetFor(adapterName) : null;
+}
+
+async function bwDiscoverDevices() {
+  const target = bacAdapterTarget();
+  if (target) bac.target = target.value;
+  await bacDiscover();
 }
 
 function bacPropRows(flashIds) {
@@ -2681,7 +3257,7 @@ async function bacReadTrend() {
   bac.trend.objectKey = bacObjectKey(obj);
   renderAll();
   try {
-    const result = await invoke("bacnet_read_trend", {
+    const result = await bacnetRead().readTrend({
       device: bacDeviceRef(dev),
       objectType: obj.objectType,
       instance: obj.instance,
@@ -2970,11 +3546,12 @@ function renderBacnetPage() {
       discoverBtn,
       scanBtn,
     ),
+    bac.discovering ? bacDiscoveryProgressEl("bac-discovery-progress") : null,
     bacTargetChips(),
   );
 
   const hasDevices = bac.devices.length > 0;
-  const devicesSection = el("section", { class: "plugin-section" },
+  const devicesSection = el("section", { class: "plugin-section plugin-section-fill" },
     el("div", { class: "section-head" },
       el("h3", {}, "Devices"),
       el("span", { id: "bac-device-count", class: "muted small" }, bacDeviceCountText()),
@@ -2998,7 +3575,7 @@ function renderBacnetPage() {
         )
       : null,
     // Static scroll wrapper; bacApplyDeviceView swaps the inner <table> in place (no re-nesting).
-    el("div", { class: "table-scroll" }, bacDeviceTableEl()),
+    el("div", { class: "table-scroll table-scroll-fill" }, bacDeviceTableEl()),
   );
 
   const dev = bacSelectedDevice();
@@ -3054,11 +3631,11 @@ function renderBacnetPage() {
     bacWritePanel(),
   );
 
-  const browseSection = el("section", { class: "plugin-section" },
+  const browseSection = el("section", { class: "plugin-section plugin-section-fill" },
     el("div", { class: "bac-browse" }, objectsPane, propsPane),
   );
 
-  return el("div", { class: "plugin-controls" },
+  return el("div", { class: "plugin-controls plugin-controls-fill bac-root" },
     discoverSection,
     devicesSection,
     browseSection,
@@ -3074,6 +3651,8 @@ let obsBusy = false;
 let obsPhase = "";       // high-level bring-up phase label
 let obsProgress = null;  // latest per-component install event (download %, rate, ETA, …)
 let obsHealth = null;
+let obsHealthChecking = true;
+let obsHealthMessage = "Checking health and smoke test on startup…";
 let obsPack = null;      // installed-vs-pinned component versions (update detection)
 let obsPackLoading = false;
 
@@ -3142,18 +3721,97 @@ function renderInstallProgress() {
 }
 
 function obsStatusPill() {
-  if (obsHealth && obsHealth.influxReady) return { label: "Live", cls: "pill-running" };
+  if (obsHealthChecking) return { label: "Checking", cls: "pill-muted" };
+  if (obsHealth && obsHealth.influxReady && obsSmokeOk(obsHealth.smoke)) return { label: "Live", cls: "pill-running" };
+  if (obsHealth && obsHealth.influxReady) return { label: "Partial", cls: "pill-muted" };
   if (obsHealth && obsHealth.influxUp) return { label: "Starting", cls: "pill-muted" };
   const s = telemetry ? telemetry.stats() : null;
   if (s && s.backend && s.degraded) return { label: "Reconnecting", cls: "pill-muted" };
   return { label: "Local", cls: "pill-idle" };
 }
 
+function obsSmokeOk(smoke) {
+  return !!(smoke && smoke.directWrite && smoke.directQuery && smoke.telegrafWrite && smoke.telegrafQuery);
+}
+
+function obsSmokeLabel(smoke) {
+  if (!smoke) return "Smoke: unknown";
+  if (!smoke.attempted) return `Smoke: skipped${smoke.error ? ` (${smoke.error})` : ""}`;
+  if (obsSmokeOk(smoke)) return "Smoke: ok";
+  const bits = [
+    `Influx write ${smoke.directWrite ? "ok" : "failed"}`,
+    `Influx query ${smoke.directQuery ? "ok" : "failed"}`,
+    `Telegraf write ${smoke.telegrafWrite ? "ok" : "failed"}`,
+    `Telegraf query ${smoke.telegrafQuery ? "ok" : "failed"}`,
+  ];
+  return `Smoke: partial — ${bits.join(" · ")}${smoke.error ? ` (${smoke.error})` : ""}`;
+}
+
+function obsCompactHealthLine() {
+  if (obsHealthChecking) return obsHealthMessage || "Checking health…";
+  if (!obsHealth) return obsHealthMessage || "Health not checked yet.";
+  if (obsHealth.influxReady && obsHealth.grafanaUp && obsSmokeOk(obsHealth.smoke)) {
+    return "Live · metrics verified";
+  }
+  if (obsHealth.influxReady && obsHealth.grafanaUp) {
+    return "Partial · metrics smoke needs attention";
+  }
+  if (obsHealth.influxUp) return "Starting · waiting for readiness";
+  return "Offline · buffering locally";
+}
+
 async function obsRefreshHealth() {
   if (!pack) return;
-  try { obsHealth = await pack.health(); }
-  catch (_) { obsHealth = null; }
+  obsHealthChecking = true;
+  obsHealthMessage = "Checking health and smoke test…";
   renderAll();
+  try {
+    obsHealth = await pack.health();
+    obsHealthMessage = "";
+  } catch (err) {
+    obsHealth = null;
+    obsHealthMessage = `Health check failed: ${err}`;
+  } finally {
+    obsHealthChecking = false;
+    renderAll();
+  }
+}
+
+async function obsApplyStartupStatus(status) {
+  const obs = status?.observability;
+  if (!obs) {
+    if (status?.running) {
+      obsHealthChecking = true;
+      obsHealthMessage = "Checking health and smoke test on startup…";
+      return true;
+    }
+    return false;
+  }
+  obsHealthChecking = false;
+  if (obs.packStatus) obsPack = obs.packStatus;
+  if (obs.health) {
+    obsHealth = obs.health;
+    obsHealthMessage = "";
+  }
+  if (pack && obs.started && obs.config && obs.health?.influxReady) {
+    try {
+      await pack.connect(obs.config);
+      logTo("observability", "Connected to Observability Pack started during app startup.", "ok");
+    } catch (err) {
+      logTo("observability", `Pack started, but telemetry attach failed: ${err}`, "warn");
+    }
+  } else if (obs.skipped && obs.reason && obs.reason !== "Observability Pack is not installed yet") {
+    obsHealthMessage = `Startup warmup skipped: ${obs.reason}`;
+    logTo("observability", `Startup warmup skipped: ${obs.reason}`, "info");
+  } else if (obs.skipped && obs.reason) {
+    obsHealthMessage = obs.reason;
+  } else if (obs.attempted && !obs.started && obs.reason) {
+    obsHealthMessage = `Startup warmup could not start pack: ${obs.reason}`;
+    logTo("observability", `Startup warmup could not start pack: ${obs.reason}`, "warn");
+  } else if (!obs.health && obs.reason) {
+    obsHealthMessage = obs.reason;
+  }
+  return true;
 }
 
 async function obsBringUp() {
@@ -3196,22 +3854,35 @@ function renderObservabilityPage() {
   const recent = telemetry ? telemetry.recent(15) : [];
   const cfg = pack ? pack.getConfig() : null;
 
-  const healthLine = obsHealth
-    ? `InfluxDB: ${obsHealth.influxReady ? "ready" : obsHealth.influxUp ? "starting" : "down"} · Grafana: ${obsHealth.grafanaUp ? "up" : "down"}`
-    : "Health unknown — click Check health.";
+  const healthLine = obsHealthChecking
+    ? (obsHealthMessage || "Checking health…")
+    : obsHealth
+      ? `InfluxDB: ${obsHealth.influxReady ? "ready" : obsHealth.influxUp ? "starting" : "down"} · Grafana: ${obsHealth.grafanaUp ? "up" : "down"} · ${obsSmokeLabel(obsHealth.smoke)}`
+      : (obsHealthMessage || "Health not checked yet — click Check health.");
 
   const installLabel = obsBusy ? "Working…"
     : (obsPack && obsPack.updatesAvailable) ? "Update & restart pack"
     : (obsPack && obsPack.installed) ? "Restart pack"
     : "Install & start pack";
 
+  const details = el("details", { class: "obs-details" },
+    el("summary", { class: "muted small" }, "Details"),
+    el("div", { class: "settings-stack" },
+      obsVersionsLine(),
+      el("p", { class: "muted small" }, healthLine),
+      el("p", { class: "muted small" },
+        "Local stack: Telegraf, InfluxDB, and Grafana on 127.0.0.1. Metrics buffer in memory until the pack is live."),
+      el("div", { class: "tool-actions" },
+        el("button", { class: "btn-ghost", disabled: obsBusy ? "disabled" : undefined, onclick: obsWriteConfigs }, "Write configs"),
+      ),
+    ),
+  );
+
   const statusCard = el("section", { class: "plugin-section" },
-    el("h3", {}, "Observability Pack"),
-    el("p", { class: "muted small" },
-      "Telegraf + InfluxDB + Grafana run locally on 127.0.0.1. The first install downloads ~400 MB; " +
-      "until then, tool metrics are kept in an in-memory ring buffer (still visible below)."),
-    obsVersionsLine(),
-    el("p", { class: "muted small" }, obsBusy ? (obsPhase || "Working…") : healthLine),
+    el("div", { class: "section-head" },
+      el("h3", {}, "Observability Pack"),
+      el("span", { class: "muted small" }, obsBusy ? (obsPhase || "Working…") : obsCompactHealthLine()),
+    ),
     el("div", { class: "tool-actions" },
       el("button", {
         class: "btn btn-primary",
@@ -3220,11 +3891,11 @@ function renderObservabilityPage() {
       }, installLabel),
       el("button", { class: "btn-ghost", disabled: obsBusy ? "disabled" : undefined, onclick: obsStop }, "Stop"),
       el("button", { class: "btn-ghost", onclick: obsRefreshHealth }, "Check health"),
-      el("button", { class: "btn-ghost", disabled: obsBusy ? "disabled" : undefined, onclick: obsWriteConfigs }, "Write configs"),
       obsHealth && obsHealth.grafanaUp && cfg
         ? el("button", { class: "btn-ghost", onclick: () => openExternal(`http://127.0.0.1:${cfg.grafanaPort}`) }, "Open Grafana")
         : null,
     ),
+    details,
   );
 
   const statRow = (label, val) => el("div", { class: "kv-row" },
@@ -3241,14 +3912,14 @@ function renderObservabilityPage() {
       : el("p", { class: "muted small" }, "Telemetry service not started."),
   );
 
-  const recentCard = el("section", { class: "plugin-section" },
+  const recentCard = el("section", { class: "plugin-section plugin-section-fill" },
     el("div", { class: "section-head" },
       el("h3", {}, "Recent metrics"),
       el("button", { class: "btn-ghost", onclick: () => renderAll() }, "Refresh"),
     ),
     recent.length === 0
       ? el("p", { class: "muted small" }, "No metrics recorded yet. Run a tool (e.g. a network scan) to produce some.")
-      : el("ol", { class: "plugin-log" },
+      : el("ol", { class: "plugin-log scroll-fill" },
           ...recent.slice().reverse().map((p) =>
             el("li", { class: "log-info" },
               el("span", { class: "log-time" }, new Date(p.ts).toLocaleTimeString()),
@@ -3259,7 +3930,7 @@ function renderObservabilityPage() {
   );
 
   const progressCard = obsBusy ? renderInstallProgress() : null;
-  return el("div", { class: "plugin-controls" }, statusCard, progressCard, statsCard, recentCard);
+  return el("div", { class: "plugin-controls plugin-controls-fill" }, statusCard, progressCard, statsCard, recentCard);
 }
 
 // ============================================================================
@@ -3285,7 +3956,15 @@ function histPersist() {
   if (!hist) return;
   userState.historian = {
     points: hist.points().map((p) => ({
-      device: p.device, objectType: p.objectType, instance: p.instance, label: p.label || "",
+      device: p.device,
+      objectType: p.objectType,
+      instance: p.instance,
+      label: p.label || "",
+      site: p.site || "",
+      building: p.building || "",
+      floor: p.floor || "",
+      equip: p.equip || "",
+      pointId: p.pointId || "",
     })),
     running: hist.isRunning(),
     intervalMs: histIntervalMs,
@@ -3293,12 +3972,53 @@ function histPersist() {
   saveUserState();
 }
 
-function histRestore() {
+function histSourceRef(point) {
+  const device = point?.device || {};
+  const deviceInstance = device.deviceInstance ?? device.instance ?? device.id;
+  if (deviceInstance == null || point?.objectType == null || point?.instance == null) return "";
+  return `bacnet:${Number(deviceInstance)}:${Number(point.objectType)}:${Number(point.instance)}`;
+}
+
+function histMetadataChanged(current, next) {
+  return ["label", "site", "building", "floor", "equip", "pointId"]
+    .some((key) => (current?.[key] || "") !== (next?.[key] || ""));
+}
+
+function histSyncFromInventory() {
+  const inv = inventoryInstance();
+  const hist = historianInstance();
+  if (!inv || !hist) return 0;
+  let refreshed = 0;
+  for (const current of hist.points()) {
+    const sourceRef = histSourceRef(current);
+    const point = (current.pointId ? inv.getEntity(current.pointId) : null)
+      || inv.listEntities({ type: "point", sourceRef })[0];
+    if (!point || point.type !== "point") continue;
+    try {
+      const record = bwHistorianRecordForPoint(inv, point);
+      if (!histMetadataChanged(current, record)) continue;
+      hist.addPoint(record);
+      refreshed++;
+    } catch (_) {
+      // Keep manual historian records intact.
+    }
+  }
+  return refreshed;
+}
+
+function histRestore({ replace = false } = {}) {
   const hist = historianInstance();
   const saved = userState.historian;
-  if (!hist || !saved) return;
+  if (!hist) return;
+  if (replace) {
+    if (hist.isRunning()) hist.stop();
+    hist.clearPoints?.();
+  }
+  if (!saved) return;
   for (const p of saved.points || []) hist.addPoint(p);
   if (saved.intervalMs) histIntervalMs = saved.intervalMs;
+  const refreshed = histSyncFromInventory();
+  if (refreshed) histPersist();
   if (saved.running && (saved.points || []).length) {
     hist.start(histIntervalMs);
     logTo("bacnet-historian", `Resumed logging ${saved.points.length} point(s).`, "info");
@@ -3312,8 +4032,10 @@ function renderHistorianPage() {
       el("section", { class: "plugin-section" },
         el("p", { class: "muted" }, "Historian unavailable — the platform kernel did not resolve its dependencies.")));
   }
+  const synced = histSyncFromInventory();
+  if (synced) histPersist();
 
-  // Devices come from the BACnet Explorer's discovery results (inter-tool reuse).
+  // Devices come from the shared BACnet discovery session used by Building Workspace.
   const devices = bac.devices || [];
   let devIdx = devices.length ? "0" : "";
   const objTypeInput = el("input", { type: "number", class: "nm-input bac-range-input", value: "0", title: "Object type (0=AI, 1=AO, 2=AV, …)" });
@@ -3322,7 +4044,7 @@ function renderHistorianPage() {
   const devSelect = el("select", { class: "nm-input", onchange: (e) => { devIdx = e.target.value; } },
     ...(devices.length
       ? devices.map((d, i) => el("option", { value: String(i) }, bacDeviceLabel(d)))
-      : [el("option", { value: "" }, "No devices — discover in BACnet Explorer first")]));
+      : [el("option", { value: "" }, "No devices — discover from Building Workspace first")]));
 
   const addBtn = el("button", {
     class: "btn",
@@ -3344,7 +4066,7 @@ function renderHistorianPage() {
 
   const addCard = el("section", { class: "plugin-section" },
     el("h3", {}, "Add a point"),
-    el("p", { class: "muted small" }, "Points are read from devices discovered in the BACnet Explorer."),
+    el("p", { class: "muted small" }, "Points are read through the BACnet service from the current discovery session."),
     el("div", { class: "bac-discover-controls" },
       el("label", { class: "nm-field bac-target-field" }, el("span", { class: "nm-field-label" }, "Device"), devSelect),
       el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Object type"), objTypeInput),
@@ -3380,20 +4102,24 @@ function renderHistorianPage() {
       el("button", {
         class: "btn-ghost",
         onclick: async () => {
-          const r = await hist.pollOnce();
-          logTo("bacnet-historian", `Polled — ${r.written} written, ${r.errors} error(s).`, r.errors ? "warn" : "ok");
-          renderAll();
+          try {
+            const r = await hist.pollOnce();
+            logTo("bacnet-historian", `Polled — ${r.written} written, ${r.errors} error(s).`, r.errors ? "warn" : "ok");
+            renderAll();
+          } catch (err) {
+            logTo("bacnet-historian", `Poll failed: ${err}`, "error");
+          }
         },
       }, "Poll now"),
     ),
   );
 
   const pts = hist.points();
-  const pointsCard = el("section", { class: "plugin-section" },
+  const pointsCard = el("section", { class: "plugin-section plugin-section-fill" },
     el("h3", {}, `Points (${pts.length})`),
     pts.length === 0
       ? el("p", { class: "muted small" }, "No points yet — add one above.")
-      : el("ol", { class: "plugin-log" },
+      : el("ol", { class: "plugin-log scroll-fill" },
           ...pts.map((p) =>
             el("li", { class: p.lastError ? "log-error" : "log-info" },
               el("span", { class: "log-msg" },
@@ -3403,7 +4129,2140 @@ function renderHistorianPage() {
             ))),
   );
 
-  return el("div", { class: "plugin-controls" }, controlCard, addCard, pointsCard);
+  return el("div", { class: "plugin-controls plugin-controls-fill" }, controlCard, addCard, pointsCard);
+}
+
+// ============================================================================
+// Building Workspace (model → historize → dashboard → commission → report)
+// ============================================================================
+
+let bw = bwStateFromUserState();
+
+function bwNormalizeDeviceInboxState(saved = {}) {
+  const inbox = saved.deviceInbox && typeof saved.deviceInbox === "object" ? saved.deviceInbox : {};
+  const phase = inbox.phase === "modeling" ? "modeling" : "discovery";
+  return {
+    phase,
+    selectedKeys: Array.isArray(inbox.selectedKeys)
+      ? inbox.selectedKeys
+      : (Array.isArray(saved.deviceInboxSelectedKeys) ? saved.deviceInboxSelectedKeys : []),
+    anchorKey: inbox.anchorKey || saved.deviceInboxSelectionAnchorKey || "",
+    filter: typeof inbox.filter === "string" ? inbox.filter : (saved.deviceInboxFilter || ""),
+    candidates: inbox.candidates && typeof inbox.candidates === "object" && !Array.isArray(inbox.candidates)
+      ? inbox.candidates
+      : {},
+  };
+}
+
+function bwStateFromUserState() {
+  const saved = userState.buildingWorkspace || {};
+  return {
+    tab: saved.tab || "model",
+    filter: saved.filter || "",
+    template: saved.template || "vav",
+    selectedSiteId: saved.selectedSiteId || "",
+    selectedBuildingId: saved.selectedBuildingId || "",
+    selectedFloorId: saved.selectedFloorId || "",
+    selectedEntityId: saved.selectedEntityId || "",
+    selectedEntityIds: Array.isArray(saved.selectedEntityIds) ? saved.selectedEntityIds : [],
+    selectionAnchorId: saved.selectionAnchorId || "",
+    collapsedNodeIds: Array.isArray(saved.collapsedNodeIds) ? saved.collapsedNodeIds : [],
+    contextMenu: null,
+    inboxMenu: null,
+    draft: null,
+    busy: false,
+    lastRunId: saved.lastRunId || null,
+    dashboardJson: "",
+    floorBatchPattern: "Floor {n}",
+    floorBatchStart: "1",
+    floorBatchCount: "3",
+    deviceInbox: bwNormalizeDeviceInboxState(saved),
+    cxMin: "",
+    cxMax: "",
+    cxNotes: "",
+  };
+}
+
+function bwRestoreState() {
+  bw = bwStateFromUserState();
+}
+
+function bwSaveState() {
+  userState.buildingWorkspace = {
+    tab: bw.tab,
+    filter: bw.filter,
+    template: bw.template,
+    selectedSiteId: bw.selectedSiteId,
+    selectedBuildingId: bw.selectedBuildingId,
+    selectedFloorId: bw.selectedFloorId,
+    selectedEntityId: bw.selectedEntityId,
+    selectedEntityIds: bw.selectedEntityIds,
+    selectionAnchorId: bw.selectionAnchorId,
+    collapsedNodeIds: bw.collapsedNodeIds,
+    lastRunId: bw.lastRunId,
+    deviceInbox: bw.deviceInbox,
+  };
+  saveUserState();
+}
+
+function inventoryInstance() {
+  return platform ? platform.capability("inventory.v1") : null;
+}
+
+function bwStatusPill() {
+  const inv = inventoryInstance();
+  if (!inv) return { label: "Off", cls: "pill-muted" };
+  const points = inv.listEntities({ type: "point" }).length;
+  return points ? { label: `${points} point${points === 1 ? "" : "s"}`, cls: "pill-running" } : { label: "Ready", cls: "pill-idle" };
+}
+
+function bwTemplateForName(name) {
+  const s = String(name || "").toLowerCase();
+  if (s.includes("ahu")) return "ahu";
+  if (s.includes("meter") || s.includes("mtr")) return "meter";
+  if (s.includes("zone")) return "zone";
+  return "vav";
+}
+
+function bwNodeCollapsed(id) {
+  return bw.collapsedNodeIds.includes(id);
+}
+
+function bwSetNodeCollapsed(id, collapsed) {
+  const current = new Set(bw.collapsedNodeIds);
+  if (collapsed) current.add(id);
+  else current.delete(id);
+  bw.collapsedNodeIds = [...current];
+  bwSaveState();
+}
+
+function bwToggleNodeCollapsed(id) {
+  bwSetNodeCollapsed(id, !bwNodeCollapsed(id));
+  bwRenderModelScope({ tree: true, details: false, header: false });
+}
+
+function bwExpandNode(id) {
+  if (!id || !bwNodeCollapsed(id)) return;
+  bwSetNodeCollapsed(id, false);
+}
+
+function bwActiveSite(inv) {
+  if (String(bw.selectedSiteId || "").startsWith("__new_")) return null;
+  return inv.getEntity(bw.selectedSiteId) || inv.listEntities({ type: "site" })[0] || null;
+}
+
+function bwActiveBuilding(inv, siteId) {
+  if (String(bw.selectedBuildingId || "").startsWith("__new_")) return null;
+  const selected = inv.getEntity(bw.selectedBuildingId);
+  if (selected && (!siteId || selected.siteId === siteId)) return selected;
+  const buildings = siteId ? inv.listEntities({ type: "building", siteId }) : inv.listEntities({ type: "building" });
+  return buildings[0] || null;
+}
+
+function bwActiveFloor(inv, buildingId) {
+  if (String(bw.selectedFloorId || "").startsWith("__new_")) return null;
+  const selected = inv.getEntity(bw.selectedFloorId);
+  if (selected && (!buildingId || selected.buildingId === buildingId || selected.parentId === buildingId)) return selected;
+  const floors = buildingId ? inv.listEntities({ type: "floor", buildingId }) : inv.listEntities({ type: "floor" });
+  return floors[0] || null;
+}
+
+function bwEnsureSite(inv) {
+  const existing = bwActiveSite(inv);
+  if (existing) {
+    bw.selectedSiteId = existing.id;
+    return existing;
+  }
+  const site = inv.upsertEntity({
+    type: "site",
+    name: "Default Site",
+    tags: { site: true, haystack: "4" },
+  });
+  bw.selectedSiteId = site.id;
+  return site;
+}
+
+function bwEnsureBuilding(inv, site) {
+  const existing = bwActiveBuilding(inv, site.id);
+  if (existing) {
+    bw.selectedBuildingId = existing.id;
+    return existing;
+  }
+  const building = inv.upsertEntity({
+    type: "building",
+    siteId: site.id,
+    parentId: site.id,
+    name: "Main Building",
+    tags: { building: true },
+  });
+  bw.selectedBuildingId = building.id;
+  return building;
+}
+
+function bwEnsureFloor(inv, site, building) {
+  const existing = bwActiveFloor(inv, building.id);
+  if (existing) {
+    bw.selectedFloorId = existing.id;
+    return existing;
+  }
+  const floor = inv.upsertEntity({
+    type: "floor",
+    siteId: site.id,
+    buildingId: building.id,
+    parentId: building.id,
+    name: "Floor 1",
+    tags: { floor: true },
+  });
+  bw.selectedFloorId = floor.id;
+  return floor;
+}
+
+function bwEnsureLocation(inv) {
+  const site = bwEnsureSite(inv);
+  const building = bwEnsureBuilding(inv, site);
+  const floor = bwEnsureFloor(inv, site, building);
+  bwSaveState();
+  return { site, building, floor };
+}
+
+function bwPromptName(label, fallback) {
+  const value = prompt(label, fallback || "");
+  return value == null ? "" : String(value).trim();
+}
+
+function bwDefaultName(type) {
+  return {
+    site: "New Site",
+    building: "New Building",
+    floor: "New Floor",
+    equip: "New Device",
+    point: "New Point",
+  }[type] || "New Item";
+}
+
+function bwFocusDraftName() {
+  setTimeout(() => {
+    const input = document.querySelector("[data-bw-draft-name='1']");
+    if (!input) return;
+    input.focus();
+    input.select();
+  }, 0);
+}
+
+function bwStartDraft(type, parentId = "") {
+  bw.contextMenu = null;
+  bwExpandNode(parentId);
+  bw.draft = {
+    id: `draft:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
+    type,
+    parentId,
+    name: bwDefaultName(type),
+  };
+  bwRenderModelScope({ tree: true, details: true, header: true });
+  bwFocusDraftName();
+}
+
+function bwCancelDraft() {
+  if (!bw.draft) return;
+  bw.draft = null;
+  bwRenderModelScope({ tree: true, details: true, header: true });
+}
+
+function bwEntityByName(inv, filter, name) {
+  const target = String(name || "").trim().toLowerCase();
+  return inv.listEntities(filter).find((e) => String(e.name || "").trim().toLowerCase() === target) || null;
+}
+
+function bwBacnetDeviceInstance(device) {
+  const n = Number(device?.instance ?? device?.deviceInstance);
+  return Number.isFinite(n) ? n : null;
+}
+
+function bwModeledDeviceForBacnet(inv, device) {
+  if (!inv) return null;
+  return bwFindModeledDeviceForBacnet(inv.listEntities({ type: "equip" }), device);
+}
+
+function bwDeviceEntityFromBacnet({ site, building, floor, device }) {
+  const instance = bwBacnetDeviceInstance(device);
+  const ref = bacDeviceRef(device);
+  return {
+    type: "equip",
+    siteId: site.id,
+    buildingId: building.id,
+    floorId: floor.id,
+    parentId: floor.id,
+    name: device.name || `Device ${instance}`,
+    deviceInstance: instance,
+    deviceRef: { ...ref, deviceInstance: instance },
+    address: device.address || "",
+    network: device.network ?? null,
+    mac: device.mac ?? null,
+    vendorId: device.vendorId ?? null,
+    vendorName: device.vendorName || "",
+    modelName: device.modelName || "",
+    tags: { equip: true, device: true, bacnet: true },
+  };
+}
+
+function bwFilteredDiscoveredDevices() {
+  const q = String(bw.deviceInbox?.filter || "").trim().toLowerCase();
+  const devices = bac.devices || [];
+  if (!q) return devices;
+  return devices.filter((d) =>
+    String(d.instance ?? "").includes(q) ||
+    (d.name || "").toLowerCase().includes(q) ||
+    bacAddressText(d).toLowerCase().includes(q) ||
+    bacVendorText(d).toLowerCase().includes(q) ||
+    (d.modelName || "").toLowerCase().includes(q));
+}
+
+function bwDeviceInboxCandidateList(inv) {
+  return bwDeviceInboxCandidates({
+    devices: bwFilteredDiscoveredDevices(),
+    modeledDevices: inv ? inv.listEntities({ type: "equip" }) : [],
+    candidates: bw.deviceInbox?.candidates || {},
+  }).filter((c) => c.status !== "ignored");
+}
+
+function bwDeviceInboxQueueList(inv) {
+  return bwImportPlanItems({
+    devices: bac.devices || [],
+    modeledDevices: inv ? inv.listEntities({ type: "equip" }) : [],
+    candidates: bw.deviceInbox?.candidates || {},
+  });
+}
+
+function bwInboxSelectionFor(phase) {
+  return bw.deviceInbox?.phase === phase ? (bw.deviceInbox.selectedKeys || []) : [];
+}
+
+function bwSetInboxSelection(phase, keys, anchorKey = "") {
+  bw.deviceInbox.phase = phase;
+  bw.deviceInbox.selectedKeys = [...new Set(keys.filter(Boolean))];
+  bw.deviceInbox.anchorKey = anchorKey || bw.deviceInbox.selectedKeys.at(-1) || "";
+}
+
+function bwSelectInboxCandidate(phase, item, event = null) {
+  if (!item || item.selectable === false) return;
+  const inv = inventoryInstance();
+  const order = (phase === "modeling" ? bwDeviceInboxQueueList(inv) : bwDeviceInboxCandidateList(inv))
+    .filter((c) => c.selectable !== false)
+    .map((c) => c.key);
+  if (!order.includes(item.key)) return;
+  const selected = bwInboxSelectionFor(phase);
+  if (event?.shiftKey) {
+    const anchor = bw.deviceInbox.anchorKey && order.includes(bw.deviceInbox.anchorKey)
+      ? bw.deviceInbox.anchorKey
+      : (selected.at(-1) || item.key);
+    const a = order.indexOf(anchor);
+    const b = order.indexOf(item.key);
+    bwSetInboxSelection(phase, a >= 0 && b >= 0 ? order.slice(Math.min(a, b), Math.max(a, b) + 1) : [item.key], item.key);
+  } else if (event?.ctrlKey || event?.metaKey) {
+    const current = new Set(selected);
+    if (current.has(item.key)) current.delete(item.key);
+    else current.add(item.key);
+    bwSetInboxSelection(phase, [...current], item.key);
+  } else {
+    bwSetInboxSelection(phase, [item.key], item.key);
+  }
+  bwSaveState();
+  bwSyncInboxSelectionUi();
+}
+
+function bwOpenInboxMenu(event, phase, item) {
+  event.preventDefault();
+  event.stopPropagation();
+  if (!item || item.selectable === false) return;
+  const selected = bwInboxSelectionFor(phase);
+  if (bw.deviceInbox.phase !== phase || !selected.includes(item.key)) {
+    bwSetInboxSelection(phase, [item.key], item.key);
+  }
+  bw.inboxMenu = { x: event.clientX, y: event.clientY, phase, key: item.key };
+  bwSaveState();
+  bwSyncInboxSelectionUi();
+  bwRenderInboxMenu();
+  bwClampInboxMenu();
+}
+
+function bwCloseInboxMenu() {
+  if (!bw.inboxMenu) return;
+  bw.inboxMenu = null;
+  document.querySelector(".bw-inbox-menu")?.remove();
+}
+
+function bwClampInboxMenu() {
+  setTimeout(() => {
+    const menu = document.querySelector(".bw-inbox-menu");
+    if (!menu) return;
+    const margin = 8;
+    const rect = menu.getBoundingClientRect();
+    menu.style.left = `${Math.max(margin, Math.min(rect.left, window.innerWidth - rect.width - margin))}px`;
+    menu.style.top = `${Math.max(margin, Math.min(rect.top, window.innerHeight - rect.height - margin))}px`;
+  }, 0);
+}
+
+function bwInboxMenuButton(label, onclick, danger = false) {
+  return el("button", {
+    class: `bw-menu-item ${danger ? "bw-menu-danger" : ""}`,
+    onclick: (e) => {
+      e.stopPropagation();
+      bw.inboxMenu = null;
+      document.querySelector(".bw-inbox-menu")?.remove();
+      onclick();
+    },
+  }, label);
+}
+
+function bwInboxContextMenu(inv, floor = null) {
+  const menu = bw.inboxMenu;
+  if (!menu) return null;
+  const selected = bwInboxSelectionFor(menu.phase);
+  const selectedCount = selected.length || 1;
+  const items = [];
+  if (menu.phase === "discovery") {
+    items.push(bwInboxMenuButton(`Add ${selectedCount} to Import Plan`, bwQueueSelectedInboxDevices));
+    items.push(bwInboxMenuButton(`Ignore ${selectedCount}`, bwIgnoreSelectedInboxDevices, true));
+  } else {
+    if (floor) items.push(bwInboxMenuButton(selectedCount > 1 ? `Add selected to ${floor.name}` : `Add to ${floor.name}`, () => bwModelQueuedDevicesToFloor(floor.id)));
+    items.push(bwInboxMenuButton("Remove from Import Plan", () => bwRemoveQueuedInboxDevices(), true));
+  }
+  return el("div", {
+    class: "bw-context-menu bw-inbox-menu",
+    style: `left:${menu.x}px; top:${menu.y}px`,
+    onclick: (e) => e.stopPropagation(),
+  }, ...items);
+}
+
+function bwRenderInboxMenu() {
+  document.querySelector(".bw-inbox-menu")?.remove();
+  const inv = inventoryInstance();
+  if (!inv || !bw.inboxMenu) return;
+  const menu = bwInboxContextMenu(inv, bwCurrentFloorForInbox(inv));
+  if (menu) document.body.appendChild(menu);
+}
+
+function bwEntityContext(inv, entity) {
+  if (!entity) return {};
+  const equip = entity.type === "equip" ? entity : inv.getEntity(entity.equipId);
+  const floor = entity.type === "floor" ? entity : inv.getEntity(entity.floorId || equip?.floorId || equip?.parentId);
+  const building = entity.type === "building" ? entity : inv.getEntity(entity.buildingId || floor?.buildingId || floor?.parentId);
+  const site = entity.type === "site" ? entity : inv.getEntity(entity.siteId || building?.siteId || building?.parentId);
+  return { site, building, floor, equip };
+}
+
+function bwTreeEntityOrder(inv) {
+  const out = [];
+  const pushEquip = (equip) => {
+    out.push(equip);
+    out.push(...inv.listEntities({ type: "point", equipId: equip.id }));
+  };
+  for (const site of inv.listEntities({ type: "site" })) {
+    out.push(site);
+    for (const building of inv.listEntities({ type: "building", siteId: site.id })) {
+      out.push(building);
+      for (const floor of inv.listEntities({ type: "floor", buildingId: building.id })) {
+        out.push(floor);
+        for (const equip of inv.listEntities({ type: "equip", floorId: floor.id })) pushEquip(equip);
+        out.push(...inv.listEntities({ type: "point", floorId: floor.id }).filter((p) => !p.equipId));
+      }
+      for (const equip of inv.listEntities({ type: "equip", buildingId: building.id }).filter((e) => !e.floorId)) pushEquip(equip);
+      out.push(...inv.listEntities({ type: "point", buildingId: building.id }).filter((p) => !p.floorId && !p.equipId));
+    }
+    for (const equip of inv.listEntities({ type: "equip", siteId: site.id }).filter((e) => !e.buildingId && !e.floorId)) pushEquip(equip);
+    out.push(...inv.listEntities({ type: "point", siteId: site.id }).filter((p) => !p.buildingId && !p.floorId && !p.equipId));
+  }
+  return out;
+}
+
+function bwSetSelection(ids, primaryId = ids.at(-1) || "") {
+  const unique = [...new Set(ids.filter(Boolean))];
+  bw.selectedEntityIds = unique;
+  bw.selectedEntityId = primaryId || unique.at(-1) || "";
+}
+
+function bwSelectTreeEntity(entity, event = null) {
+  const inv = inventoryInstance();
+  if (!inv) return;
+  bw.contextMenu = null;
+  if (!entity) {
+    bwSetSelection([]);
+    bw.selectionAnchorId = "";
+    bwSaveState();
+    bwRenderModelScope({ tree: true, details: true, header: true });
+    return;
+  }
+  if (event?.shiftKey) {
+    const order = bwTreeEntityOrder(inv).map((e) => e.id);
+    const anchor = bw.selectionAnchorId && order.includes(bw.selectionAnchorId) ? bw.selectionAnchorId : bw.selectedEntityId;
+    const a = order.indexOf(anchor);
+    const b = order.indexOf(entity.id);
+    if (a >= 0 && b >= 0) bwSetSelection(order.slice(Math.min(a, b), Math.max(a, b) + 1), entity.id);
+    else bwSetSelection([entity.id], entity.id);
+  } else if (event?.ctrlKey || event?.metaKey) {
+    const current = new Set(bw.selectedEntityIds);
+    if (current.has(entity.id)) current.delete(entity.id);
+    else current.add(entity.id);
+    bwSetSelection([...current], entity.id);
+    bw.selectionAnchorId = entity.id;
+  } else {
+    bwSetSelection([entity.id], entity.id);
+    bw.selectionAnchorId = entity.id;
+  }
+  const { site, building, floor } = bwEntityContext(inv, entity);
+  bw.selectedSiteId = site?.id || "";
+  bw.selectedBuildingId = building?.id || "";
+  bw.selectedFloorId = floor?.id || "";
+  if (entity.type === "site") {
+    bw.selectedSiteId = entity.id;
+    bw.selectedBuildingId = "";
+    bw.selectedFloorId = "";
+  } else if (entity.type === "building") {
+    bw.selectedBuildingId = entity.id;
+    bw.selectedFloorId = "";
+  } else if (entity.type === "floor") {
+    bw.selectedFloorId = entity.id;
+  }
+  bwSaveState();
+  bwRenderModelScope({ tree: true, details: true, header: true });
+}
+
+function bwOpenTreeMenu(event, kind, entityId = "") {
+  event.preventDefault();
+  event.stopPropagation();
+  bw.contextMenu = { x: event.clientX, y: event.clientY, kind, entityId };
+  bwRenderTreeMenu();
+  bwClampTreeMenu();
+}
+
+function bwCloseTreeMenu() {
+  if (!bw.contextMenu) return;
+  bw.contextMenu = null;
+  document.querySelector(".bw-tree-menu")?.remove();
+}
+
+function bwClampTreeMenu() {
+  setTimeout(() => {
+    const menu = document.querySelector(".bw-context-menu");
+    if (!menu) return;
+    const margin = 8;
+    const rect = menu.getBoundingClientRect();
+    const left = Math.max(margin, Math.min(rect.left, window.innerWidth - rect.width - margin));
+    const top = Math.max(margin, Math.min(rect.top, window.innerHeight - rect.height - margin));
+    menu.style.left = `${left}px`;
+    menu.style.top = `${top}px`;
+    menu.style.maxHeight = `${Math.max(140, window.innerHeight - (margin * 2))}px`;
+  }, 0);
+}
+
+function bwAddSite() {
+  bwStartDraft("site");
+}
+
+function bwCommitDraft(nameValue) {
+  const inv = inventoryInstance();
+  const draft = bw.draft;
+  if (!inv || !draft) return null;
+  const name = String(nameValue || "").trim();
+  bw.draft = null;
+  if (!name) {
+    bwRenderModelScope({ tree: true, details: true, header: true });
+    return null;
+  }
+  let entity = null;
+  if (draft.type === "site") {
+    entity = inv.upsertEntity({
+      type: "site",
+      name,
+      tags: { site: true, haystack: "4" },
+    });
+  } else if (draft.type === "building") {
+    const site = inv.getEntity(draft.parentId) || bwEnsureSite(inv);
+    entity = inv.upsertEntity({
+      type: "building",
+      siteId: site.id,
+      parentId: site.id,
+      name,
+      tags: { building: true },
+    });
+  } else if (draft.type === "floor") {
+    const building = inv.getEntity(draft.parentId);
+    if (!building) {
+      bwRenderModelScope({ tree: true, details: true, header: true });
+      return null;
+    }
+    const site = inv.getEntity(building.siteId || building.parentId);
+    entity = inv.upsertEntity({
+      type: "floor",
+      siteId: site?.id || building.siteId,
+      buildingId: building.id,
+      parentId: building.id,
+      name,
+      tags: { floor: true },
+    });
+  } else if (draft.type === "equip") {
+    const floor = inv.getEntity(draft.parentId);
+    if (!floor) {
+      bwRenderModelScope({ tree: true, details: true, header: true });
+      return null;
+    }
+    const building = inv.getEntity(floor.buildingId || floor.parentId);
+    entity = inv.upsertEntity({
+      type: "equip",
+      siteId: floor.siteId || building?.siteId,
+      buildingId: building?.id || floor.buildingId,
+      floorId: floor.id,
+      parentId: floor.id,
+      name,
+      tags: { equip: true, device: true },
+    });
+  } else if (draft.type === "point") {
+    const parent = inv.getEntity(draft.parentId);
+    if (!parent) {
+      bwRenderModelScope({ tree: true, details: true, header: true });
+      return null;
+    }
+    const ctx = bwEntityContext(inv, parent);
+    const floor = parent.type === "floor" ? parent : ctx.floor;
+    const equip = parent.type === "equip" ? parent : ctx.equip;
+    entity = inv.upsertEntity({
+      type: "point",
+      siteId: ctx.site?.id || parent.siteId,
+      buildingId: ctx.building?.id || parent.buildingId,
+      floorId: floor?.id || parent.floorId,
+      equipId: equip?.id || "",
+      parentId: equip?.id || floor?.id,
+      name,
+      tags: { point: true },
+    });
+  }
+  if (!entity) {
+    bwRenderModelScope({ tree: true, details: true, header: true });
+    return null;
+  }
+  logTo("building-workspace", `Added ${bwTreeNodeLabel(entity).toLowerCase()} ${entity.name}.`, "ok");
+  bwSelectTreeEntity(entity);
+  return entity;
+}
+
+function bwAddBuilding(siteId) {
+  bwStartDraft("building", siteId);
+}
+
+function bwAddFloor(buildingId) {
+  bwStartDraft("floor", buildingId);
+}
+
+function bwBatchFloorName(pattern, n) {
+  const p = String(pattern || "").trim() || "Floor {n}";
+  return /(\{n\}|#)/.test(p) ? p.replace(/\{n\}|#/g, String(n)) : `${p} ${n}`;
+}
+
+function bwBatchFloorNumber(startText, offset) {
+  const raw = String(startText || "").trim();
+  const n = Number.parseInt(raw, 10) + offset;
+  if (!Number.isFinite(n)) return "";
+  const width = /^\d+$/.test(raw) && raw.length > 1 && raw.startsWith("0") ? raw.length : 0;
+  return width ? String(n).padStart(width, "0") : String(n);
+}
+
+function bwFocusBatchFloors() {
+  setTimeout(() => {
+    const input = document.querySelector("[data-bw-floor-batch-pattern='1']");
+    if (!input) return;
+    input.focus();
+    input.select();
+  }, 0);
+}
+
+function bwPrepareBatchFloors(building) {
+  const inv = inventoryInstance();
+  const floors = inv && building ? inv.listEntities({ type: "floor", buildingId: building.id }) : [];
+  bw.floorBatchStart = String(floors.length + 1);
+  bwSelectTreeEntity(building);
+  bwFocusBatchFloors();
+}
+
+function bwBatchAddFloors(buildingId) {
+  const inv = inventoryInstance();
+  const building = inv && inv.getEntity(buildingId);
+  if (!inv || !building) return;
+  const site = inv.getEntity(building.siteId || building.parentId);
+  const startText = String(bw.floorBatchStart || "").trim();
+  const start = Number.parseInt(startText, 10);
+  const count = Number.parseInt(bw.floorBatchCount, 10);
+  if (!Number.isFinite(start) || !Number.isFinite(count) || count < 1) {
+    logTo("building-workspace", "Batch floors need a valid start number and count.", "warn");
+    bwRenderModelScope({ tree: true, details: true });
+    return;
+  }
+  const total = Math.min(count, 200);
+  const created = [];
+  const skipped = [];
+  for (let i = 0; i < total; i++) {
+    const n = bwBatchFloorNumber(startText, i);
+    const name = bwBatchFloorName(bw.floorBatchPattern, n);
+    if (bwEntityByName(inv, { type: "floor", buildingId: building.id }, name)) {
+      skipped.push(name);
+      continue;
+    }
+    created.push(inv.upsertEntity({
+      type: "floor",
+      siteId: site?.id || building.siteId,
+      buildingId: building.id,
+      parentId: building.id,
+      name,
+      tags: { floor: true },
+    }));
+  }
+  if (created.length) {
+    const last = created.at(-1);
+    bwSetSelection([last.id], last.id);
+    bw.selectionAnchorId = last.id;
+    bw.selectedSiteId = last.siteId || "";
+    bw.selectedBuildingId = building.id;
+    bw.selectedFloorId = last.id;
+    bwSaveState();
+  }
+  const skippedMsg = skipped.length ? ` Skipped ${skipped.length} duplicate${skipped.length === 1 ? "" : "s"}.` : "";
+  logTo("building-workspace", `Added ${created.length} floor${created.length === 1 ? "" : "s"} to ${building.name}.${skippedMsg}`, created.length ? "ok" : "warn");
+  bwRenderModelScope({ tree: true, details: true, header: true });
+}
+
+function bwSyncInboxSelectionUi() {
+  const selected = new Set(bw.deviceInbox?.selectedKeys || []);
+  const phase = bw.deviceInbox?.phase || "discovery";
+  document.querySelectorAll("[data-bw-inbox-key]").forEach((row) => {
+    const on = row.dataset.bwInboxPhase === phase && selected.has(row.dataset.bwInboxKey);
+    row.classList.toggle("bw-inbox-row-selected", on);
+    row.setAttribute("aria-selected", on ? "true" : "false");
+  });
+  const queue = document.getElementById("bw-inbox-queue-selected");
+  if (queue) queue.disabled = phase !== "discovery" || selected.size === 0;
+  const ignore = document.getElementById("bw-inbox-ignore-selected");
+  if (ignore) ignore.disabled = phase !== "discovery" || selected.size === 0;
+  const remove = document.getElementById("bw-inbox-remove-queued");
+  if (remove) remove.disabled = phase !== "modeling" || selected.size === 0;
+  const add = document.getElementById("bw-inbox-model-selected");
+  if (add) add.disabled = !add.dataset.floorId || Number(add.dataset.queuedCount || 0) === 0;
+}
+
+function bwApplyDeviceInboxFilter() {
+  bwSaveState();
+  const inv = inventoryInstance();
+  const body = document.getElementById("bw-discovered-device-rows");
+  if (!inv || !body) return;
+  body.replaceChildren(...bwDiscoveredDeviceRows(inv));
+  bwSyncInboxSelectionUi();
+}
+
+function bwDiscoveryDragAttrs(item, canDrag) {
+  if (!canDrag) return {};
+  return {
+    draggable: "true",
+    title: "Drag to Import Plan",
+    ondragstart: (e) => bwDragDiscoveryDevices(item, e),
+    ondragend: () => { bwInboxDragKeys = []; },
+  };
+}
+
+function bwQueueSelectedInboxDevices() {
+  const inv = inventoryInstance();
+  if (!inv) return;
+  const selected = bwInboxSelectionFor("discovery");
+  const floor = bwCurrentFloorForInbox(inv);
+  bw.deviceInbox.candidates = bwQueueInboxDevices({
+    candidates: bw.deviceInbox.candidates || {},
+    keys: selected,
+    devices: bac.devices || [],
+    modeledDevices: inv.listEntities({ type: "equip" }),
+    targetFloorId: floor?.id || "",
+  });
+  const queued = selected.filter((key) => bw.deviceInbox.candidates[key]?.status === "queued");
+  bwSetInboxSelection("modeling", queued, queued.at(-1) || "");
+  logTo("building-workspace", `Queued ${queued.length} device${queued.length === 1 ? "" : "s"} for modeling.`, queued.length ? "ok" : "warn");
+  bwSaveState();
+  bwRenderInboxScope();
+}
+
+let bwInboxDragKeys = [];
+
+function bwDragDiscoveryDevices(item, event) {
+  const selected = bwInboxSelectionFor("discovery");
+  const keys = bw.deviceInbox.phase === "discovery" && selected.includes(item.key) ? selected : [item.key];
+  bwSetInboxSelection("discovery", keys, item.key);
+  bw.inboxMenu = null;
+  bwInboxDragKeys = keys;
+  event.stopPropagation();
+  event.dataTransfer.effectAllowed = "copy";
+  event.dataTransfer.setData("application/x-stier-bacnet-device-keys", JSON.stringify(keys));
+  event.dataTransfer.setData("text/plain", keys.join(","));
+  bwSyncInboxSelectionUi();
+}
+
+function bwImportPlanDragOver(event) {
+  const types = Array.from(event.dataTransfer.types || []);
+  if (!bwInboxDragKeys.length && !types.includes("application/x-stier-bacnet-device-keys") && !types.includes("text/plain")) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "copy";
+  event.currentTarget.classList.add("bw-import-plan-drop");
+}
+
+function bwImportPlanDragLeave(event) {
+  event.currentTarget.classList.remove("bw-import-plan-drop");
+}
+
+function bwImportPlanDrop(event) {
+  event.preventDefault();
+  event.currentTarget.classList.remove("bw-import-plan-drop");
+  const raw = event.dataTransfer.getData("application/x-stier-bacnet-device-keys");
+  try {
+    const keys = raw ? JSON.parse(raw) : bwInboxDragKeys;
+    if (Array.isArray(keys) && keys.length) {
+      bwSetInboxSelection("discovery", keys, keys.at(-1));
+      bwQueueSelectedInboxDevices();
+    }
+  } catch (_) {
+    // Ignore malformed drag payloads from outside the app.
+  } finally {
+    bwInboxDragKeys = [];
+  }
+}
+
+function bwIgnoreSelectedInboxDevices() {
+  const selected = bwInboxSelectionFor("discovery");
+  if (!selected.length) return;
+  const next = { ...(bw.deviceInbox.candidates || {}) };
+  for (const key of selected) {
+    next[key] = {
+      ...(next[key] || {}),
+      key,
+      status: "ignored",
+      discoveredAt: next[key]?.discoveredAt || new Date().toISOString(),
+    };
+  }
+  bw.deviceInbox.candidates = next;
+  bwSetInboxSelection("discovery", []);
+  bwSaveState();
+  bwRenderInboxScope();
+}
+
+function bwRemoveQueuedInboxDevices(keys = bwInboxSelectionFor("modeling")) {
+  bw.deviceInbox.candidates = bwRemoveQueuedDevices(bw.deviceInbox.candidates || {}, keys);
+  bwSetInboxSelection("modeling", []);
+  bwSaveState();
+  bwRenderInboxScope();
+}
+
+function bwClearDeviceDiscovery() {
+  bac.devices = [];
+  bac.discoveryRan = false;
+  bac.lastDiscoveryCount = null;
+  bw.deviceInbox.candidates = {};
+  bwSetInboxSelection("discovery", []);
+  bwSaveState();
+  bwRenderInboxScope();
+}
+
+function bwModelQueuedDevicesToFloor(floorId, keys = null) {
+  const inv = inventoryInstance();
+  const floor = inv && inv.getEntity(floorId);
+  if (!inv || !floor) return;
+  const building = inv.getEntity(floor.buildingId || floor.parentId);
+  const site = inv.getEntity(floor.siteId || building?.siteId);
+  if (!site || !building) return;
+  const selectedKeys = Array.isArray(keys)
+    ? keys
+    : (bw.deviceInbox.phase === "modeling" ? bwInboxSelectionFor("modeling") : []);
+  const modelKeys = selectedKeys.length
+    ? selectedKeys
+    : Object.values(bw.deviceInbox.candidates || {}).filter((c) => c?.status === "queued").map((c) => c.key);
+  const result = bwModelQueuedDevices({
+    inventory: inv,
+    devices: bac.devices || [],
+    candidates: bw.deviceInbox.candidates || {},
+    floor,
+    site,
+    building,
+    makeEntity: bwDeviceEntityFromBacnet,
+    keys: modelKeys,
+  });
+  bw.deviceInbox.candidates = result.candidates;
+  const imported = result.imported || [];
+  if (imported.length) {
+    bwSetSelection(imported.map((d) => d.id), imported.at(-1).id);
+    bw.selectionAnchorId = imported.at(-1).id;
+    bw.selectedSiteId = site.id;
+    bw.selectedBuildingId = building.id;
+    bw.selectedFloorId = floor.id;
+  }
+  bwSetInboxSelection("modeling", []);
+  bwSaveState();
+  logTo("building-workspace",
+    `Added ${imported.length} queued device${imported.length === 1 ? "" : "s"} to ${floor.name}.${result.skipped ? ` Skipped ${result.skipped}.` : ""}`,
+    imported.length ? "ok" : "warn");
+  bwRenderInboxScope();
+}
+
+function bwImportDiscoveredDevicesToFloor(floorId, keys = null) {
+  const inv = inventoryInstance();
+  if (!inv) return;
+  const importKeys = Array.isArray(keys) && keys.length ? keys : bwInboxSelectionFor("discovery");
+  bw.deviceInbox.candidates = bwQueueInboxDevices({
+    candidates: bw.deviceInbox.candidates || {},
+    keys: importKeys,
+    devices: bac.devices || [],
+    modeledDevices: inv.listEntities({ type: "equip" }),
+    targetFloorId: floorId,
+  });
+  bwModelQueuedDevicesToFloor(floorId, importKeys);
+}
+
+async function bwDiscoverDevicePoints(equipId) {
+  const inv = inventoryInstance();
+  const equip = inv && inv.getEntity(equipId);
+  if (!inv || !equip) return;
+  const site = inv.getEntity(equip.siteId);
+  const building = inv.getEntity(equip.buildingId);
+  const floor = inv.getEntity(equip.floorId || equip.parentId);
+  const device = equip.deviceRef || { deviceInstance: equip.deviceInstance };
+  const deviceInstance = Number(equip.deviceInstance ?? device.deviceInstance ?? device.instance);
+  if (!Number.isFinite(deviceInstance)) {
+    logTo("building-workspace", `${equip.name} is missing a BACnet device instance.`, "warn");
+    return;
+  }
+  bw.busy = true;
+  bwRenderModelScope({ details: true });
+  try {
+    const bacnet = platform ? platform.capability("bacnet.read.v1") : bacnetRead();
+    const objects = await bacnet.listObjects(device, deviceInstance);
+    let imported = 0;
+    for (const object of objects || []) {
+      inv.upsertEntity(pointEntityFromBacnet({
+        siteId: site?.id || equip.siteId,
+        buildingId: building?.id || equip.buildingId,
+        floorId: floor?.id || equip.floorId,
+        equipId: equip.id,
+        device: { ...device, instance: deviceInstance, deviceInstance },
+        object,
+      }));
+      imported++;
+    }
+    logTo("building-workspace", `Imported ${imported} point${imported === 1 ? "" : "s"} from ${equip.name}.`, imported ? "ok" : "warn");
+  } catch (err) {
+    logTo("building-workspace", `Point discovery failed for ${equip.name}: ${err}`, "error");
+  } finally {
+    bw.busy = false;
+    bwRenderModelScope({ tree: true, details: true, header: true });
+  }
+}
+
+function bwAddDevice(floorId) {
+  bwStartDraft("equip", floorId);
+}
+
+function bwAddPoint(parentId) {
+  bwStartDraft("point", parentId);
+}
+
+function bwRenameEntity(entityId) {
+  const inv = inventoryInstance();
+  const entity = inv && inv.getEntity(entityId);
+  if (!entity) return;
+  const name = bwPromptName(`${entity.type[0].toUpperCase() + entity.type.slice(1)} name`, entity.name);
+  if (!name) return;
+  const renamed = inv.upsertEntity({ ...entity, name });
+  const refreshed = bwRefreshHistorianForEntity(inv, renamed);
+  logTo("building-workspace", `Renamed ${entity.type} to ${renamed.name}${refreshed ? ` and refreshed ${refreshed} historian point${refreshed === 1 ? "" : "s"}` : ""}.`, "ok");
+  bwSelectTreeEntity(renamed);
+}
+
+function bwAffectedPoints(inv, entity) {
+  if (!entity) return [];
+  if (entity.type === "point") return [entity];
+  if (entity.type === "site") return inv.listEntities({ type: "point", siteId: entity.id });
+  if (entity.type === "building") return inv.listEntities({ type: "point", buildingId: entity.id });
+  if (entity.type === "floor") return inv.listEntities({ type: "point", floorId: entity.id });
+  if (entity.type === "equip") return inv.listEntities({ type: "point", equipId: entity.id });
+  return [];
+}
+
+function bwHistorianKey(point) {
+  const device = point.device || {};
+  return `${device.deviceInstance ?? device.instance ?? device.id ?? "?"}:${point.objectType}:${point.instance}`;
+}
+
+function bwHistorianRecordForPoint(inv, point) {
+  const site = inv.getEntity(point.siteId);
+  const building = inv.getEntity(point.buildingId);
+  const floor = inv.getEntity(point.floorId);
+  const equip = inv.getEntity(point.equipId);
+  return historianPointFromEntity(point, { site, building, floor, equip });
+}
+
+function bwRefreshHistorianForEntity(inv, entity) {
+  const hist = historianInstance();
+  if (!hist) return 0;
+  const tracked = new Set(hist.points().map(bwHistorianKey));
+  let refreshed = 0;
+  for (const point of bwAffectedPoints(inv, entity)) {
+    try {
+      const record = bwHistorianRecordForPoint(inv, point);
+      if (!tracked.has(bwHistorianKey(record))) continue;
+      hist.addPoint(record);
+      refreshed++;
+    } catch (_) {
+      // Manual/unbound points do not have BACnet historian records yet.
+    }
+  }
+  if (refreshed) histPersist();
+  return refreshed;
+}
+
+function bwDescendantIds(inv, entity) {
+  if (!entity) return [];
+  const entities = inv.listEntities();
+  const directChildren = (parent) => entities.filter((e) =>
+    e.parentId === parent.id ||
+    (parent.type === "site" && e.siteId === parent.id && e.id !== parent.id) ||
+    (parent.type === "building" && e.buildingId === parent.id && e.id !== parent.id) ||
+    (parent.type === "floor" && e.floorId === parent.id && e.id !== parent.id) ||
+    (parent.type === "equip" && e.equipId === parent.id && e.id !== parent.id));
+  const out = [];
+  const visit = (parent) => {
+    for (const child of directChildren(parent)) {
+      if (out.includes(child.id)) continue;
+      out.push(child.id);
+      visit(child);
+    }
+  };
+  visit(entity);
+  return out;
+}
+
+function bwRemoveEntityTree(entityId) {
+  const inv = inventoryInstance();
+  const entity = inv && inv.getEntity(entityId);
+  if (!entity) return;
+  const ids = [...bwDescendantIds(inv, entity).reverse(), entity.id];
+  if (!confirm(`Remove ${entity.name} and ${ids.length - 1} descendant item(s)?`)) return;
+  for (const id of ids) inv.removeEntity(id);
+  bwSetSelection([]);
+  bw.selectionAnchorId = "";
+  logTo("building-workspace", `Removed ${entity.name}.`, "warn");
+  bwRenderModelScope({ tree: true, details: true, header: true });
+}
+
+function bwHistorizeEquipPoints(equipId) {
+  const inv = inventoryInstance();
+  if (!inv) return;
+  const points = inv.listEntities({ type: "point", equipId });
+  points.forEach((p) => bwHistorizePoint(p.id));
+}
+
+function bwPointsForEntities(inv, entities) {
+  const points = new Map();
+  const add = (rows) => rows.forEach((p) => points.set(p.id, p));
+  for (const entity of entities) {
+    if (entity.type === "point") points.set(entity.id, entity);
+    else if (entity.type === "equip") add(inv.listEntities({ type: "point", equipId: entity.id }));
+    else if (entity.type === "floor") add(inv.listEntities({ type: "point", floorId: entity.id }));
+    else if (entity.type === "building") add(inv.listEntities({ type: "point", buildingId: entity.id }));
+    else if (entity.type === "site") add(inv.listEntities({ type: "point", siteId: entity.id }));
+  }
+  return [...points.values()];
+}
+
+function bwHistorizeSelectedEntities() {
+  const inv = inventoryInstance();
+  if (!inv) return;
+  const points = bwPointsForEntities(inv, bwSelectedEntities(inv));
+  points.forEach((p) => bwHistorizePoint(p.id));
+  if (!points.length) {
+    logTo("building-workspace", "Selection has no points to historize.", "warn");
+    bwRenderModelScope({ details: true });
+  }
+}
+
+function bwApplyTemplateToSelected(templateId = bw.template) {
+  const inv = inventoryInstance();
+  if (!inv) return;
+  const devices = bwSelectedEntities(inv).filter((e) => e.type === "equip");
+  for (const device of devices) inv.applyTemplate(device.id, templateId);
+  logTo("building-workspace", devices.length
+    ? `Applied ${templateId} template to ${devices.length} device${devices.length === 1 ? "" : "s"}.`
+    : "Selection has no devices to template.",
+    devices.length ? "ok" : "warn");
+  bwRenderModelScope({ tree: true, details: true });
+}
+
+function bwRemoveSelectedEntities() {
+  const inv = inventoryInstance();
+  if (!inv) return;
+  const selected = bwSelectedEntities(inv);
+  if (!selected.length) return;
+  const ids = new Set();
+  for (const entity of selected) {
+    ids.add(entity.id);
+    for (const id of bwDescendantIds(inv, entity)) ids.add(id);
+  }
+  if (!confirm(`Remove ${selected.length} selected item(s) and ${ids.size - selected.length} descendant item(s)?`)) return;
+  for (const id of [...ids].reverse()) inv.removeEntity(id);
+  bwSetSelection([]);
+  bw.selectionAnchorId = "";
+  logTo("building-workspace", `Removed ${ids.size} model item${ids.size === 1 ? "" : "s"}.`, "warn");
+  bwRenderModelScope({ tree: true, details: true, header: true });
+}
+
+function bwTreeNodeLabel(entity) {
+  if (!entity) return "Model";
+  if (entity.type === "equip") return entity.tags?.device ? "Device" : "Equipment";
+  return entity.type[0].toUpperCase() + entity.type.slice(1);
+}
+
+function bwDraftBelongs(type, parentId = "") {
+  return bw.draft && bw.draft.type === type && (bw.draft.parentId || "") === (parentId || "");
+}
+
+function bwDraftNode(type, depth, parentId = "") {
+  const draft = bwDraftBelongs(type, parentId) ? bw.draft : null;
+  if (!draft) return null;
+  const onCommit = (input) => bwCommitDraft(input.value);
+  return el("li", { class: "bw-tree-item" },
+    el("div", {
+      class: "bw-tree-node bw-tree-node-on bw-tree-draft-node",
+      style: `--depth:${depth}`,
+      onclick: (e) => e.stopPropagation(),
+      oncontextmenu: (e) => e.preventDefault(),
+    },
+      el("span", { class: "bw-tree-toggle bw-tree-toggle-empty", "aria-hidden": "true" }),
+      el("span", { class: `bw-tree-kind bw-tree-kind-${type}` }, bwTreeNodeLabel({ type, tags: type === "equip" ? { device: true } : {} })[0]),
+      el("input", {
+        class: "bw-tree-name-input",
+        value: draft.name,
+        "data-bw-draft-name": "1",
+        onkeydown: (e) => {
+          if (e.key === "Enter") onCommit(e.currentTarget);
+          if (e.key === "Escape") bwCancelDraft();
+        },
+        onblur: (e) => onCommit(e.currentTarget),
+      })));
+}
+
+function bwTreeNode(inv, entity, depth, children = []) {
+  const selected = bw.selectedEntityIds.includes(entity.id) || bw.selectedEntityId === entity.id;
+  const primary = bw.selectedEntityId === entity.id;
+  const hasChildren = children.length > 0;
+  const collapsed = hasChildren && bwNodeCollapsed(entity.id);
+  return el("li", { class: "bw-tree-item" },
+    el("button", {
+      class: `bw-tree-node ${selected ? "bw-tree-node-on" : ""} ${selected && !primary ? "bw-tree-node-multi" : ""}`,
+      style: `--depth:${depth}`,
+      title: entity.id,
+      onclick: (e) => { e.stopPropagation(); bwSelectTreeEntity(entity, e); },
+      oncontextmenu: (e) => bwOpenTreeMenu(e, entity.type, entity.id),
+    },
+      hasChildren
+        ? el("span", {
+            class: `bw-tree-toggle ${collapsed ? "" : "bw-tree-toggle-open"}`,
+            role: "button",
+            "aria-label": collapsed ? `Expand ${entity.name || entity.id}` : `Collapse ${entity.name || entity.id}`,
+            "aria-expanded": collapsed ? "false" : "true",
+            onclick: (e) => { e.stopPropagation(); bwToggleNodeCollapsed(entity.id); },
+          }, "›")
+        : el("span", { class: "bw-tree-toggle bw-tree-toggle-empty", "aria-hidden": "true" }),
+      el("span", { class: `bw-tree-kind bw-tree-kind-${entity.type}` }, bwTreeNodeLabel(entity)[0]),
+      el("span", { class: "bw-tree-name" }, entity.name || entity.id),
+      entity.type === "point" && !(entity.sourceRefs || []).length ? el("span", { class: "bw-tree-meta" }, "manual") : null),
+    hasChildren && !collapsed ? el("ol", { class: "bw-tree-list" }, ...children) : null);
+}
+
+function bwTreePanel(inv) {
+  const sites = inv.listEntities({ type: "site" });
+  const childrenForSite = (site) => {
+    const buildings = inv.listEntities({ type: "building", siteId: site.id });
+    const legacyEquips = inv.listEntities({ type: "equip", siteId: site.id }).filter((e) => !e.buildingId && !e.floorId);
+    const legacyPoints = inv.listEntities({ type: "point", siteId: site.id }).filter((p) => !p.buildingId && !p.floorId && !p.equipId);
+    return [
+      ...buildings.map((building) => {
+        const floors = inv.listEntities({ type: "floor", buildingId: building.id });
+        const buildingEquips = inv.listEntities({ type: "equip", buildingId: building.id }).filter((e) => !e.floorId);
+        const buildingPoints = inv.listEntities({ type: "point", buildingId: building.id }).filter((p) => !p.floorId && !p.equipId);
+        return bwTreeNode(inv, building, 1, [
+          ...floors.map((floor) => {
+            const equips = inv.listEntities({ type: "equip", floorId: floor.id });
+            const directPoints = inv.listEntities({ type: "point", floorId: floor.id }).filter((p) => !p.equipId);
+            const floorChildren = [
+              ...equips.map((equip) => bwTreeNode(inv, equip, 3, [
+                ...inv.listEntities({ type: "point", equipId: equip.id }).map((p) => bwTreeNode(inv, p, 4)),
+                bwDraftNode("point", 4, equip.id),
+              ].filter(Boolean))),
+              ...directPoints.map((p) => bwTreeNode(inv, p, 3)),
+              bwDraftNode("equip", 3, floor.id),
+            ];
+            return bwTreeNode(inv, floor, 2, floorChildren.filter(Boolean));
+          }),
+          ...buildingEquips.map((equip) => bwTreeNode(inv, equip, 2, [
+            ...inv.listEntities({ type: "point", equipId: equip.id }).map((p) => bwTreeNode(inv, p, 3)),
+            bwDraftNode("point", 3, equip.id),
+          ].filter(Boolean))),
+          ...buildingPoints.map((p) => bwTreeNode(inv, p, 2)),
+          bwDraftNode("floor", 2, building.id),
+        ].filter(Boolean));
+      }),
+      ...legacyEquips.map((equip) => bwTreeNode(inv, equip, 1, [
+        ...inv.listEntities({ type: "point", equipId: equip.id }).map((p) => bwTreeNode(inv, p, 2)),
+        bwDraftNode("point", 2, equip.id),
+      ].filter(Boolean))),
+      ...legacyPoints.map((p) => bwTreeNode(inv, p, 1)),
+      bwDraftNode("building", 1, site.id),
+    ];
+  };
+  const siteNodes = [
+    ...sites.map((site) => bwTreeNode(inv, site, 0, childrenForSite(site).filter(Boolean))),
+    bwDraftNode("site", 0),
+  ].filter(Boolean);
+  return el("section", {
+    id: "bw-model-tree-panel",
+    class: "plugin-section bw-tree-section",
+    onclick: bwCloseTreeMenu,
+    oncontextmenu: (e) => bwOpenTreeMenu(e, "root"),
+  },
+    el("div", { class: "section-head" },
+      el("h3", {}, "Model Tree"),
+      el("span", { class: "muted small" }, `${sites.length} site${sites.length === 1 ? "" : "s"}`)),
+    el("div", { class: "bw-tree-scroll" },
+      el("button", {
+        class: `bw-tree-node bw-tree-root ${!bw.selectedEntityId && bw.selectedEntityIds.length === 0 ? "bw-tree-node-on" : ""}`,
+        style: "--depth:0",
+        onclick: (e) => { e.stopPropagation(); bwSelectTreeEntity(null); },
+      oncontextmenu: (e) => bwOpenTreeMenu(e, "root"),
+    },
+        el("span", { class: "bw-tree-toggle bw-tree-toggle-empty", "aria-hidden": "true" }),
+        el("span", { class: "bw-tree-kind" }, "M"),
+        el("span", { class: "bw-tree-name" }, "Model")),
+      siteNodes.length
+        ? el("ol", { class: "bw-tree-list bw-tree-list-root" },
+            ...siteNodes)
+        : el("p", { class: "muted small" }, "Right-click Model to add a site.")),
+    bwTreeContextMenu(inv));
+}
+
+function bwMenuButton(label, action, danger = false) {
+  return el("button", {
+    class: danger ? "bw-menu-item bw-menu-danger" : "bw-menu-item",
+    onclick: (e) => {
+      e.stopPropagation();
+      bw.contextMenu = null;
+      document.querySelector(".bw-tree-menu")?.remove();
+      action();
+    },
+  }, label);
+}
+
+function bwTreeContextMenu(inv) {
+  const menu = bw.contextMenu;
+  if (!menu) return null;
+  const entity = menu.entityId ? inv.getEntity(menu.entityId) : null;
+  const items = [];
+  const selected = bwSelectedEntities(inv);
+  if (entity && selected.length > 1 && selected.some((e) => e.id === entity.id)) {
+    items.push(bwMenuButton("Historize selection", bwHistorizeSelectedEntities));
+    items.push(bwMenuButton("Apply template to devices", () => bwApplyTemplateToSelected(bw.template)));
+    items.push(bwMenuButton("Clear selection", () => { bwSetSelection([]); bw.selectionAnchorId = ""; bwSaveState(); bwRenderModelScope({ tree: true, details: true, header: true }); }));
+    items.push(bwMenuButton("Remove selection", bwRemoveSelectedEntities, true));
+    return el("div", {
+      class: "bw-context-menu bw-tree-menu",
+      style: `left:${menu.x}px; top:${menu.y}px`,
+      onclick: (e) => e.stopPropagation(),
+    }, ...items);
+  }
+  if (menu.kind === "root") {
+    items.push(bwMenuButton("Add site", bwAddSite));
+  } else if (entity?.type === "site") {
+    items.push(bwMenuButton("Add building", () => bwAddBuilding(entity.id)));
+    items.push(bwMenuButton("Rename site", () => bwRenameEntity(entity.id)));
+    items.push(bwMenuButton("Remove site", () => bwRemoveEntityTree(entity.id), true));
+  } else if (entity?.type === "building") {
+    items.push(bwMenuButton("Add floor", () => bwAddFloor(entity.id)));
+    items.push(bwMenuButton("Batch add floors", () => bwPrepareBatchFloors(entity)));
+    items.push(bwMenuButton("Rename building", () => bwRenameEntity(entity.id)));
+    items.push(bwMenuButton("Remove building", () => bwRemoveEntityTree(entity.id), true));
+  } else if (entity?.type === "floor") {
+    items.push(bwMenuButton("Add device", () => bwAddDevice(entity.id)));
+    items.push(bwMenuButton("Rename floor", () => bwRenameEntity(entity.id)));
+    items.push(bwMenuButton("Remove floor", () => bwRemoveEntityTree(entity.id), true));
+  } else if (entity?.type === "equip") {
+    items.push(bwMenuButton("Add point", () => bwAddPoint(entity.id)));
+    items.push(bwMenuButton("Apply template", () => bwApplyTemplate(entity.id, bw.template)));
+    items.push(bwMenuButton("Historize points", () => bwHistorizeEquipPoints(entity.id)));
+    items.push(bwMenuButton("Rename device", () => bwRenameEntity(entity.id)));
+    items.push(bwMenuButton("Remove device", () => bwRemoveEntityTree(entity.id), true));
+  } else if (entity?.type === "point") {
+    items.push(bwMenuButton("Historize point", () => bwHistorizePoint(entity.id)));
+    items.push(bwMenuButton("Rename point", () => bwRenameEntity(entity.id)));
+    items.push(bwMenuButton("Remove point", () => bwRemoveEntityTree(entity.id), true));
+  }
+  return el("div", {
+    class: "bw-context-menu bw-tree-menu",
+    style: `left:${menu.x}px; top:${menu.y}px`,
+    onclick: (e) => e.stopPropagation(),
+  }, ...items);
+}
+
+function bwRenderTreeMenu() {
+  document.querySelector(".bw-tree-menu")?.remove();
+  const inv = inventoryInstance();
+  if (!inv || !bw.contextMenu) return;
+  const menu = bwTreeContextMenu(inv);
+  if (menu) document.body.appendChild(menu);
+}
+
+function bwPointRows(inv) {
+  return inv.listEntities({ type: "point" });
+}
+
+function bwSetTab(tab) {
+  bw.tab = tab;
+  bwSaveState();
+  bwRenderWorkspaceScope();
+}
+
+function bwTabs() {
+  const tabs = [
+    ["model", "Model"],
+    ["bacnet", "BACnet"],
+    ["historian", "Historian"],
+    ["dashboard", "Dashboard"],
+    ["commissioning", "Commissioning"],
+    ["reports", "Reports"],
+  ];
+  return el("div", { class: "bw-tabs" },
+    ...tabs.map(([tab, label]) =>
+      el("button", {
+        class: `bw-tab ${bw.tab === tab ? "bw-tab-on" : ""}`,
+        onclick: () => bwSetTab(tab),
+      }, label)));
+}
+
+function bwDownload(filename, text, type = "text/plain;charset=utf-8") {
+  const blob = new Blob([text], { type });
+  const url = URL.createObjectURL(blob);
+  const a = el("a", { href: url, download: filename });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function bwHistorizePoint(pointId) {
+  const inv = inventoryInstance();
+  const hist = historianInstance();
+  if (!inv || !hist) return;
+  const point = inv.getEntity(pointId);
+  if (!point) return;
+  const site = inv.getEntity(point.siteId);
+  const building = inv.getEntity(point.buildingId);
+  const floor = inv.getEntity(point.floorId);
+  const equip = inv.getEntity(point.equipId);
+  try {
+    hist.addPoint(historianPointFromEntity(point, { site, building, floor, equip }));
+    histPersist();
+    logTo("building-workspace", `Historizing ${point.name}.`, "ok");
+    bwRenderTabScope();
+  } catch (err) {
+    logTo("building-workspace", `Could not historize ${point.name}: ${err}`, "error");
+  }
+}
+
+function bwHistorizeSelectedObject(obj = bacSelectedObject()) {
+  const inv = inventoryInstance();
+  const dev = bacSelectedDevice();
+  if (!inv || !dev || !obj) return;
+  const { site, building, floor } = bwEnsureLocation(inv);
+  const equipName = suggestEquipmentName(obj.name || "", `Device ${dev.instance}`);
+  let equip = bwEntityByName(inv, { type: "equip", floorId: floor.id }, equipName)
+    || inv.upsertEntity({
+      type: "equip",
+      siteId: site.id,
+      buildingId: building.id,
+      floorId: floor.id,
+      parentId: floor.id,
+      name: equipName,
+      tags: { equip: true },
+    });
+  equip = inv.applyTemplate(equip.id, bwTemplateForName(equipName));
+  const point = inv.upsertEntity(pointEntityFromBacnet({
+    siteId: site.id,
+    buildingId: building.id,
+    floorId: floor.id,
+    equipId: equip.id,
+    device: dev,
+    object: obj,
+    props: bacObjectKey(obj) === bac.selectedObjectKey ? bac.props : [],
+  }));
+  bwHistorizePoint(point.id);
+}
+
+function bwApplyTemplate(entityId, templateId) {
+  const inv = inventoryInstance();
+  if (!inv) return;
+  inv.applyTemplate(entityId, templateId);
+  logTo("building-workspace", `Applied ${templateId} template.`, "ok");
+  bwRenderModelScope({ tree: true, details: true });
+}
+
+function bwSelectedEntity(inv) {
+  if (!bw.selectedEntityId) return null;
+  const entity = inv.getEntity(bw.selectedEntityId);
+  if (!entity) {
+    bwSetSelection([]);
+    bwSaveState();
+    return null;
+  }
+  return entity;
+}
+
+function bwSelectedEntities(inv) {
+  const ids = bw.selectedEntityIds.length ? bw.selectedEntityIds : (bw.selectedEntityId ? [bw.selectedEntityId] : []);
+  const entities = ids.map((id) => inv.getEntity(id)).filter(Boolean);
+  if (entities.length !== ids.length) {
+    bwSetSelection(entities.map((e) => e.id), entities.at(-1)?.id || "");
+    bwSaveState();
+  }
+  return entities;
+}
+
+function bwScopeCounts(inv, entity = null) {
+  const inScope = (e) => {
+    if (!entity) return true;
+    if (entity.type === "site") return e.siteId === entity.id || e.id === entity.id;
+    if (entity.type === "building") return e.buildingId === entity.id || e.parentId === entity.id || e.id === entity.id;
+    if (entity.type === "floor") return e.floorId === entity.id || e.parentId === entity.id || e.id === entity.id;
+    if (entity.type === "equip") return e.equipId === entity.id || e.parentId === entity.id || e.id === entity.id;
+    return e.id === entity.id;
+  };
+  const rows = inv.listEntities().filter(inScope);
+  return {
+    sites: rows.filter((e) => e.type === "site").length,
+    buildings: rows.filter((e) => e.type === "building").length,
+    floors: rows.filter((e) => e.type === "floor").length,
+    devices: rows.filter((e) => e.type === "equip").length,
+    points: rows.filter((e) => e.type === "point").length,
+  };
+}
+
+function bwCountTile(label, value) {
+  return el("div", { class: "bw-count-tile" },
+    el("span", { class: "bw-count-value" }, String(value)),
+    el("span", { class: "bw-count-label" }, label));
+}
+
+function bwDetailRow(label, value) {
+  if (value == null || value === "") return null;
+  return el("div", { class: "bw-detail-row" },
+    el("span", { class: "bw-detail-label" }, label),
+    el("span", { class: "bw-detail-value" }, String(value)));
+}
+
+function bwBreadcrumbItems(inv, entity) {
+  if (!entity) return [];
+  const { site, building, floor, equip } = bwEntityContext(inv, entity);
+  const items = [];
+  for (const candidate of [site, building, floor, equip]) {
+    if (candidate && !items.some((item) => item.id === candidate.id)) items.push(candidate);
+  }
+  if (!items.some((item) => item.id === entity.id)) items.push(entity);
+  return items;
+}
+
+function bwBreadcrumb(inv, entity) {
+  const items = bwBreadcrumbItems(inv, entity);
+  if (!items.length) return null;
+  return el("nav", { class: "bw-breadcrumb", "aria-label": "Model path" },
+    ...items.flatMap((item, i) => [
+      i ? el("span", { class: "bw-breadcrumb-sep" }, ">") : null,
+      el("button", {
+        class: `bw-breadcrumb-item ${item.id === entity.id ? "bw-breadcrumb-current" : ""}`,
+        onclick: (e) => { e.stopPropagation(); bwSelectTreeEntity(item); },
+      }, item.name || item.id),
+    ]));
+}
+
+function bwHeaderBreadcrumb() {
+  const inv = inventoryInstance();
+  if (!inv) return null;
+  const selected = bwSelectedEntities(inv);
+  if (selected.length > 1) {
+    return el("div", { id: "bw-header-breadcrumb-addon", class: "bw-breadcrumb bw-breadcrumb-summary" }, `${selected.length} selected`);
+  }
+  const entity = selected.length === 1 ? selected[0] : bwSelectedEntity(inv);
+  const crumb = entity ? bwBreadcrumb(inv, entity) : el("div", { class: "bw-breadcrumb bw-breadcrumb-summary" });
+  crumb.id = "bw-header-breadcrumb-addon";
+  return crumb;
+}
+
+function bwCurrentFloorForInbox(inv) {
+  const selected = bwSelectedEntity(inv);
+  if (!selected) return null;
+  if (selected.type === "floor") return selected;
+  const { floor } = bwEntityContext(inv, selected);
+  return floor || null;
+}
+
+function bwSelectedNetworkAdapterName() {
+  return nm.selectedAdapter || nmSelected()?.adapterName || nm.scan.adapterName || "";
+}
+
+function bwOpenAdapterSelection(adapterName = "") {
+  nm.tab = "configure";
+  const target = adapterName || bwSelectedNetworkAdapterName() || nmScanDefaultAdapter();
+  if (target) {
+    nm.selectedAdapter = target;
+    nm.selectedId = null;
+  }
+  setView(pluginView("networkmanager"));
+}
+
+function bwDeviceInboxEmptyMessage() {
+  if (bac.discovering) return "Listening for I-Am replies...";
+  if (bac.discoveryRan && bac.lastDiscoveryCount === 0) {
+    const selectedAdapter = bwSelectedNetworkAdapterName();
+    const subnet = selectedAdapter ? nmScanSubnetFor(selectedAdapter) : null;
+    const target = bacAdapterTarget(selectedAdapter);
+    const adapterMessage = !nm.loaded
+      ? "Network adapters have not been read yet. Open Network Manager to verify the active BAS/NIC adapter."
+      : !selectedAdapter
+        ? "No Network Manager adapter is selected. Choose the active BAS/NIC adapter, then run discovery again."
+        : !subnet
+          ? `${selectedAdapter} is selected, but it does not have a usable IPv4 subnet. Check its IP configuration or choose another adapter.`
+          : `${selectedAdapter} is selected (${subnet.label}). Tried ${target?.label || bac.target}. Check VPN/firewall rules, BBMD/foreign-device routing, or try a known device IP with the advanced BACnet Inspector.`;
+    return el("div", { class: "bw-empty-action" },
+      el("span", {}, `Discovery finished with no BACnet devices found. ${adapterMessage}`),
+      el("button", { class: "btn-ghost", onclick: () => bwOpenAdapterSelection(selectedAdapter) }, "Open adapter selection"));
+  }
+  return "No discovered devices yet. Run discovery to populate the inbox.";
+}
+
+function bwRenderDeviceInboxLive() {
+  const inv = inventoryInstance();
+  const node = document.getElementById("bw-device-inbox");
+  if (!inv || !node) return;
+  node.replaceWith(bwDeviceInbox(inv, bwCurrentFloorForInbox(inv)));
+}
+
+function bwInboxScrollState() {
+  return [...document.querySelectorAll("#bw-device-inbox .bw-device-inbox-scroll")]
+    .map((node, index) => ({ index, top: node.scrollTop, left: node.scrollLeft }));
+}
+
+function bwRestoreInboxScrollState(state) {
+  for (const item of state || []) {
+    const node = document.querySelectorAll("#bw-device-inbox .bw-device-inbox-scroll")[item.index];
+    if (!node) continue;
+    node.scrollTop = item.top;
+    node.scrollLeft = item.left;
+  }
+}
+
+function bwPatchDeviceInboxLive() {
+  const inv = inventoryInstance();
+  const inbox = document.getElementById("bw-device-inbox");
+  if (!inv || !inbox) {
+    bwRenderDeviceInboxLive();
+    return;
+  }
+  const floor = bwCurrentFloorForInbox(inv);
+  const discovered = bwDeviceInboxCandidateList(inv);
+  const queued = bwDeviceInboxQueueList(inv);
+  const discoverySelected = bwInboxSelectionFor("discovery").length;
+  const modelingSelected = bwInboxSelectionFor("modeling").length;
+  const scrollState = bwInboxScrollState();
+
+  document.getElementById("bw-discovered-device-rows")?.replaceChildren(...bwDiscoveredDeviceRows(inv));
+  document.getElementById("bw-modeling-queue-rows")?.replaceChildren(...bwModelingQueueRows(inv, floor));
+
+  const count = document.getElementById("bw-device-inbox-count");
+  if (count) count.textContent = bac.discovering ? "Discovering..." : `${discovered.length} shown · ${queued.length} queued`;
+  const ignore = document.getElementById("bw-inbox-ignore-selected");
+  if (ignore) ignore.disabled = discoverySelected ? false : true;
+  const clear = document.getElementById("bw-inbox-clear");
+  if (clear) clear.disabled = bac.devices.length || queued.length ? false : true;
+  const model = document.getElementById("bw-inbox-model-selected");
+  if (model) {
+    model.dataset.floorId = floor?.id || "";
+    model.dataset.queuedCount = String(queued.length);
+    model.disabled = floor && queued.length ? false : true;
+    model.textContent = floor ? (modelingSelected ? `Add selected to ${floor.name}` : `Add queue to ${floor.name}`) : "Select a floor";
+  }
+  const remove = document.getElementById("bw-inbox-remove-queued");
+  if (remove) remove.disabled = modelingSelected ? false : true;
+  bwSyncInboxSelectionUi();
+  bwRestoreInboxScrollState(scrollState);
+  requestAnimationFrame(() => bwRestoreInboxScrollState(scrollState));
+}
+
+function bwRenderHeaderAddon() {
+  const node = document.getElementById("bw-header-breadcrumb-addon");
+  if (!node) return;
+  const next = bwHeaderBreadcrumb();
+  if (next) node.replaceWith(next);
+}
+
+function bwRenderWorkspaceScope() {
+  const node = document.getElementById("bw-root");
+  if (!node || currentPluginId() !== "building-workspace") {
+    renderScoped("page");
+    return;
+  }
+  node.replaceWith(renderBuildingWorkspacePage());
+  bwRenderHeaderAddon();
+}
+
+function bwRenderTabScope() {
+  const inv = inventoryInstance();
+  const body = document.getElementById("bw-tab-body");
+  if (!inv || !body || currentPluginId() !== "building-workspace") {
+    bwRenderWorkspaceScope();
+    return;
+  }
+  body.replaceChildren(bwCurrentTabBody(inv));
+  bwRenderHeaderAddon();
+}
+
+function bwRenderModelScope({ tree = false, details = false, header = false } = {}) {
+  const inv = inventoryInstance();
+  if (!inv || currentPluginId() !== "building-workspace") {
+    renderScoped("page");
+    return;
+  }
+  if (bw.tab !== "model") {
+    bwRenderTabScope();
+    return;
+  }
+  const treeNode = document.getElementById("bw-model-tree-panel");
+  const detailsNode = document.getElementById("bw-model-details");
+  if (tree && treeNode) treeNode.replaceWith(bwTreePanel(inv));
+  if (details && detailsNode) detailsNode.replaceWith(bwModelDetails(inv));
+  if (header) bwRenderHeaderAddon();
+  if ((tree && !treeNode) || (details && !detailsNode)) bwRenderTabScope();
+}
+
+function bwRenderInboxScope() {
+  if (currentPluginId() !== "building-workspace") {
+    renderScoped("page");
+    return;
+  }
+  if (bw.tab === "bacnet") bwPatchDeviceInboxLive();
+  else bwRenderTabScope();
+  bwRenderHeaderAddon();
+}
+
+function bwInboxStatusLabel(inv, item, floor = null) {
+  const existing = item.modeledDevice;
+  if (item.status === "queued") return "Queued";
+  if (item.status === "changed") return "Changed";
+  if (item.status === "conflict") return item.conflict || "Conflict";
+  if (existing) {
+    const existingFloor = inv.getEntity(existing.floorId || existing.parentId);
+    return existing.floorId === floor?.id ? "Modeled here" : `Modeled on ${existingFloor?.name || "another floor"}`;
+  }
+  return "New";
+}
+
+function bwInboxStatusClass(status) {
+  if (status === "new") return "pill-running";
+  if (status === "queued") return "pill-info";
+  if (status === "changed") return "pill-warn";
+  if (status === "conflict") return "pill-error";
+  return "pill-muted";
+}
+
+function bwDiscoveredDeviceRows(inv) {
+  const items = bwDeviceInboxCandidateList(inv);
+  const floor = bwCurrentFloorForInbox(inv);
+  const selected = new Set(bwInboxSelectionFor("discovery"));
+  const rows = items.map((item) => {
+    const device = item.device;
+    const canDrag = item.selectable !== false;
+    const dragAttrs = bwDiscoveryDragAttrs(item, canDrag);
+    return el("tr", {
+      class: `bw-inbox-row ${selected.has(item.key) ? "bw-inbox-row-selected" : ""} ${item.selectable === false ? "bw-inbox-row-disabled" : ""}`,
+      "data-bw-inbox-key": item.key,
+      "data-bw-inbox-phase": "discovery",
+      "aria-selected": selected.has(item.key) ? "true" : "false",
+      ...dragAttrs,
+      onclick: (e) => bwSelectInboxCandidate("discovery", item, e),
+      oncontextmenu: (e) => bwOpenInboxMenu(e, "discovery", item),
+    },
+      el("td", { class: "bac-num", ...dragAttrs }, String(device.instance ?? "")),
+      el("td", { ...dragAttrs }, device.name || el("span", { class: "muted" }, "Unnamed")),
+      el("td", { class: "bac-mono", ...dragAttrs }, bacAddressText(device)),
+      el("td", { ...dragAttrs }, bacVendorText(device) || el("span", { class: "muted" }, "-")),
+      el("td", { ...dragAttrs }, device.modelName || el("span", { class: "muted" }, "-")),
+      el("td", { ...dragAttrs }, el("span", { class: `pill ${bwInboxStatusClass(item.status)}` }, bwInboxStatusLabel(inv, item, floor))));
+  });
+  return rows.length ? rows : [el("tr", {}, el("td", { class: "muted small", colspan: "6" }, bwDeviceInboxEmptyMessage()))];
+}
+
+function bwModelingQueueRows(inv, floor = null) {
+  const items = bwDeviceInboxQueueList(inv);
+  const selected = new Set(bwInboxSelectionFor("modeling"));
+  const rows = items.map((item) => {
+    const device = item.device;
+    const targetFloor = inv.getEntity(item.candidate?.targetFloorId || floor?.id);
+    const instance = device ? String(device.instance ?? "") : item.key.replace(/^bacnet-device:/, "");
+    const match = item.modeledDevice ? bwInboxPathLabel(inv, item.modeledDevice) : (item.conflict || "");
+    return el("tr", {
+      class: `bw-inbox-row ${selected.has(item.key) ? "bw-inbox-row-selected" : ""}`,
+      "data-bw-inbox-key": item.key,
+      "data-bw-inbox-phase": "modeling",
+      "aria-selected": selected.has(item.key) ? "true" : "false",
+      onclick: (e) => bwSelectInboxCandidate("modeling", item, e),
+      oncontextmenu: (e) => bwOpenInboxMenu(e, "modeling", item),
+    },
+      el("td", {}, item.proposedName || device?.name || "Unnamed"),
+      el("td", { class: "bac-num" }, instance),
+      el("td", { class: "bac-mono" }, device ? bacAddressText(device) : "not in current discovery"),
+      el("td", {}, device ? bacVendorText(device) || "-" : "-"),
+      el("td", {}, device?.modelName || "-"),
+      el("td", {}, targetFloor?.name || "Selected floor"),
+      el("td", {}, match || el("span", { class: "muted" }, "-")),
+      el("td", {}, item.action === "skip" ? "Skip" : "Add"),
+      el("td", {}, el("span", { class: `pill ${bwInboxStatusClass(item.status)}` }, bwInboxStatusLabel(inv, item, floor))));
+  });
+  return rows.length ? rows : [el("tr", {}, el("td", { class: "muted small", colspan: "9" }, "No queued devices. Highlight discovered rows and queue them for modeling."))];
+}
+
+function bwInboxPathLabel(inv, entity) {
+  return entity ? bwBreadcrumbItems(inv, entity).map((item) => item.name || item.id).join(" > ") : "";
+}
+
+function bwDeviceInbox(inv, floor = null) {
+  const discovered = bwDeviceInboxCandidateList(inv);
+  const queued = bwDeviceInboxQueueList(inv);
+  const discoverySelected = bwInboxSelectionFor("discovery").length;
+  const modelingSelected = bwInboxSelectionFor("modeling").length;
+  const adapterTarget = bacAdapterTarget();
+  const canModel = Boolean(floor && queued.length);
+  return el("div", {
+    id: "bw-device-inbox",
+    class: "bw-device-inbox",
+    onclick: () => { if (bw.inboxMenu) bwCloseInboxMenu(); },
+  },
+    el("div", { class: "bw-inbox-grid" },
+    el("div", { class: "bw-inbox-stage bw-inbox-stage-discovery" },
+      el("div", { class: "section-head bw-inbox-stage-head" },
+        el("h4", {}, "BACnet Device Inbox"),
+        el("span", { id: "bw-device-inbox-count", class: "muted small" }, bac.discovering ? "Discovering..." : `${discovered.length} shown · ${queued.length} queued`)),
+      adapterTarget
+        ? el("p", { class: "muted small bw-inbox-target" }, `Discovery target: ${adapterTarget.label}`)
+        : null,
+      bac.discovering ? bacDiscoveryProgressEl("bw-discovery-progress") : null,
+      el("div", { class: "tool-actions" },
+        el("button", {
+          class: "btn btn-primary",
+          disabled: bac.discovering ? "disabled" : undefined,
+          onclick: bwDiscoverDevices,
+        }, bac.discovering ? "Discovering..." : "Discover devices"),
+        el("button", {
+          id: "bw-inbox-ignore-selected",
+          class: "btn-ghost",
+          disabled: discoverySelected ? undefined : "disabled",
+          onclick: bwIgnoreSelectedInboxDevices,
+        }, "Ignore"),
+        el("button", { id: "bw-inbox-clear", class: "btn-ghost", disabled: bac.devices.length || queued.length ? undefined : "disabled", onclick: bwClearDeviceDiscovery }, "Clear")),
+      el("input", {
+        class: "nm-input bw-device-filter",
+        placeholder: "Filter by instance, name, address, vendor, model",
+        value: bw.deviceInbox?.filter || "",
+        oninput: (e) => { bw.deviceInbox.filter = e.target.value; bwApplyDeviceInboxFilter(); },
+      }),
+      el("div", { class: "bw-device-inbox-scroll" },
+        el("table", { class: "bac-table bw-device-inbox-table bw-discovery-table" },
+          el("thead", {}, el("tr", {},
+            el("th", {}, "Instance"),
+            el("th", {}, "Name"),
+            el("th", {}, "Address"),
+            el("th", {}, "Vendor"),
+            el("th", {}, "Model"),
+            el("th", {}, "Status"))),
+          el("tbody", { id: "bw-discovered-device-rows" }, ...bwDiscoveredDeviceRows(inv))))),
+    el("div", { class: "bw-inbox-stage bw-inbox-stage-queue" },
+      el("div", { class: "section-head bw-inbox-stage-head" },
+        el("h4", {}, "Import Plan"),
+        el("span", { class: "muted small" }, floor ? `Target: ${floor.name}` : "Select a floor in the Model Tree")),
+      el("div", { class: "tool-actions" },
+        el("button", {
+          id: "bw-inbox-model-selected",
+          class: "btn-ghost",
+          "data-floor-id": floor?.id || "",
+          "data-queued-count": String(queued.length),
+          disabled: canModel ? undefined : "disabled",
+          onclick: () => bwModelQueuedDevicesToFloor(floor.id),
+        }, floor ? (modelingSelected ? `Add selected to ${floor.name}` : `Add queue to ${floor.name}`) : "Select a floor"),
+        el("button", {
+          id: "bw-inbox-remove-queued",
+          class: "btn-ghost",
+          disabled: modelingSelected ? undefined : "disabled",
+          onclick: () => bwRemoveQueuedInboxDevices(),
+        }, "Remove from queue")),
+      el("div", {
+        class: "bw-device-inbox-scroll bw-queue-scroll bw-import-plan-dropzone",
+        ondragover: bwImportPlanDragOver,
+        ondragleave: bwImportPlanDragLeave,
+        ondrop: bwImportPlanDrop,
+      },
+        el("table", { class: "bac-table bw-device-inbox-table bw-import-plan-table" },
+          el("thead", {}, el("tr", {},
+            el("th", {}, "Proposed Equip"),
+            el("th", {}, "Instance"),
+            el("th", {}, "Address"),
+            el("th", {}, "Vendor"),
+            el("th", {}, "Model"),
+            el("th", {}, "Target"),
+            el("th", {}, "Match / Issue"),
+            el("th", {}, "Action"),
+            el("th", {}, "Status"))),
+          el("tbody", { id: "bw-modeling-queue-rows" }, ...bwModelingQueueRows(inv, floor)))))),
+    bwInboxContextMenu(inv, floor));
+}
+
+function bwRootDetails(inv) {
+  const counts = bwScopeCounts(inv);
+  return [
+    el("div", { class: "bw-count-grid" },
+      bwCountTile("Sites", counts.sites),
+      bwCountTile("Buildings", counts.buildings),
+      bwCountTile("Floors", counts.floors),
+      bwCountTile("Devices", counts.devices),
+      bwCountTile("Points", counts.points)),
+    el("div", { class: "bw-context-summary" },
+      el("h4", {}, "Model overview"),
+      el("p", { class: "muted small" }, "Select a site, building, floor, device, or point to inspect modeled context. Protocol discovery and imports live in the BACnet tab.")),
+  ];
+}
+
+function bwSiteDetails(inv, site) {
+  const counts = bwScopeCounts(inv, site);
+  return [
+    el("div", { class: "bw-count-grid" },
+      bwCountTile("Buildings", counts.buildings),
+      bwCountTile("Floors", counts.floors),
+      bwCountTile("Devices", counts.devices),
+      bwCountTile("Points", counts.points)),
+    el("div", { class: "bw-context-summary" },
+      el("h4", {}, "Site context"),
+      el("div", { class: "bw-detail-grid" },
+        bwDetailRow("Name", site.name),
+        bwDetailRow("Tags", Object.keys(site.tags || {}).join(", ")))),
+  ];
+}
+
+function bwBuildingDetails(inv, building) {
+  const counts = bwScopeCounts(inv, building);
+  const floors = inv.listEntities({ type: "floor", buildingId: building.id });
+  if (!String(bw.floorBatchStart || "").trim()) bw.floorBatchStart = String(floors.length + 1);
+  return [
+    el("div", { class: "bw-count-grid" },
+      bwCountTile("Floors", counts.floors),
+      bwCountTile("Devices", counts.devices),
+      bwCountTile("Points", counts.points)),
+    el("div", { class: "bw-batch-floor-form" },
+      el("label", { class: "nm-field" },
+        el("span", { class: "nm-field-label" }, "Floor name pattern"),
+        el("input", {
+          class: "nm-input",
+          value: bw.floorBatchPattern,
+          "data-bw-floor-batch-pattern": "1",
+          placeholder: "Floor {n}",
+          oninput: (e) => { bw.floorBatchPattern = e.target.value; },
+        })),
+      el("label", { class: "nm-field bw-batch-small" },
+        el("span", { class: "nm-field-label" }, "Start"),
+        el("input", {
+          class: "nm-input",
+          inputmode: "numeric",
+          pattern: "[0-9]*",
+          value: bw.floorBatchStart,
+          oninput: (e) => { bw.floorBatchStart = e.target.value; },
+        })),
+      el("label", { class: "nm-field bw-batch-small" },
+        el("span", { class: "nm-field-label" }, "Count"),
+        el("input", {
+          class: "nm-input",
+          type: "number",
+          min: "1",
+          max: "200",
+          value: bw.floorBatchCount,
+          oninput: (e) => { bw.floorBatchCount = e.target.value; },
+        })),
+      el("button", { class: "btn-ghost bw-batch-action", onclick: () => bwBatchAddFloors(building.id) }, "Add batch")),
+  ];
+}
+
+function bwFloorDetails(inv, floor) {
+  const counts = bwScopeCounts(inv, floor);
+  return [
+    el("div", { class: "bw-count-grid" },
+      bwCountTile("Devices", counts.devices),
+      bwCountTile("Points", counts.points)),
+    el("div", { class: "bw-context-summary" },
+      el("h4", {}, "Floor context"),
+      el("div", { class: "bw-detail-grid" },
+        bwDetailRow("Name", floor.name),
+        bwDetailRow("Building", inv.getEntity(floor.buildingId || floor.parentId)?.name || ""),
+        bwDetailRow("Site", inv.getEntity(floor.siteId)?.name || ""),
+        bwDetailRow("Tags", Object.keys(floor.tags || {}).join(", ")))),
+  ];
+}
+
+function bwDeviceDetails(inv, equip) {
+  const templates = inv.listEntities({ type: "template" });
+  const points = inv.listEntities({ type: "point", equipId: equip.id });
+  return [
+    el("div", { class: "bw-count-grid" }, bwCountTile("Points", points.length)),
+    el("div", { class: "bw-detail-grid" },
+      bwDetailRow("Template", equip.templateId || ""),
+      bwDetailRow("Tags", Object.keys(equip.tags || {}).join(", "))),
+    el("div", { class: "tool-actions" },
+      equip.tags?.bacnet || equip.deviceInstance != null
+        ? el("button", { class: "btn-ghost", disabled: bw.busy ? "disabled" : undefined, onclick: () => bwDiscoverDevicePoints(equip.id) }, bw.busy ? "Discovering..." : "Discover points")
+        : null,
+      el("select", { class: "nm-input bw-template-select", onchange: (e) => { bw.template = e.target.value; bwSaveState(); } },
+        ...templates.map((t) => el("option", { value: t.id, selected: bw.template === t.id || bw.template === t.id.replace("template:", "") ? "selected" : undefined }, t.name)))),
+  ];
+}
+
+function bwPointDetails(inv, point) {
+  return [
+    el("div", { class: "bw-detail-grid" },
+      bwDetailRow("Unit", point.unit),
+      bwDetailRow("Device instance", point.deviceInstance),
+      bwDetailRow("Object", point.objectType != null && point.instance != null ? `${point.objectType}:${point.instance}` : ""),
+      bwDetailRow("Source", (point.sourceRefs || []).join(", ")),
+      bwDetailRow("Tags", Object.keys(point.tags || {}).join(", "))),
+  ];
+}
+
+function bwSelectionDetails(inv, entities) {
+  const counts = {
+    site: entities.filter((e) => e.type === "site").length,
+    building: entities.filter((e) => e.type === "building").length,
+    floor: entities.filter((e) => e.type === "floor").length,
+    equip: entities.filter((e) => e.type === "equip").length,
+    point: entities.filter((e) => e.type === "point").length,
+  };
+  const points = bwPointsForEntities(inv, entities);
+  const devices = entities.filter((e) => e.type === "equip");
+  const templates = inv.listEntities({ type: "template" });
+  return [
+    el("p", { class: "muted small bw-selection-hint" }, "Ctrl-click toggles nodes. Shift-click selects a range from the last clicked node."),
+    el("div", { class: "bw-count-grid" },
+      bwCountTile("Sites", counts.site),
+      bwCountTile("Buildings", counts.building),
+      bwCountTile("Floors", counts.floor),
+      bwCountTile("Devices", counts.equip),
+      bwCountTile("Points", counts.point)),
+    el("div", { class: "tool-actions" },
+      el("button", { class: "btn btn-primary", disabled: points.length ? undefined : "disabled", onclick: bwHistorizeSelectedEntities }, `Historize ${points.length} point${points.length === 1 ? "" : "s"}`),
+      el("select", {
+        class: "nm-input bw-template-select",
+        disabled: devices.length ? undefined : "disabled",
+        onchange: (e) => { bw.template = e.target.value; bwSaveState(); },
+      },
+        ...templates.map((t) => el("option", { value: t.id, selected: bw.template === t.id || bw.template === t.id.replace("template:", "") ? "selected" : undefined }, t.name))),
+      el("button", { class: "btn-ghost", disabled: devices.length ? undefined : "disabled", onclick: () => bwApplyTemplateToSelected(bw.template) }, `Apply to ${devices.length} device${devices.length === 1 ? "" : "s"}`),
+      el("button", { class: "btn-ghost", onclick: () => { bwSetSelection([]); bw.selectionAnchorId = ""; bwSaveState(); bwRenderModelScope({ tree: true, details: true, header: true }); } }, "Clear"),
+      el("button", { class: "btn-ghost danger", onclick: bwRemoveSelectedEntities }, "Remove selected")),
+    el("ol", { class: "plugin-log bw-selection-list" },
+      ...entities.map((entity) => el("li", { class: "log-info" },
+        el("span", { class: "log-time" }, bwTreeNodeLabel(entity)),
+        el("span", { class: "log-msg" }, entity.name || entity.id)))),
+  ];
+}
+
+function bwModelDetails(inv) {
+  const selected = bwSelectedEntities(inv);
+  if (selected.length > 1) return el("section", { id: "bw-model-details", class: "plugin-section bw-detail-panel" }, ...bwSelectionDetails(inv, selected));
+  const entity = selected.length === 1 ? selected[0] : bwSelectedEntity(inv);
+  const content = !entity ? bwRootDetails(inv)
+    : entity.type === "site" ? bwSiteDetails(inv, entity)
+    : entity.type === "building" ? bwBuildingDetails(inv, entity)
+    : entity.type === "floor" ? bwFloorDetails(inv, entity)
+    : entity.type === "equip" ? bwDeviceDetails(inv, entity)
+    : entity.type === "point" ? bwPointDetails(inv, entity)
+    : bwRootDetails(inv);
+  return el("section", { id: "bw-model-details", class: "plugin-section bw-detail-panel" }, ...content);
+}
+
+function bwModelTab(inv) {
+  return el("div", { id: "bw-model-tab", class: "bw-model-layout", onclick: () => { if (bw.contextMenu) bwCloseTreeMenu(); } },
+    bwTreePanel(inv),
+    el("div", { class: "bw-model-main" }, bwModelDetails(inv)),
+  );
+}
+
+function bwBacnetTab(inv) {
+  const floor = bwCurrentFloorForInbox(inv);
+  return el("section", { class: "plugin-section bw-detail-panel bw-protocol-panel" },
+    el("div", { class: "section-head" },
+      el("h3", {}, "BACnet Device Management"),
+      el("span", { class: "muted small" }, floor ? `Import target: ${bwInboxPathLabel(inv, floor)}` : "Select a floor in Model to set the import target")),
+    bwDeviceInbox(inv, floor));
+}
+
+function bwHistorianTab(inv) {
+  const hist = historianInstance();
+  const pts = hist ? hist.points() : [];
+  const modelPoints = bwPointRows(inv);
+  return el("section", { class: "plugin-section" },
+    el("div", { class: "section-head" },
+      el("h3", {}, "Historian"),
+      el("span", { class: `pill ${hist && hist.isRunning() ? "pill-running" : "pill-idle"}` }, hist && hist.isRunning() ? "Logging" : "Idle")),
+    el("p", { class: "muted small" }, "Historize modeled points with site/equipment/point tags. Existing manual Historian controls remain available."),
+    el("div", { class: "tool-actions" },
+      el("button", { class: "btn btn-primary", disabled: modelPoints.length ? undefined : "disabled", onclick: () => modelPoints.forEach((p) => bwHistorizePoint(p.id)) }, "Historize modeled points"),
+      el("button", { class: "btn-ghost", onclick: () => setView(pluginView("bacnet-historian")) }, "Open BACnet Historian")),
+    pts.length
+      ? el("ol", { class: "plugin-log" },
+          ...pts.map((p) => el("li", { class: p.lastError ? "log-error" : "log-info" },
+            el("span", { class: "log-msg" }, `${[p.site, p.building, p.floor, p.equip].filter(Boolean).join(" · ")}${p.site || p.building || p.floor || p.equip ? " · " : ""}${p.label || p.pointId || `${p.objectType}:${p.instance}`} → ${p.lastError ? "ERR " + p.lastError : (p.lastValue ?? "—")}`))))
+      : el("p", { class: "muted small" }, "No historian points yet."));
+}
+
+function bwDashboardTab(inv) {
+  const snapshot = inv.exportSnapshot();
+  const site = bwActiveSite(inv);
+  const building = bwActiveBuilding(inv, site?.id);
+  const floor = bwActiveFloor(inv, building?.id);
+  const dashboardScope = {
+    siteId: site?.id || null,
+    buildingId: building?.id || null,
+    floorId: floor?.id || null,
+  };
+  const points = inv.listEntities({ type: "point", ...dashboardScope });
+  const dashboardUrl = telemetry ? telemetry.panelUrl({ dashboard: "stier-building-workspace" }) : null;
+  const json = bw.dashboardJson || JSON.stringify(generateBuildingDashboard(snapshot, dashboardScope), null, 2);
+  return el("section", { class: "plugin-section" },
+    el("div", { class: "section-head" },
+      el("h3", {}, "Template Dashboard"),
+      el("span", { class: "muted small" }, `${points.length} modeled point${points.length === 1 ? "" : "s"}${floor ? ` on ${floor.name}` : ""}`)),
+    el("p", { class: "muted small" },
+      dashboardUrl ? "Observability is connected; open Grafana to view provisioned dashboards." : "Ready to chart after the Observability Pack starts; metrics stay in the local ring buffer until then."),
+    el("div", { class: "tool-actions" },
+      el("button", {
+        class: "btn btn-primary",
+        onclick: () => {
+          bw.dashboardJson = JSON.stringify(generateBuildingDashboard(snapshot, dashboardScope), null, 2);
+          logTo("building-workspace", "Generated dashboard JSON from the current model.", "ok");
+          bwRenderTabScope();
+        },
+      }, "Generate dashboard JSON"),
+      el("button", { class: "btn-ghost", onclick: () => bwDownload(`building-dashboard-${bacTimestamp()}.json`, json, "application/json;charset=utf-8") }, "Export JSON"),
+      dashboardUrl ? el("button", { class: "btn-ghost", onclick: () => openExternal(dashboardUrl) }, "Open Grafana dashboard") : null),
+    el("textarea", { class: "nm-input bw-json", rows: "12", readonly: "readonly" }, json));
+}
+
+async function bwRunCommissioning(inv) {
+  const bacnet = platform ? platform.capability("bacnet.read.v1") : null;
+  if (!bacnet) return;
+  bw.busy = true;
+  bwRenderTabScope();
+  try {
+    const points = inv.listEntities({ type: "point" });
+    const run = await runCommissioning({
+      points,
+      bacnet,
+      writeProperty: async ({ point, ref, value, priority, relinquish }) => bacnet.writeProperty({
+        device: point.deviceRef || { deviceInstance: ref.deviceInstance },
+        objectType: ref.objectType,
+        instance: ref.instance,
+        property: 85,
+        arrayIndex: null,
+        priority,
+        value: relinquish ? { kind: "null" } : { kind: "real", value: Number(value) },
+      }),
+      options: {
+        min: bw.cxMin,
+        max: bw.cxMax,
+        notes: bw.cxNotes,
+      },
+    });
+    const saved = inv.recordCommissioningRun(run);
+    bw.lastRunId = saved.id;
+    bwSaveState();
+    logTo("building-workspace", `Commissioning finished: ${saved.status}.`, saved.status === "fail" ? "warn" : "ok");
+  } catch (err) {
+    logTo("building-workspace", `Commissioning failed: ${err}`, "error");
+  } finally {
+    bw.busy = false;
+    bwRenderTabScope();
+  }
+}
+
+function bwCommissioningTab(inv) {
+  const points = bwPointRows(inv);
+  const run = bw.lastRunId ? inv.getEntity(bw.lastRunId) : null;
+  return el("section", { class: "plugin-section" },
+    el("div", { class: "section-head" },
+      el("h3", {}, "Commissioning"),
+      el("span", { class: "muted small" }, `${points.length} point${points.length === 1 ? "" : "s"} in scope`)),
+    el("div", { class: "bac-discover-controls" },
+      el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Min"), el("input", { class: "nm-input bac-range-input", value: bw.cxMin, oninput: (e) => { bw.cxMin = e.target.value; } })),
+      el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Max"), el("input", { class: "nm-input bac-range-input", value: bw.cxMax, oninput: (e) => { bw.cxMax = e.target.value; } })),
+      el("button", { class: "btn btn-primary", disabled: bw.busy || points.length === 0 ? "disabled" : undefined, onclick: () => bwRunCommissioning(inv) }, bw.busy ? "Running…" : "Run checks")),
+    el("textarea", { class: "nm-input bw-notes", rows: "3", placeholder: "Operator notes", oninput: (e) => { bw.cxNotes = e.target.value; } }, bw.cxNotes),
+    run
+      ? el("ol", { class: "plugin-log" },
+          ...(run.steps || []).map((s) => el("li", { class: s.status === "fail" ? "log-error" : s.status === "warn" ? "log-warn" : "log-info" },
+            el("span", { class: "log-time" }, s.status),
+            el("span", { class: "log-msg" }, `${s.pointName || s.pointId} · ${s.check}${s.value != null ? ` · ${s.value}` : ""}${s.error ? ` · ${s.error}` : ""}`))))
+      : el("p", { class: "muted small" }, "No run yet."));
+}
+
+function bwReportsTab(inv) {
+  const runs = inv.listEntities({ type: "commissioningRun" });
+  const run = bw.lastRunId ? inv.getEntity(bw.lastRunId) : runs.at(-1);
+  const snapshot = inv.exportSnapshot();
+  const md = run ? exportCommissioningMarkdown(snapshot, run) : "";
+  const csv = run ? exportCommissioningCsv(run) : "";
+  return el("section", { class: "plugin-section" },
+    el("div", { class: "section-head" },
+      el("h3", {}, "Reports"),
+      el("span", { class: "muted small" }, `${runs.length} run${runs.length === 1 ? "" : "s"}`)),
+    run
+      ? el("div", { class: "tool-actions" },
+          el("button", { class: "btn btn-primary", onclick: () => bwDownload(`commissioning-${bacTimestamp()}.md`, md, "text/markdown;charset=utf-8") }, "Export Markdown"),
+          el("button", { class: "btn-ghost", onclick: () => bwDownload(`commissioning-${bacTimestamp()}.csv`, csv, "text/csv;charset=utf-8") }, "Export CSV"),
+          el("button", { class: "btn-ghost", onclick: () => copyText(md) }, "Copy Markdown"))
+      : el("p", { class: "muted small" }, "Run commissioning checks to create a report."),
+    run ? el("textarea", { class: "nm-input bw-json", rows: "16", readonly: "readonly" }, md) : null);
+}
+
+function bwCurrentTabBody(inv) {
+  return bw.tab === "bacnet" ? bwBacnetTab(inv)
+    : bw.tab === "historian" ? bwHistorianTab(inv)
+    : bw.tab === "dashboard" ? bwDashboardTab(inv)
+    : bw.tab === "commissioning" ? bwCommissioningTab(inv)
+    : bw.tab === "reports" ? bwReportsTab(inv)
+    : bwModelTab(inv);
+}
+
+function renderBuildingWorkspacePage() {
+  const inv = inventoryInstance();
+  const synced = histSyncFromInventory();
+  if (synced) histPersist();
+  if (!inv) {
+    return el("div", { class: "plugin-controls" },
+      el("section", { class: "plugin-section" },
+        el("p", { class: "muted" }, "Building Workspace unavailable — the platform kernel did not resolve inventory dependencies.")));
+  }
+  const body = bwCurrentTabBody(inv);
+  return el("div", { id: "bw-root", class: "plugin-controls bw-root" },
+    bwTabs(),
+    el("div", { id: "bw-tab-body" }, body),
+  );
 }
 
 // ============================================================================
@@ -3640,6 +6499,196 @@ function renderLibrary() {
   }
 }
 
+function setActivityFilter(key, value) {
+  userState[key] = value;
+  saveUserState();
+  renderActivityPage();
+}
+
+function clearActivityFiltered() {
+  const toolFilter = userState.activityToolFilter || "all";
+  const kindFilter = userState.activityKindFilter || "all";
+  if (toolFilter === "all" && kindFilter === "all") {
+    pluginLogs.clear();
+  } else {
+    for (const [toolId, entries] of pluginLogs.entries()) {
+      if (toolFilter !== "all" && toolId !== toolFilter) continue;
+      if (kindFilter === "all") {
+        // No kind filter: clear every entry for this tool.
+        pluginLogs.delete(toolId);
+        continue;
+      }
+      const remaining = entries.filter((entry) => entry.kind !== kindFilter);
+      if (remaining.length) pluginLogs.set(toolId, remaining);
+      else pluginLogs.delete(toolId);
+    }
+  }
+  renderActivityPage();
+}
+
+function renderActivityPage() {
+  const root = document.getElementById("view-root");
+  root.replaceChildren();
+  const entries = filteredActivityEntries();
+  const allEntries = activityEntries();
+  const toolFilter = userState.activityToolFilter || "all";
+  const kindFilter = userState.activityKindFilter || "all";
+  const toolIds = new Set(TOOLS.filter((tool) => !isHidden(tool.id)).map((tool) => tool.id));
+  for (const entry of allEntries) toolIds.add(entry.toolId);
+  if (toolFilter !== "all") toolIds.add(toolFilter);
+  const activityToolIds = [...toolIds].sort((a, b) => activityToolLabel(a).localeCompare(activityToolLabel(b)));
+  const kinds = ["ok", "info", "warn", "error"];
+
+  root.appendChild(el("div", { class: "view-header" },
+    el("h2", {}, "Activity"),
+    el("div", { class: "view-header-right" },
+      el("button", { class: "btn-ghost", disabled: allEntries.length ? undefined : "disabled", onclick: clearActivityFiltered }, "Clear"),
+    ),
+  ));
+
+  root.appendChild(el("section", { class: "plugin-section plugin-section-fill activity-panel" },
+    el("div", { class: "activity-controls" },
+      el("label", { class: "nm-field activity-filter" },
+        el("span", { class: "nm-field-label" }, "Tool"),
+        el("select", {
+          class: "nm-input",
+          onchange: (e) => setActivityFilter("activityToolFilter", e.target.value),
+        },
+          el("option", { value: "all", selected: toolFilter === "all" ? "selected" : undefined }, "All tools"),
+          ...activityToolIds.map((toolId) => {
+            const count = allEntries.filter((entry) => entry.toolId === toolId).length;
+            return el("option", { value: toolId, selected: toolFilter === toolId ? "selected" : undefined }, `${activityToolLabel(toolId)} (${count})`);
+          }))),
+      el("label", { class: "nm-field activity-filter" },
+        el("span", { class: "nm-field-label" }, "Status"),
+        el("select", {
+          class: "nm-input",
+          onchange: (e) => setActivityFilter("activityKindFilter", e.target.value),
+        },
+          el("option", { value: "all", selected: kindFilter === "all" ? "selected" : undefined }, "All statuses"),
+          ...kinds.map((kind) => {
+            const count = allEntries.filter((entry) => entry.kind === kind).length;
+            return el("option", { value: kind, selected: kindFilter === kind ? "selected" : undefined }, `${kind} (${count})`);
+          })))),
+    entries.length === 0
+      ? el("p", { class: "muted small activity-empty" }, allEntries.length ? "No activity matches the current filters." : "No activity yet. Use a tool and its events will appear here.")
+      : el("ol", { id: "activity-log-list", class: "plugin-log activity-log scroll-fill" },
+          ...entries.map(renderActivityLogEntry),
+        ),
+  ));
+}
+
+// ----------------------------------------------------------------------------
+// Services & Capabilities — the developer API reference, generated from the live
+// capability graph joined with the contract docs (src/platform/service-catalog.js).
+// ----------------------------------------------------------------------------
+
+async function copyText(text, btn) {
+  try {
+    await navigator.clipboard.writeText(text);
+    if (btn) {
+      const prev = btn.textContent;
+      btn.textContent = "Copied";
+      setTimeout(() => { btn.textContent = prev; }, 1200);
+    }
+  } catch (err) {
+    console.warn("copyText failed:", err);
+  }
+}
+
+function serviceBadge(provider) {
+  if (provider.category === "service") return { label: "Service", cls: "svc-badge-service" };
+  if (provider.category === "app") return { label: "App", cls: "svc-badge-app" };
+  return { label: "Provider", cls: "" };
+}
+
+function renderCapabilityCard(e) {
+  const methods = (e.doc ? e.doc.methods : []).map((m) =>
+    el("div", { class: "svc-method" },
+      el("code", { class: "svc-method-sig" }, m.sig),
+      el("span", { class: "svc-method-ret muted small" }, `→ ${m.returns}`),
+      el("p", { class: "svc-method-desc muted small" }, m.desc),
+    ),
+  );
+
+  const consumers = e.consumers.length
+    ? `Used by: ${e.consumers.map((c) => c.name + (c.optional ? " (optional)" : "")).join(", ")}`
+    : "Not yet consumed by any tool.";
+
+  return el("div", { class: "svc-cap" },
+    el("div", { class: "svc-cap-head" },
+      el("code", { class: "svc-cap-ref" }, e.ref),
+      el("span", { class: "svc-cap-ver muted small" }, `contract v${e.version}`),
+      el("button", {
+        class: "btn-ghost svc-copy", title: "Copy the consume-this-capability snippet",
+        onclick: (ev) => copyText(e.usage, ev.currentTarget),
+      }, "Copy"),
+    ),
+    e.doc
+      ? el("p", { class: "svc-cap-summary" }, e.doc.summary)
+      : el("p", { class: "muted small" }, "No contract docs yet — see the provider's source."),
+    methods.length ? el("div", { class: "svc-methods" }, ...methods) : null,
+    e.doc && e.doc.notes ? el("p", { class: "svc-note small muted" }, `ℹ ${e.doc.notes}`) : null,
+    el("details", { class: "svc-usage" },
+      el("summary", {}, "How to use"),
+      el("pre", { class: "svc-usage-code" }, el("code", {}, e.usage)),
+    ),
+    el("p", { class: "svc-consumers muted small" }, consumers),
+  );
+}
+
+function renderServiceProvider(provider, caps) {
+  const badge = serviceBadge(provider);
+  const head = el("div", { class: "svc-provider-head" },
+    el("span", { class: "svc-provider-icon" }, provider.emoji),
+    el("div", { class: "svc-provider-titles" },
+      el("h3", { class: "svc-provider-name" }, provider.name),
+      el("span", { class: `pill svc-badge ${badge.cls}` }, badge.label),
+    ),
+    provider.permissions.length
+      ? el("span", { class: "svc-perms muted small", title: "Permissions this provider holds" },
+          `🔑 ${provider.permissions.join(", ")}`)
+      : null,
+  );
+  return el("section", { class: "svc-provider" }, head, ...caps.map(renderCapabilityCard));
+}
+
+function renderServicesPage() {
+  const root = document.getElementById("view-root");
+  root.replaceChildren();
+
+  // Built from ALL_MANIFESTS so installed third-party (mcp) capabilities appear too.
+  const { entries } = buildServiceCatalog(ALL_MANIFESTS);
+
+  root.appendChild(el("div", { class: "view-header" },
+    el("h2", {}, "Services & Capabilities"),
+    el("span", { class: "muted small" }, `${entries.length} capabilities`),
+  ));
+  root.appendChild(el("p", { class: "services-intro muted" },
+    "Every capability a tool exposes is a versioned contract any app or connector can build against. ",
+    "Declare it in your manifest's ", el("code", {}, "requires"),
+    ", then resolve it from your scoped host with ", el("code", {}, "host.use()"),
+    " — you never reach into another tool directly. Provider, version and consumers below are read live from the capability graph.",
+  ));
+
+  if (entries.length === 0) {
+    root.appendChild(el("p", { class: "empty-state" }, "No capabilities are registered."));
+    return;
+  }
+
+  // Group capabilities by their provider; list Services before Apps.
+  const byProvider = new Map();
+  for (const e of entries) {
+    if (!byProvider.has(e.provider.id)) byProvider.set(e.provider.id, { provider: e.provider, caps: [] });
+    byProvider.get(e.provider.id).caps.push(e);
+  }
+  const rank = (p) => (p.category === "service" ? 0 : 1);
+  const groups = [...byProvider.values()].sort((a, b) =>
+    rank(a.provider) - rank(b.provider) || a.provider.name.localeCompare(b.provider.name),
+  );
+  for (const g of groups) root.appendChild(renderServiceProvider(g.provider, g.caps));
+}
+
 // Body for the per-tool "About" modal: the description plus a source link.
 function aboutModalBody(tool) {
   const parts = [
@@ -3656,6 +6705,11 @@ function aboutModalBody(tool) {
   return parts;
 }
 
+function renderPluginHeaderAddon(tool) {
+  if (tool.id === "building-workspace") return bwHeaderBreadcrumb();
+  return null;
+}
+
 function renderPluginPage(id) {
   const root = document.getElementById("view-root");
   root.replaceChildren();
@@ -3666,6 +6720,7 @@ function renderPluginPage(id) {
   }
   const status = tool.renderStatusPill ? tool.renderStatusPill() : null;
   const fav = isFavorite(tool.id);
+  const headerAddon = renderPluginHeaderAddon(tool);
 
   root.appendChild(el("nav", { class: "breadcrumb" },
     el("a", {
@@ -3678,7 +6733,7 @@ function renderPluginPage(id) {
   root.appendChild(el("header", { class: "plugin-header" },
     el("div", { class: "plugin-header-left" },
       el("div", { class: "tool-icon plugin-icon" }, tool.emoji),
-      el("div", {},
+      el("div", { class: "plugin-header-copy" },
         el("div", { class: "plugin-title-row" },
           el("h2", { class: "plugin-title" }, tool.name),
           hasAbout && el("button", {
@@ -3689,6 +6744,7 @@ function renderPluginPage(id) {
           }, "ⓘ"),
         ),
         el("p", { class: "plugin-tagline" }, tool.tagline),
+        headerAddon,
       ),
     ),
     el("div", { class: "plugin-header-right" },
@@ -3706,21 +6762,131 @@ function renderPluginPage(id) {
   if (tool.renderPage) root.appendChild(tool.renderPage(tool));
 
   // (The former "About" section now lives behind the ⓘ button in the header.)
+}
 
-  // Per-plugin activity log.
-  const logEntries = pluginLogs.get(tool.id) || [];
-  root.appendChild(el("section", { class: "plugin-section" },
-    el("div", { class: "section-head" },
-      el("h3", {}, "Activity"),
-      el("button", {
-        class: "btn-ghost",
-        onclick: () => { pluginLogs.set(tool.id, []); renderPluginPage(tool.id); },
-      }, "Clear"),
-    ),
-    logEntries.length === 0
-      ? el("p", { class: "muted small" }, "No activity yet. Enable the tool and try it out.")
-      : el("ol", { id: "plugin-log-list", class: "plugin-log" },
-          ...logEntries.map(renderLogEntry),
+function renderAccountPage() {
+  const root = document.getElementById("view-root");
+  root.replaceChildren();
+
+  root.appendChild(el("div", { class: "view-header" },
+    el("h2", {}, "Account"),
+  ));
+
+  const user = activeAuthUser();
+  const org = activeAuthOrg();
+  const session = authState && authState.session;
+  const userOrgs = session
+    ? (authState.orgs || []).filter((o) => o.ownerUserId === session.userId)
+    : [];
+  const lastSynced = authState && authState.lastSyncedAt
+    ? new Date(authState.lastSyncedAt * 1000).toLocaleString()
+    : "";
+  root.appendChild(el("section", { class: "settings-card" },
+    el("h3", {}, "Profile & sync"),
+    session
+      ? el("div", { class: "settings-stack" },
+          el("p", { class: "muted small" },
+            "Preferences, last page, installed tools, and workspace state are saved under this local user and organization."),
+          el("div", { class: "settings-kv" },
+            el("span", { class: "muted small" }, "User"),
+            el("strong", {}, user ? user.name : session.userId),
+            el("span", { class: "muted small" }, "Email"),
+            el("span", {}, user ? user.email : "local"),
+            el("span", { class: "muted small" }, "Organization"),
+            el("select", {
+              class: "nm-input",
+              onchange: (e) => authSwitchOrg(e.target.value),
+            }, ...userOrgs.map((o) => el("option", {
+              value: o.id,
+              selected: o.id === session.orgId ? "selected" : undefined,
+            }, o.name))),
+            el("span", { class: "muted small" }, "Device"),
+            el("code", {}, authState.deviceId || session.deviceId),
+          ),
+          el("div", { class: "settings-inline" },
+            el("input", {
+              class: "nm-input",
+              value: authDraft.newOrgName,
+              placeholder: "New organization",
+              oninput: (e) => { authDraft.newOrgName = e.target.value; },
+              onkeydown: (e) => { if (e.key === "Enter") authCreateOrg(); },
+            }),
+            el("button", {
+              class: "btn-ghost",
+              disabled: !authDraft.newOrgName.trim() ? "disabled" : undefined,
+              onclick: authCreateOrg,
+            }, "Add org"),
+          ),
+          el("p", { class: "muted small" },
+            authState.syncStatus ? authState.syncStatus.message : "Local-first profile."),
+          authState.syncFolder && el("div", { class: "settings-kv" },
+            el("span", { class: "muted small" }, "Sync folder"),
+            el("code", {}, authState.syncFolder),
+            lastSynced && el("span", { class: "muted small" }, "Last sync"),
+            lastSynced && el("span", {}, lastSynced),
+          ),
+          authSyncMessage && el("p", { class: "muted small" }, authSyncMessage),
+          el("div", { class: "tool-actions" },
+            el("button", {
+              class: "btn-ghost",
+              disabled: authSyncBusy ? "disabled" : undefined,
+              onclick: authPickSyncFolder,
+            }, authState.syncFolder ? "Change sync folder" : "Choose sync folder"),
+            authState.syncFolder && el("button", {
+              class: "btn btn-primary",
+              disabled: authSyncBusy ? "disabled" : undefined,
+              onclick: () => authSyncNow(),
+            }, authSyncBusy ? "Syncing..." : "Sync now"),
+            authState.syncFolder && el("button", {
+              class: "btn-ghost",
+              disabled: authSyncBusy ? "disabled" : undefined,
+              onclick: authClearSyncFolder,
+            }, "Disconnect sync"),
+            el("button", { class: "btn-ghost", onclick: authExportSnapshot }, "Copy snapshot"),
+            el("button", { class: "btn-ghost", onclick: authSignOut }, "Sign out"),
+          ),
+        )
+      : el("div", { class: "settings-stack" },
+          el("p", { class: "muted small" },
+            "Create a local profile so app state is scoped by user and organization instead of only browser storage."),
+          el("div", { class: "settings-form-grid" },
+            el("label", { class: "field-label" },
+              "Name",
+              el("input", {
+                class: "nm-input",
+                value: authDraft.name,
+                placeholder: "Local User",
+                oninput: (e) => { authDraft.name = e.target.value; },
+              }),
+            ),
+            el("label", { class: "field-label" },
+              "Email",
+              el("input", {
+                class: "nm-input",
+                value: authDraft.email,
+                placeholder: "name@example.com",
+                oninput: (e) => { authDraft.email = e.target.value; },
+              }),
+            ),
+            el("label", { class: "field-label" },
+              "Organization",
+              el("input", {
+                class: "nm-input",
+                value: authDraft.orgName,
+                placeholder: "Personal",
+                oninput: (e) => { authDraft.orgName = e.target.value; },
+              }),
+            ),
+          ),
+          el("div", { class: "tool-actions" },
+            el("button", { class: "btn btn-primary", onclick: authCreateLocalAccount }, "Create local profile"),
+            el("button", {
+              class: "btn-ghost",
+              disabled: authSyncBusy ? "disabled" : undefined,
+              onclick: authPickSyncFolder,
+            }, authSyncBusy ? "Connecting..." : "Connect sync folder"),
+          ),
+          authSyncMessage && el("p", { class: "muted small" }, authSyncMessage),
         ),
   ));
 }
@@ -3728,46 +6894,10 @@ function renderPluginPage(id) {
 function renderSettings() {
   const root = document.getElementById("view-root");
   root.replaceChildren();
+  const session = authState && authState.session;
 
   root.appendChild(el("div", { class: "view-header" },
     el("h2", {}, "Settings"),
-  ));
-
-  // ===== Updates card =====
-  const statusLine = el("p", { class: "muted small", id: "update-status" },
-    `You're running v${APP_VERSION}.`);
-  const progressBar = el("div", { class: "progress-bar", id: "update-progress" },
-    el("div", { class: "progress-fill", id: "update-progress-fill" }));
-  progressBar.style.display = "none";
-  const actions = el("div", { class: "tool-actions" });
-
-  const checkBtn = el("button", {
-    class: "btn btn-primary",
-    onclick: () => checkForUpdates({ manual: true }),
-  }, "Check for updates");
-  actions.appendChild(checkBtn);
-
-  root.appendChild(el("section", { class: "settings-card" },
-    el("h3", {}, "Updates"),
-    statusLine,
-    progressBar,
-    actions,
-    el("p", { class: "muted small", style: "margin-top: 10px;" },
-      "Updates are signed and delivered via GitHub Releases. The app checks on launch and prompts before installing.",
-    ),
-  ));
-
-  // ===== About =====
-  root.appendChild(el("section", { class: "settings-card" },
-    el("h3", {}, "About"),
-    el("p", {}, "S-Tier Utilities is a small Tauri desktop hub for native Windows utilities."),
-    el("p", {},
-      "Source: ",
-      el("a", {
-        href: "#",
-        onclick: (e) => { e.preventDefault(); openExternal("https://github.com/S-Tier-Building-Automation/STierUtilities"); },
-      }, "github.com/S-Tier-Building-Automation/STierUtilities"),
-    ),
   ));
 
   // ===== Third-party tools (MCP) =====
@@ -3801,20 +6931,13 @@ function renderSettings() {
   root.appendChild(el("section", { class: "settings-card" },
     el("h3", {}, "Preferences"),
     el("p", { class: "muted small" },
-      "Favorites and hidden tools are stored locally in this app.",
+      session
+        ? "Favorites and hidden tools are saved to the active local profile."
+        : "Favorites and hidden tools are stored locally in this app.",
     ),
     el("button", {
       class: "btn-ghost",
-      onclick: () => {
-        if (!confirm("Reset all preferences (favorites, hidden tools, view)?")) return;
-        localStorage.removeItem(STORAGE_KEY);
-        userState.favorites = {};
-        userState.hidden = {};
-        userState.showHidden = false;
-        userState.view = "library";
-        saveUserState();
-        renderAll();
-      },
+      onclick: resetPreferences,
     }, "Reset preferences"),
   ));
 }
@@ -3829,7 +6952,7 @@ function setUpdateStatus(text, kind = "info") {
   const node = document.getElementById("update-status");
   if (!node) return;
   node.textContent = text;
-  node.className = `muted small update-status-${kind}`;
+  node.className = `menu-app-version update-status-${kind}`;
 }
 
 async function checkForUpdates({ manual = false, silent = false } = {}) {
@@ -3840,7 +6963,7 @@ async function checkForUpdates({ manual = false, silent = false } = {}) {
     const update = await updater.check();
     if (!update) {
       if (!silent) setUpdateStatus(`You're on the latest version (v${APP_VERSION}).`, "ok");
-      // When triggered off the Settings page (e.g. the header About popover),
+      // When triggered off a page without update UI (e.g. the header Account menu),
       // there's no status line to update — surface the result directly.
       if (manual && !document.getElementById("update-status")) {
         alert(`You're on the latest version (v${APP_VERSION}).`);
@@ -3857,7 +6980,7 @@ async function checkForUpdates({ manual = false, silent = false } = {}) {
       `Download and install now?`,
     );
     if (!ok) {
-      setUpdateStatus(`Update v${update.version} available. Use "Check for updates" to install later.`, "warn");
+      setUpdateStatus(`Update v${update.version} available. Use "Check for update" to install later.`, "warn");
       return;
     }
 
@@ -3925,7 +7048,7 @@ function renderSidebar() {
   }
 
   const view = currentView();
-  for (const btn of document.querySelectorAll(".sidebar-nav-item")) {
+  for (const btn of document.querySelectorAll(".header-nav-item")) {
     btn.classList.toggle(
       "active",
       btn.dataset.view === "library"
@@ -3939,6 +7062,64 @@ function renderSidebar() {
 // Top-level render
 // ============================================================================
 
+let lastRenderedView = "";
+
+function renderScrollTargets() {
+  const selectors = [
+    "#view-root",
+    ".plugin-page",
+    ".scroll-fill",
+    ".bw-device-inbox-scroll",
+    ".bw-tree-list",
+    ".activity-log",
+    ".bac-table-wrap",
+    ".nm-scan-results",
+  ];
+  return selectors.flatMap((selector) =>
+    [...document.querySelectorAll(selector)].map((node, index) => ({ selector, index, node })));
+}
+
+function captureRenderUiState() {
+  const active = document.activeElement;
+  const activeState = active && active !== document.body && active.id
+    ? {
+        id: active.id,
+        start: typeof active.selectionStart === "number" ? active.selectionStart : null,
+        end: typeof active.selectionEnd === "number" ? active.selectionEnd : null,
+      }
+    : null;
+  return {
+    active: activeState,
+    scrolls: renderScrollTargets()
+      .filter(({ node }) => node.scrollTop || node.scrollLeft)
+      .map(({ selector, index, node }) => ({
+        selector,
+        index,
+        top: node.scrollTop,
+        left: node.scrollLeft,
+      })),
+  };
+}
+
+function restoreRenderUiState(state) {
+  if (!state) return;
+  for (const item of state.scrolls || []) {
+    const node = document.querySelectorAll(item.selector)[item.index];
+    if (!node) continue;
+    node.scrollTop = item.top;
+    node.scrollLeft = item.left;
+  }
+  if (state.active?.id) {
+    const active = document.getElementById(state.active.id);
+    if (active && typeof active.focus === "function") {
+      active.focus({ preventScroll: true });
+      if (state.active.start != null && typeof active.setSelectionRange === "function") {
+        active.setSelectionRange(state.active.start, state.active.end ?? state.active.start);
+      }
+    }
+  }
+}
+
 function renderHeaderBreadcrumb() {
   const bc = document.getElementById("header-breadcrumb");
   if (!bc) return;
@@ -3946,6 +7127,12 @@ function renderHeaderBreadcrumb() {
   const view = currentView();
   if (view === "settings") {
     bc.appendChild(el("span", { class: "crumb-current" }, "Settings"));
+  } else if (view === "account") {
+    bc.appendChild(el("span", { class: "crumb-current" }, "Account"));
+  } else if (view === "services") {
+    bc.appendChild(el("span", { class: "crumb-current" }, "Services & Capabilities"));
+  } else if (view === "activity") {
+    bc.appendChild(el("span", { class: "crumb-current" }, "Activity"));
   } else if (view.startsWith("plugin:")) {
     const id = view.slice("plugin:".length);
     const tool = TOOLS.find((t) => t.id === id);
@@ -3961,14 +7148,100 @@ function renderHeaderBreadcrumb() {
   }
 }
 
-function renderAll() {
+function renderChrome() {
   renderSidebar();
   const view = currentView();
   renderHeaderBreadcrumb();
-  document.getElementById("header-settings")?.classList.toggle("active", view === "settings");
+  document.getElementById("header-account-menu")?.classList.toggle(
+    "active",
+    view === "account" || view === "settings" || view === "services",
+  );
+}
+
+function renderCurrentPage() {
+  const view = currentView();
   if (view === "settings") renderSettings();
+  else if (view === "account") renderAccountPage();
+  else if (view === "services") renderServicesPage();
+  else if (view === "activity") renderActivityPage();
   else if (view.startsWith("plugin:")) renderPluginPage(view.slice("plugin:".length));
   else renderLibrary();
+}
+
+function renderScoped(scope = "page") {
+  if (scope === "chrome") {
+    renderChrome();
+    return;
+  }
+  if (scope === "building-workspace") {
+    bwRenderWorkspaceScope();
+    return;
+  }
+  if (scope === "building-workspace:tab") {
+    bwRenderTabScope();
+    return;
+  }
+  if (scope === "building-workspace:model") {
+    bwRenderModelScope({ tree: true, details: true, header: true });
+    return;
+  }
+  if (scope === "building-workspace:inbox") {
+    bwRenderInboxScope();
+    return;
+  }
+  if (scope === "all") {
+    renderAll();
+    return;
+  }
+  const view = currentView();
+  const uiState = view === lastRenderedView ? captureRenderUiState() : null;
+  renderCurrentPage();
+  lastRenderedView = view;
+  if (uiState) requestAnimationFrame(() => restoreRenderUiState(uiState));
+}
+
+function renderAll() {
+  const view = currentView();
+  const uiState = view === lastRenderedView ? captureRenderUiState() : null;
+  renderChrome();
+  renderCurrentPage();
+  lastRenderedView = view;
+  if (uiState) requestAnimationFrame(() => restoreRenderUiState(uiState));
+}
+
+let startupWarmupApplied = false;
+const startupDelay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function applyStartupWarmupStatus(status) {
+  if (!status || startupWarmupApplied) return false;
+  let changed = false;
+  if (status.network) changed = (await nmApplyStartupSnapshot(status.network)) || changed;
+  changed = (await obsApplyStartupStatus(status)) || changed;
+  if (!status.running) startupWarmupApplied = true;
+  if (changed) renderAll();
+  return changed;
+}
+
+async function hydrateFromStartupWarmup({ waitMs = 12000 } = {}) {
+  const started = Date.now();
+  while (Date.now() - started <= waitMs) {
+    let status = null;
+    try {
+      status = await invoke("app_startup_status");
+    } catch (_) {
+      return;
+    }
+    await applyStartupWarmupStatus(status);
+    if (!status || !status.running) break;
+    await startupDelay(400);
+  }
+  if (pack && !obsHealth) {
+    await obsRefreshHealth();
+  } else if (!obsHealth) {
+    obsHealthChecking = false;
+    obsHealthMessage = "Startup health check did not complete.";
+    renderAll();
+  }
 }
 
 // ============================================================================
@@ -4001,11 +7274,21 @@ listen("clipboardtyper:typed", (event) => {
 // so the backend keep-alive thread doesn't orphan. Best-effort and synchronous-
 // ish; the backend also self-terminates the keep-alive after repeated failures.
 window.addEventListener("pagehide", () => {
-  if (bac.cov.processId != null) {
+  flushUserStatePersistence();
+  if (packFlushTimer) {
+    clearInterval(packFlushTimer);
+    packFlushTimer = null;
+  }
+  if (nmSaveTimer) {
+    clearTimeout(nmSaveTimer);
+    nmSaveTimer = null;
+    nmSaveNow().catch((err) => console.warn("[networkmanager] final profile save failed:", err));
+  }
+  if (bac.cov.processId != null && bac.cov.objectKey) {
     const dev = bacSelectedDevice();
-    const [t, i] = (bac.cov.objectKey || "0:0").split(":").map((n) => parseInt(n, 10));
+    const [t, i] = bac.cov.objectKey.split(":").map((n) => parseInt(n, 10));
     if (dev) {
-      invoke("bacnet_unsubscribe_cov", {
+      bacnetRead().unsubscribeCov({
         device: bacDeviceRef(dev), objectType: t, instance: i, processId: bac.cov.processId,
       }).catch(() => {});
     }
@@ -4013,11 +7296,7 @@ window.addEventListener("pagehide", () => {
 });
 
 window.addEventListener("DOMContentLoaded", async () => {
-  document.getElementById("gh-link").addEventListener("click", (e) => {
-    e.preventDefault();
-    openExternal("https://github.com/stier1ba");
-  });
-  for (const btn of document.querySelectorAll(".sidebar-nav-item")) {
+  for (const btn of document.querySelectorAll(".header-nav-item")) {
     btn.addEventListener("click", () => setView(btn.dataset.view));
   }
 
@@ -4027,13 +7306,10 @@ window.addEventListener("DOMContentLoaded", async () => {
   applySidebarCollapsed();
 
   // App-header actions
-  document.querySelector(".app-header")?.appendChild(buildAboutMenu());
-  document.getElementById("header-files")?.addEventListener("click", openAppDataDir);
-  document.getElementById("header-docs")?.addEventListener("click", () => openExternal(REPO_URL));
-  document.getElementById("header-settings")?.addEventListener("click", () => setView("settings"));
-  document.getElementById("header-about")?.addEventListener("click", (e) => {
+  document.querySelector(".app-header")?.appendChild(buildAccountMenu());
+  document.getElementById("header-account-menu")?.addEventListener("click", (e) => {
     e.stopPropagation();
-    toggleAboutMenu();
+    toggleAccountMenu();
   });
 
   // Custom titlebar window controls (native window decorations are disabled,
@@ -4062,6 +7338,9 @@ window.addEventListener("DOMContentLoaded", async () => {
   appWindow.onResized(() => syncMaxButton());
   syncMaxButton();
 
+  await authBootstrapUserState();
+  applySidebarCollapsed();
+
   try {
     const s = await invoke("clipboardtyper_get_state");
     ct = s;
@@ -4080,7 +7359,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     rebuildCatalog();
     const installed = ALL_MANIFESTS.filter((m) => m.kind === "mcp");
     const factories = new Map([
-      ...buildFactories(invoke, { timeseries: telemetry, scheduler }),
+      ...buildFactories(invoke, { timeseries: telemetry, scheduler, inventoryStorage: createAppInventoryStorage() }),
       ...buildMcpFactories(invoke, installed),
     ]);
     const installGrants = new Map(
@@ -4099,7 +7378,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     // connecting attaches the live InfluxDB transport. The periodic flush is a
     // no-op until then, so it's safe to run unconditionally.
     pack = createPackController({ invoke, timeseries: telemetry });
-    setInterval(() => { pack.flush().catch(() => {}); }, 10000);
+    packFlushTimer = setInterval(() => { pack.flush().catch(() => {}); }, 10000);
 
     // Granular per-component install progress (download %, rate, ETA, extract…)
     // from the Rust downloader, rendered as a live progress bar.
@@ -4127,9 +7406,10 @@ window.addEventListener("DOMContentLoaded", async () => {
     console.error("[platform] kernel boot failed:", err);
   }
 
-  // Load saved network profiles up front so the library card shows a count.
-  // Live adapter state is read lazily when the Network Manager page opens.
-  nmLoadProfiles().then(renderAll);
+  // Load saved network profiles up front, then hydrate from the native startup
+  // warmup if it already refreshed adapters / started the Observability Pack.
+  await nmLoadProfiles();
+  hydrateFromStartupWarmup().catch((err) => console.warn("[startup] warmup hydrate failed:", err));
 
   renderAll();
 

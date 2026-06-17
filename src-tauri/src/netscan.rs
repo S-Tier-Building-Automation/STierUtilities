@@ -153,7 +153,12 @@ fn ping_one(handle: HANDLE, target: Ipv4Addr) -> Option<u32> {
             PING_TIMEOUT_MS,
         )
     };
-    if replies == 0 {
+    // Only read the reply struct once IcmpSendEcho confirms at least one reply was
+    // written; on the failure path (0 replies) the buffer holds nothing meaningful.
+    // Also guard that the buffer is large enough to back an ICMP_ECHO_REPLY before
+    // reinterpreting it (it always is — see reply_size above — but never read past
+    // the allocation if that ever changes).
+    if replies < 1 || reply_size < std::mem::size_of::<ICMP_ECHO_REPLY>() {
         return None;
     }
     // Safe: the buffer is large enough and aligned; IcmpSendEcho reported >=1 reply.
@@ -171,14 +176,7 @@ fn arp_mac(target: Ipv4Addr) -> Option<String> {
     let mut mac = [0u8; 8];
     let mut len: u32 = mac.len() as u32;
     // SendARP returns NO_ERROR (0) on success.
-    let res = unsafe {
-        SendARP(
-            dest,
-            0,
-            mac.as_mut_ptr() as *mut std::ffi::c_void,
-            &mut len,
-        )
-    };
+    let res = unsafe { SendARP(dest, 0, mac.as_mut_ptr() as *mut std::ffi::c_void, &mut len) };
     if res != 0 || len == 0 {
         return None;
     }
@@ -234,7 +232,7 @@ fn sweep_blocking(app: AppHandle, first: u32, last: u32) -> Vec<ScanHost> {
 
             loop {
                 let next = {
-                    let guard = rx.lock().unwrap();
+                    let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
                     guard.recv()
                 };
                 let target_u = match next {
@@ -252,13 +250,13 @@ fn sweep_blocking(app: AppHandle, first: u32, last: u32) -> Vec<ScanHost> {
                     };
                     found_count.fetch_add(1, Ordering::Relaxed);
                     let _ = app.emit("netscan:host", &host);
-                    found.lock().unwrap().push(host);
+                    found.lock().unwrap_or_else(|e| e.into_inner()).push(host);
                 }
 
                 let done = scanned.fetch_add(1, Ordering::Relaxed) + 1;
                 // Emit progress periodically (and on the final probe) to keep the bar
                 // moving without flooding the event channel.
-                if done % 16 == 0 || done == total {
+                if done.is_multiple_of(16) || done == total {
                     let _ = app.emit(
                         "netscan:progress",
                         ScanProgress {
@@ -350,7 +348,13 @@ $out=foreach($ip in $ips){{
     );
 
     let output = Command::new("powershell.exe")
-        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", &script])
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            &script,
+        ])
         .creation_flags(CREATE_NO_WINDOW)
         .output();
 
@@ -399,7 +403,7 @@ fn resolve_hostnames_streaming(app: &AppHandle, ips: Vec<String>) {
         let app = app.clone();
         handles.push(thread::spawn(move || loop {
             let next = {
-                let guard = rx.lock().unwrap();
+                let guard = rx.lock().unwrap_or_else(|e| e.into_inner());
                 guard.recv()
             };
             let chunk = match next {
@@ -479,7 +483,7 @@ fn ping_host(target: Ipv4Addr) -> Option<u32> {
 }
 
 /// Single-host reachability probe exposed as the `netscan` capability's
-/// `isReachable`. Lets other tools (e.g. BACnet Explorer) cheaply check whether a
+/// `isReachable`. Lets other tools (e.g. the BACnet service) cheaply check whether a
 /// device IP answers ICMP before trying to talk to it. Returns the round-trip
 /// time in milliseconds, or `null` if the host did not reply. Runs on the blocking
 /// pool since `IcmpSendEcho` blocks up to `PING_TIMEOUT_MS`.
@@ -560,8 +564,7 @@ mod tests {
         let one = parse_ptr_list(r#"{"ip":"1.2.3.4","host":"a.local"}"#);
         assert_eq!(one.len(), 1);
         assert_eq!(one[0].host, "a.local");
-        let many =
-            parse_ptr_list(r#"[{"ip":"1.2.3.4","host":"a"},{"ip":"1.2.3.5","host":"b"}]"#);
+        let many = parse_ptr_list(r#"[{"ip":"1.2.3.4","host":"a"},{"ip":"1.2.3.5","host":"b"}]"#);
         assert_eq!(many.len(), 2);
     }
 }

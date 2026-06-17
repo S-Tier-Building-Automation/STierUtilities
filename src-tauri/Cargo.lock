@@ -3269,6 +3269,7 @@ name = "s_tier_utilities"
 version = "0.5.4"
 dependencies = [
  "arboard",
+ "getrandom 0.2.17",
  "once_cell",
  "rfd",
  "serde",

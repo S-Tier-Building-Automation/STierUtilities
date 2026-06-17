@@ -90,6 +90,31 @@ test("addPoint dedupes and removePoint works", () => {
   assert.equal(h.points().length, 0);
 });
 
+test("clearPoints resets configured historian points", () => {
+  const scheduler = createScheduler({ timer: fakeTimer() });
+  const h = createHistorian({ bacnet: { readPoint: async () => [] }, scheduler });
+  h.addPoint({ device: { deviceInstance: 1 }, objectType: 0, instance: 1 });
+  h.addPoint({ device: { deviceInstance: 2 }, objectType: 0, instance: 2 });
+  h.clearPoints();
+  assert.deepEqual(h.points(), []);
+});
+
+test("addPoint refreshes metadata for an existing point key", () => {
+  const scheduler = createScheduler({ timer: fakeTimer() });
+  const h = createHistorian({ bacnet: { readPoint: async () => [] }, scheduler });
+  const first = h.addPoint({ device: { deviceInstance: 1 }, objectType: 0, instance: 1, label: "Old", site: "Old Site" });
+  first.reads = 4;
+  first.lastValue = 72;
+
+  const updated = h.addPoint({ device: { deviceInstance: 1 }, objectType: 0, instance: 1, label: "New", site: "New Site" });
+
+  assert.equal(updated.label, "New");
+  assert.equal(updated.site, "New Site");
+  assert.equal(updated.reads, 4);
+  assert.equal(updated.lastValue, 72);
+  assert.equal(h.points().length, 1);
+});
+
 test("start registers a scheduler job and polls immediately; stop removes it", async () => {
   const bacnet = { readPoint: async () => PV("real", 42) };
   const ts = createTimeseries();

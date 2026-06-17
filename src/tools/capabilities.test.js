@@ -4,6 +4,7 @@ import { buildFactories, maskToPrefix, parseCidr, subnetFromState } from "./capa
 import { TOOL_MANIFESTS } from "./manifests.js";
 import { createKernel } from "../platform/host.js";
 import { createTimeseries } from "../platform/services/timeseries.js";
+import { createMemoryInventoryStorage } from "./inventory.js";
 
 // A recording mock for Tauri's invoke.
 function mockInvoke(returns = {}) {
@@ -107,6 +108,37 @@ test("bacnet.suggestTargets reuses netscan rather than reimplementing discovery"
   assert.equal(invoke.calls.at(-1).cmd, "netscan_scan"); // delegated to the netscan capability
 });
 
+test("bacnet.read exposes advanced service operations through bacnet-core", async () => {
+  const invoke = mockInvoke({
+    bacnet_read_objects: [{ objectType: 0, instance: 1 }],
+    bacnet_write_property: { ok: true },
+    bacnet_read_trend: { records: [], recordCount: 0, truncated: false },
+    bacnet_subscribe_cov: 42,
+    bacnet_unsubscribe_cov: { ok: true },
+  });
+  const kernel = await bootKernel(invoke);
+  const bacnet = kernel._peek("bacnet.read.v1").impl;
+  const device = { address: "192.168.1.10:47808", deviceInstance: 1001 };
+
+  assert.deepEqual(await bacnet.listObjects(device, 1001), [{ objectType: 0, instance: 1 }]);
+  assert.deepEqual(invoke.calls.at(-1), { cmd: "bacnet_read_objects", args: { device, deviceInstance: 1001 } });
+
+  await bacnet.writeProperty({ device, objectType: 2, instance: 3, property: 85, value: { kind: "real", value: 72 }, priority: 8 });
+  assert.deepEqual(invoke.calls.at(-1), {
+    cmd: "bacnet_write_property",
+    args: { device, objectType: 2, instance: 3, property: 85, value: { kind: "real", value: 72 }, priority: 8, arrayIndex: null },
+  });
+
+  await bacnet.readTrend({ device, objectType: 20, instance: 1, maxRecords: 25 });
+  assert.deepEqual(invoke.calls.at(-1), { cmd: "bacnet_read_trend", args: { device, objectType: 20, instance: 1, maxRecords: 25 } });
+
+  assert.equal(await bacnet.subscribeCov({ device, deviceInstance: 1001, objectType: 0, instance: 1 }), 42);
+  assert.deepEqual(invoke.calls.at(-1), { cmd: "bacnet_subscribe_cov", args: { device, deviceInstance: 1001, objectType: 0, instance: 1, confirmed: false } });
+
+  await bacnet.unsubscribeCov({ device, objectType: 0, instance: 1, processId: 42 });
+  assert.deepEqual(invoke.calls.at(-1), { cmd: "bacnet_unsubscribe_cov", args: { device, objectType: 0, instance: 1, processId: 42 } });
+});
+
 test("observability provides the timeseries and scheduler capabilities", async () => {
   const kernel = await bootKernel(mockInvoke());
   assert.ok(kernel._peek("timeseries.v1"));
@@ -127,6 +159,45 @@ test("bacnet-historian is wired and polls through bacnet.read into timeseries", 
   assert.equal(pt.measurement, "bacnet_point");
   assert.equal(pt.fields.present_value, 71.2);
   assert.deepEqual(pt.tags, { device: "555", object: "0:4", label: "RAT" });
+});
+
+test("building-workspace registers inventory", async () => {
+  const kernel = await bootKernel(mockInvoke(), { inventoryStorage: createMemoryInventoryStorage() });
+  const inventory = kernel._peek("inventory.v1").impl;
+  const site = inventory.upsertEntity({ id: "site:test", type: "site", name: "Test" });
+  assert.equal(site.name, "Test");
+  assert.equal(inventory.listEntities({ type: "site" }).some((e) => e.id === "site:test"), true);
+});
+
+test("historian points can carry building model tags", async () => {
+  const ts = createTimeseries({ now: () => 7 });
+  const invoke = mockInvoke({
+    bacnet_read_properties: [{ id: 85, name: "present-value", values: [{ kind: "real", value: 70 }] }],
+  });
+  const kernel = await bootKernel(invoke, { timeseries: ts });
+  const historian = kernel._peek("bacnet.historian.v1").impl;
+  historian.addPoint({
+    device: { deviceInstance: 555 },
+    objectType: 0,
+    instance: 4,
+    label: "RAT",
+    site: "Main",
+    building: "HQ",
+    floor: "Level 1",
+    equip: "VAV-1",
+    pointId: "point:bacnet:555:0:4",
+  });
+  await historian.pollOnce();
+  assert.deepEqual(ts.recent().at(-1).tags, {
+    site: "Main",
+    building: "HQ",
+    floor: "Level 1",
+    equip: "VAV-1",
+    point: "point:bacnet:555:0:4",
+    device: "555",
+    object: "0:4",
+    label: "RAT",
+  });
 });
 
 test("a netscan sweep records a telemetry point (instrumentation)", async () => {
