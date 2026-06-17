@@ -3689,7 +3689,9 @@ async function bacReadAlarms() {
     bac.alarms.ran = true;
     logTo("bacnet", `Alarm read failed for ${bacDeviceLabel(dev)}: ${err}`, "error");
   } finally {
-    if (bac.selectedDeviceKey === dev.key) {
+    // Clear loading whenever this read still owns the alarms slot, even if the
+    // user switched devices mid-read — otherwise the button stays disabled.
+    if (bac.alarms.deviceKey === dev.key) {
       bac.alarms.loading = false;
       renderAll();
     }
@@ -6985,6 +6987,12 @@ async function bwWritePoint(point, { value, priority, relinquish = false, verify
   if (!ref || bwLiveBusyWrite) return;
   const pr = priority === "" || priority == null ? null : parseInt(priority, 10);
   if (relinquish && pr == null) { toast("Relinquish needs a priority (the slot to release).", "warn"); return; }
+  // Guard against blank/invalid input silently coercing to 0 — a real hazard for
+  // setpoints and commandable outputs. Only relinquish (null write) is exempt.
+  if (!relinquish && (value === "" || value == null || !Number.isFinite(Number(value)))) {
+    toast("Enter a numeric value to write.", "warn");
+    return;
+  }
   const writeVal = relinquish ? { kind: "null" } : bwBacnetWriteValue(ref.objectType, value);
   bwLiveBusyWrite = true;
   try {

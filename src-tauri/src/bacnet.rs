@@ -306,6 +306,10 @@ struct Client {
     /// Register-Foreign-Device to. The reader thread routes the asynchronous
     /// result back here (BVLC-Result carries no invoke id — only the source).
     fdr_waiters: Mutex<HashMap<SocketAddr, mpsc::Sender<u16>>>,
+    /// Serializes foreign-device registrations so a manual register and the
+    /// keep-alive's re-register can't run concurrently for the same BBMD and
+    /// clobber each other's `fdr_waiters` entry.
+    fdr_lock: Mutex<()>,
 }
 
 /// An active foreign-device registration with a BBMD. The keep-alive thread
@@ -346,6 +350,7 @@ impl Client {
             cov_tx: Mutex::new(None),
             bbmd: Mutex::new(None),
             fdr_waiters: Mutex::new(HashMap::new()),
+            fdr_lock: Mutex::new(()),
         });
         let for_thread = Arc::clone(&client);
         thread::spawn(move || reader_loop(for_thread, reader));
@@ -504,8 +509,16 @@ impl Client {
                 loop {
                     match ack_rx.recv_timeout(APDU_TIMEOUT) {
                         Ok(ack) if ack.negative => {
-                            // Retransmit from the segment the peer is missing.
-                            seq = ack.sequence as usize;
+                            // Retransmit from the segment the peer reports missing.
+                            // Reject an out-of-range sequence (garbled/hostile peer)
+                            // rather than indexing `chunks` out of bounds.
+                            let requested = ack.sequence as usize;
+                            if requested >= total {
+                                return Err(format!(
+                                    "peer NAK'd out-of-range segment {requested} (have {total})"
+                                ));
+                            }
+                            seq = requested;
                             send_segment(seq)?;
                         }
                         Ok(ack) if ack.sequence as usize >= seq => break, // acked
@@ -523,13 +536,24 @@ impl Client {
                 }
                 seq += 1;
             }
-            // All segments sent; await the actual response. A trailing SegmentACK
-            // for the final segment (if any) lands on ack_rx and is simply dropped.
-            match rx.recv_timeout(APDU_TIMEOUT) {
-                Ok(Outcome::Failed(e)) => Err(e),
-                Ok(outcome) => Ok(outcome),
-                Err(_) => Err(format!("no response from {} after a segmented request", target.sa)),
+            // All segments sent; await the actual response, retransmitting the
+            // final segment on timeout so one lost reply doesn't fail the request
+            // (matching the APDU_ATTEMPTS retry the unsegmented path uses). A
+            // trailing SegmentACK for the final segment lands on ack_rx and is
+            // simply dropped.
+            let last_seq = total - 1;
+            for attempt in 0..APDU_ATTEMPTS {
+                match rx.recv_timeout(APDU_TIMEOUT) {
+                    Ok(Outcome::Failed(e)) => return Err(e),
+                    Ok(outcome) => return Ok(outcome),
+                    Err(_) if attempt + 1 < APDU_ATTEMPTS => send_segment(last_seq)?,
+                    Err(_) => {}
+                }
             }
+            Err(format!(
+                "no response from {} after a segmented request ({APDU_ATTEMPTS} attempts)",
+                target.sa
+            ))
         })();
 
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&invoke_id);
@@ -1155,6 +1179,9 @@ fn subscribe_cov_core(
 /// id, so the reply is correlated purely by source address via `fdr_waiters`.
 /// Retries on timeout like a confirmed request.
 fn register_foreign_device_core(client: &Client, bbmd: SocketAddr, ttl: u16) -> Result<(), String> {
+    // Serialize registrations so concurrent callers (a manual register and the
+    // keep-alive) can't overwrite each other's BVLC-Result waiter.
+    let _serialize = client.fdr_lock.lock().unwrap_or_else(|e| e.into_inner());
     let frame = codec::encode_register_foreign_device(ttl);
     let (tx, rx) = mpsc::channel();
     client

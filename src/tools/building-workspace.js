@@ -566,24 +566,32 @@ export async function runCommissioning({ points, bacnet, writeProperty, options 
 
     if (writable && writeProperty && options.toggleVerify && isBinary) {
       // Toggle-and-verify: drive active then inactive, confirming each, then release.
+      // Relinquish runs in `finally` so a failure on a later write can't leave the
+      // point commanded; we only release if at least one command actually landed.
+      let commanded = false;
       try {
         for (const state of [1, 0]) {
           await writeProperty({ point, ref, value: state, priority });
+          commanded = true;
           step(point, "command", "pass", { value: state, priority });
           if (wantVerify) await verifyReadback(state);
         }
-        await relinquish();
       } catch (err) {
         step(point, "command", "fail", { error: String(err && err.message ? err.message : err) });
+      } finally {
+        if (commanded) await relinquish();
       }
     } else if (writable && writeProperty && commandValue != null) {
+      let commanded = false;
       try {
         await writeProperty({ point, ref, value: commandValue, priority });
+        commanded = true;
         step(point, "command", "pass", { value: commandValue, priority });
         if (wantVerify) await verifyReadback(commandValue);
-        await relinquish();
       } catch (err) {
         step(point, "command", "fail", { error: String(err && err.message ? err.message : err) });
+      } finally {
+        if (commanded) await relinquish();
       }
     }
   }
