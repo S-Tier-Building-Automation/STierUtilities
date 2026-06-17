@@ -32,10 +32,17 @@ export function createPackController({ invoke, timeseries, sleep = (ms) => new P
     connected = true;
   }
 
-  // True if we're already connected against exactly the given config, so re-attaching
-  // (which would reset `connected` and swap the transport) can be skipped.
+  // True if we're already connected against an equivalent config, so re-attaching
+  // (which would reset `connected` and swap the transport) can be skipped. Compares
+  // by value, not reference, so a freshly-loaded config object with the same fields
+  // still counts as "already connected".
   function alreadyConnectedWith(cfg) {
-    return connected && cfg != null && config === cfg;
+    return connected && config != null && cfg != null &&
+      config.influxPort === cfg.influxPort &&
+      config.grafanaPort === cfg.grafanaPort &&
+      config.token === cfg.token &&
+      config.org === cfg.org &&
+      config.bucket === cfg.bucket;
   }
 
   return {

@@ -338,8 +338,12 @@ pub async fn heicmov_make_preview(app: AppHandle, path: String) -> Result<Previe
                 ],
             )
             .await?;
-            // Keep the on-disk preview cache bounded (best-effort).
-            let _ = prune_cache(&cache_dir, PREVIEW_CACHE_BUDGET_BYTES);
+            // Keep the on-disk preview cache bounded (best-effort), off the async
+            // executor thread since pruning does synchronous directory I/O.
+            let cache_dir_clone = cache_dir.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let _ = prune_cache(&cache_dir_clone, PREVIEW_CACHE_BUDGET_BYTES);
+            });
             Ok(PreviewResult {
                 preview_path: preview_path.to_string_lossy().into_owned(),
                 mime: "image/jpeg".into(),
@@ -370,8 +374,12 @@ pub async fn heicmov_make_preview(app: AppHandle, path: String) -> Result<Previe
                 ],
             )
             .await?;
-            // Keep the on-disk preview cache bounded (best-effort).
-            let _ = prune_cache(&cache_dir, PREVIEW_CACHE_BUDGET_BYTES);
+            // Keep the on-disk preview cache bounded (best-effort), off the async
+            // executor thread since pruning does synchronous directory I/O.
+            let cache_dir_clone = cache_dir.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                let _ = prune_cache(&cache_dir_clone, PREVIEW_CACHE_BUDGET_BYTES);
+            });
             Ok(PreviewResult {
                 preview_path: preview_path.to_string_lossy().into_owned(),
                 mime: "video/mp4".into(),

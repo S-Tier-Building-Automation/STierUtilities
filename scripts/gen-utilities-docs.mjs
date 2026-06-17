@@ -99,19 +99,27 @@ for (const e of catalog.entries) {
 }
 
 // Patch docs.json: rebuild the "Utilities Platform" tab, preserve everything else.
+// Fail gracefully if the sibling docs repo (and its docs.json) isn't checked out —
+// the .mdx reference files are still generated above.
 const docsJsonPath = join(OUT, "docs.json");
-const config = JSON.parse(readFileSync(docsJsonPath, "utf8"));
-const groups = [
-  { group: "Get started", pages: ["utilities/introduction", "utilities/authoring"] },
-  { group: "Capability reference", pages: ["utilities/reference/overview"] },
-  ...groupByCategory(catalog.entries).map(([label, entries]) => ({
-    group: label, pages: entries.map((e) => `utilities/reference/${slug(e.capability)}`),
-  })),
-];
-const utilTab = { tab: "Utilities Platform", icon: "blocks", groups };
-config.navigation.tabs = config.navigation.tabs.filter((t) => t.tab !== "Utilities Platform").concat([utilTab]);
-writeFileSync(docsJsonPath, JSON.stringify(config, null, 2) + "\n", "utf8");
+let patchedDocsJson = false;
+try {
+  const config = JSON.parse(readFileSync(docsJsonPath, "utf8"));
+  const groups = [
+    { group: "Get started", pages: ["utilities/introduction", "utilities/authoring"] },
+    { group: "Capability reference", pages: ["utilities/reference/overview"] },
+    ...groupByCategory(catalog.entries).map(([label, entries]) => ({
+      group: label, pages: entries.map((e) => `utilities/reference/${slug(e.capability)}`),
+    })),
+  ];
+  const utilTab = { tab: "Utilities Platform", icon: "blocks", groups };
+  config.navigation.tabs = config.navigation.tabs.filter((t) => t.tab !== "Utilities Platform").concat([utilTab]);
+  writeFileSync(docsJsonPath, JSON.stringify(config, null, 2) + "\n", "utf8");
+  patchedDocsJson = true;
+} catch (err) {
+  console.warn(`Warning: could not patch ${docsJsonPath}: ${err.message}`);
+}
 
 console.log(`Wrote ${n} capability pages + overview into ${join(OUT, "utilities/reference")}`);
-console.log(`Patched ${docsJsonPath} (Utilities Platform tab)`);
+if (patchedDocsJson) console.log(`Patched ${docsJsonPath} (Utilities Platform tab)`);
 console.log(`Note: authored guides (utilities/introduction.mdx, utilities/authoring.mdx) are not generated — maintained in the docs repo.`);

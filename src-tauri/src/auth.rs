@@ -143,7 +143,12 @@ pub fn save_json<T: Serialize>(path: &Path, value: &T) -> Result<(), String> {
         TMP_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
-    std::fs::rename(&tmp, path).map_err(|e| e.to_string())
+    let res = std::fs::rename(&tmp, path).map_err(|e| e.to_string());
+    if res.is_err() {
+        // Don't leak the temp file in the config dir if the rename failed.
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 pub fn save_auth(path: &Path, state: &AuthState) -> Result<(), String> {

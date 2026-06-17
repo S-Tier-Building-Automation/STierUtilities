@@ -337,8 +337,15 @@ export async function runCommissioning({ points, bacnet, writeProperty, options 
       try {
         await writeProperty({ point, ref, value: commandValue, priority: options.priority || 8 });
         step(point, "command", "pass", { value: commandValue, priority: options.priority || 8 });
-        await writeProperty({ point, ref, value: null, priority: options.priority || 8, relinquish: true });
-        step(point, "relinquish", "pass", { priority: options.priority || 8 });
+        // Relinquish has its own try/catch: if the command succeeded but the
+        // relinquish failed, the point is left overridden — that's a distinct
+        // (and operationally serious) failure, not a command failure.
+        try {
+          await writeProperty({ point, ref, value: null, priority: options.priority || 8, relinquish: true });
+          step(point, "relinquish", "pass", { priority: options.priority || 8 });
+        } catch (relinquishErr) {
+          step(point, "relinquish", "fail", { error: String(relinquishErr && relinquishErr.message ? relinquishErr.message : relinquishErr) });
+        }
       } catch (err) {
         step(point, "command", "fail", { error: String(err && err.message ? err.message : err) });
       }

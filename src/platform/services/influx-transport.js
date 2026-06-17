@@ -29,7 +29,7 @@ export function buildGrafanaPanelUrl(config, spec = {}) {
 
 export function createInfluxTransport({ invoke, config }) {
   if (typeof invoke !== "function") throw new Error("createInfluxTransport requires an invoke function");
-  if (!config || typeof config.influxPort !== "number") throw new Error("createInfluxTransport requires a PackConfig");
+  if (!config || !Number.isFinite(config.influxPort)) throw new Error("createInfluxTransport requires a PackConfig");
   if (!Number.isFinite(config.grafanaPort)) throw new Error("createInfluxTransport requires a PackConfig with a numeric grafanaPort");
 
   return {
