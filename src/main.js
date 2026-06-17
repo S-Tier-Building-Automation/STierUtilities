@@ -6777,6 +6777,7 @@ let bwLivePoll = null;      // { kind: "point" | "device", id }
 let bwLiveTimer = null;
 let bwLivePaused = false;
 let bwLiveBusyWrite = false;
+let bwLiveBusyPoll = false;  // guards against overlapping async ticks
 const BW_POINT_POLL_MS = 4000;
 const BW_DEVICE_POLL_MS = 12000;
 const BW_DEVICE_POLL_CAP = 60; // don't hammer a big device every tick
@@ -6856,6 +6857,9 @@ function bwToggleLivePause() {
 }
 
 async function bwLiveTick() {
+  // Ticks run sequential async reads that can exceed the poll interval; the busy
+  // guard stops setInterval from stacking concurrent polling loops.
+  if (bwLiveBusyPoll) return;
   const poll = bwLivePoll;
   if (!poll) return;
   const inv = inventoryInstance();
@@ -6863,35 +6867,42 @@ async function bwLiveTick() {
   if (!inv || currentPluginId() !== "building-workspace" || bw.tab !== "model") { bwStopLivePoll(); return; }
   const entity = inv.getEntity(poll.id);
   if (!entity) { bwStopLivePoll(); return; }
-  if (poll.kind === "point") {
-    const ref = bwPointRef(entity);
-    if (!ref) { bwStopLivePoll(); return; }
-    try {
-      const props = await bwBacnetCap().readPoint(ref.device, ref.objectType, ref.instance);
-      if (bwLivePoll !== poll) return; // selection moved mid-read
-      bwLive = { props };
-    } catch (err) {
-      if (bwLivePoll !== poll) return;
-      bwLive = { props: null, error: String(err) };
-    }
-    bwUpdateLiveDisplay(entity);
-  } else {
-    const points = inv.listEntities({ type: "point", equipId: entity.id }).slice(0, BW_DEVICE_POLL_CAP);
-    const values = bwDeviceLive?.values || new Map();
-    for (const p of points) {
-      if (bwLivePoll !== poll) return; // bail if selection moved
-      const ref = bwPointRef(p);
-      if (!ref) { values.set(p.id, { error: "no ref" }); continue; }
+  bwLiveBusyPoll = true;
+  try {
+    if (poll.kind === "point") {
+      const ref = bwPointRef(entity);
+      if (!ref) { bwStopLivePoll(); return; }
       try {
         const props = await bwBacnetCap().readPoint(ref.device, ref.objectType, ref.instance);
-        const pv = bwLivePresentValue(props);
-        values.set(p.id, { value: pv.value, display: pv.display });
+        if (bwLivePoll !== poll) return; // selection moved mid-read
+        bwLive = { props };
       } catch (err) {
-        values.set(p.id, { error: String(err) });
+        if (bwLivePoll !== poll) return;
+        bwLive = { props: null, error: String(err) };
       }
-      bwDeviceLive = { values };
-      bwUpdateDeviceLive(entity); // progressive update as each point comes back
+      bwUpdateLiveDisplay(entity);
+    } else {
+      const points = inv.listEntities({ type: "point", equipId: entity.id }).slice(0, BW_DEVICE_POLL_CAP);
+      const values = bwDeviceLive?.values || new Map();
+      for (const p of points) {
+        if (bwLivePoll !== poll) return; // bail if selection moved
+        const ref = bwPointRef(p);
+        if (!ref) { values.set(p.id, { error: "no ref" }); continue; }
+        try {
+          const props = await bwBacnetCap().readPoint(ref.device, ref.objectType, ref.instance);
+          if (bwLivePoll !== poll) return; // stale read for a superseded selection
+          const pv = bwLivePresentValue(props);
+          values.set(p.id, { value: pv.value, display: pv.display });
+        } catch (err) {
+          if (bwLivePoll !== poll) return;
+          values.set(p.id, { error: String(err) });
+        }
+        bwDeviceLive = { values };
+        bwUpdateDeviceLive(entity); // progressive update as each point comes back
+      }
     }
+  } finally {
+    bwLiveBusyPoll = false;
   }
 }
 

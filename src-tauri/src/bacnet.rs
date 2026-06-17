@@ -2115,6 +2115,10 @@ pub async fn bacnet_read_trend(
 const COV_LIFETIME_SECS: u32 = 300;
 const COV_RESUBSCRIBE_SECS: u64 = 180;
 
+/// Short retry delay (seconds) after a failed foreign-device re-registration,
+/// so a transient failure doesn't wait a full refresh interval and lapse.
+const FDR_RETRY_SECS: u64 = 2;
+
 /// Consecutive resubscribe failures before the keep-alive gives up and drops the
 /// subscription — bounds the thread's life if the device or frontend goes away
 /// (e.g. a webview reload that never calls unsubscribe).
@@ -2286,8 +2290,12 @@ pub async fn bacnet_register_foreign_device(
         thread::spawn(move || {
             let mut failures = 0u32;
             while active.load(Ordering::Relaxed) {
+                // Re-register at half the TTL normally; after a failed attempt
+                // retry quickly so a transient miss can't let the registration
+                // lapse at the BBMD (TTL + 30 s grace) before we recover.
+                let sleep_secs = if failures > 0 { FDR_RETRY_SECS } else { refresh_secs };
                 // Sleep in short slices so unregister takes effect promptly.
-                for _ in 0..(refresh_secs * 2) {
+                for _ in 0..(sleep_secs * 2) {
                     if !active.load(Ordering::Relaxed) {
                         return;
                     }
