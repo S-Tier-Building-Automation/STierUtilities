@@ -36,6 +36,24 @@ test("source refs de-dupe generated point ids on repeated imports", () => {
   assert.equal(inv.listEntities({ type: "point" }).length, 1);
 });
 
+test("upsertMany batch-inserts, persists once, and de-dupes by source ref within the batch", () => {
+  let saves = 0;
+  const mem = createMemoryInventoryStorage();
+  const storage = { load: mem.load, save: (s) => { saves++; mem.save(s); } };
+  let next = 1;
+  const inv = createInventory({ storage, now: () => 1, idFactory: (type) => `${type}:uuid-${next++}` });
+  saves = 0; // ignore the constructor's loadFromStorage persist
+  const out = inv.upsertMany([
+    { type: "equip", name: "VAV-1" },
+    { type: "point", name: "RAT", sourceRefs: [bacnetSourceRef(1, 0, 4)] },
+    { type: "point", name: "Return Air Temp", sourceRefs: [bacnetSourceRef(1, 0, 4)] },
+  ]);
+  assert.equal(saves, 1); // a single persist for the whole batch
+  assert.equal(out.length, 2); // the VAV plus one merged point
+  assert.equal(inv.listEntities({ type: "point" }).length, 1);
+  assert.equal(inv.getEntity(out[1].id).name, "Return Air Temp");
+});
+
 test("tag filters and template application work for VAV/AHU examples", () => {
   const inv = createInventory({ storage: createMemoryInventoryStorage(), now: () => 1 });
   inv.upsertEntity({ id: "equip:vav-1", type: "equip", name: "VAV-1" });

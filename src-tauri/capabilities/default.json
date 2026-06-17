@@ -18,6 +18,7 @@
     "opener:default",
     "updater:default",
     "process:default",
+    "mcp-bridge:default",
     {
       "identifier": "shell:allow-execute",
       "allow": [

@@ -252,6 +252,152 @@ export function historianPointFromEntity(point, { site, building, floor, equip }
   };
 }
 
+// ---------------------------------------------------------------------------
+// Phase 1 — discovery & onboarding at scale. Pure helpers (no DOM/Tauri) for
+// bulk object modeling, re-IP conflict resolution, and discovery drift, so they
+// stay node --test'able alongside the rest of this module.
+// ---------------------------------------------------------------------------
+
+/** Render a point name from a template; falls back to the object's own name. */
+function renderPointName(template, object, equipName) {
+  const objType = Number(object?.objectType);
+  const typeName = object?.typeName || (Number.isFinite(objType) ? String(objType) : "");
+  const instance = object?.instance ?? "";
+  const base = object?.name || `${typeName || "obj"}:${instance}`;
+  const t = String(template || "").trim();
+  if (!t) return base;
+  const out = t
+    .replaceAll("{equip}", equipName || "")
+    .replaceAll("{type}", typeName || "")
+    .replaceAll("{instance}", String(instance))
+    .replaceAll("{name}", base)
+    .trim();
+  return out || base;
+}
+
+/**
+ * Plan how a device's objects map to equipment + point names before committing.
+ * Groups objects by an inferred equipment name (suggestEquipmentName) and applies an
+ * optional naming template ({equip}/{type}/{instance}/{name}). Pure + previewable so the
+ * UI can show the plan and let the user edit it before any inventory write.
+ */
+export function bwPlanDeviceObjects({ device, objects = [], template = "", defaultEquipName = "" } = {}) {
+  const instance = bwBacnetDeviceInstance(device);
+  const deviceName = device?.name || (instance != null ? `Device ${instance}` : "BACnet device");
+  const fallbackEquip = defaultEquipName || deviceName;
+  const items = (objects || []).map((object) => {
+    const equipName = suggestEquipmentName(object?.name || "", fallbackEquip);
+    return { object, equipName, pointName: renderPointName(template, object, equipName) };
+  });
+  const equips = [...new Set(items.map((i) => i.equipName))];
+  return { items, equips };
+}
+
+/**
+ * Build the point entities for a planned batch. Equipment ids are resolved by the
+ * caller (which creates/looks up equip entities first) via equipIdByName — a Map or a
+ * plain object keyed by the plan's equip names. Returns entities ready for
+ * inventory.upsertMany().
+ */
+export function bwModelObjectsBatch({ siteId, buildingId, floorId, device, items = [], equipIdByName = {} } = {}) {
+  const lookup = (name) => (equipIdByName instanceof Map ? equipIdByName.get(name) : equipIdByName[name]) || "";
+  return (items || []).map((item) => pointEntityFromBacnet({
+    siteId,
+    buildingId,
+    floorId,
+    equipId: lookup(item.equipName),
+    device,
+    object: { ...item.object, name: item.pointName || item.object?.name },
+    props: item.props || [],
+  }));
+}
+
+/** Rewrite a point's BACnet source ref + device fields onto a new device instance. */
+function repointPointEntity(point, device) {
+  const newInstance = bwBacnetDeviceInstance(device);
+  if (newInstance == null) return point;
+  const sourceRefs = (point.sourceRefs || []).map((ref) => {
+    const parsed = parseSourceRef(ref);
+    return parsed?.kind === "bacnet" ? bacnetSourceRef(newInstance, parsed.objectType, parsed.instance) : ref;
+  });
+  return {
+    ...point,
+    sourceRefs,
+    deviceInstance: newInstance,
+    deviceRef: compactObject({
+      address: device.address ?? point.deviceRef?.address,
+      network: device.network ?? null,
+      mac: device.mac ?? null,
+      deviceInstance: newInstance,
+    }),
+  };
+}
+
+/**
+ * Resolve a device address/instance conflict (e.g. a re-IP'd or swapped device).
+ *  - action "replace": re-point the existing modeled equip + its points onto the new
+ *    device instance/address; returns the entities to upsert (equip first, then points).
+ *  - any other action ("both"/"ignore"): no changes (caller imports separately).
+ */
+export function bwResolveDeviceConflict({ action = "replace", modeledDevice, device, points = [] } = {}) {
+  if (action !== "replace" || !modeledDevice || !device) return { action, updated: [] };
+  const newInstance = bwBacnetDeviceInstance(device);
+  const equip = {
+    ...modeledDevice,
+    deviceInstance: newInstance ?? modeledDevice.deviceInstance,
+    address: device.address ?? modeledDevice.address,
+    deviceRef: compactObject({
+      ...(modeledDevice.deviceRef || {}),
+      address: device.address ?? modeledDevice.deviceRef?.address,
+      network: device.network ?? null,
+      mac: device.mac ?? null,
+      deviceInstance: newInstance ?? modeledDevice.deviceInstance,
+    }),
+  };
+  const repointed = (points || [])
+    .filter((p) => Number(p.deviceInstance) === Number(modeledDevice.deviceInstance))
+    .map((p) => repointPointEntity(p, device));
+  return { action: "replace", updated: [equip, ...repointed] };
+}
+
+/** Which device fields drifted between two observations of the same device key. */
+function deviceDriftFields(before, after) {
+  const fields = [];
+  for (const k of ["address", "vendorId", "modelName", "name"]) {
+    const a = before?.[k];
+    const b = after?.[k];
+    if (a != null && b != null && String(a) !== String(b)) fields.push(k);
+  }
+  return fields;
+}
+
+/**
+ * Classify a fresh discovery against the previously-seen set: each current device is
+ * new / returning / changed (address/vendor/model/name drift), plus a `missing` list for
+ * devices seen before but absent now. Pure; the caller persists `current` as the next
+ * baseline.
+ */
+export function bwClassifyDiscovery(prev = [], current = []) {
+  const prevList = Array.isArray(prev) ? prev : Object.values(prev || {});
+  const prevByKey = new Map(prevList.map((d) => [bwDeviceKey(d), d]));
+  const seen = new Set();
+  const devices = (current || []).map((device) => {
+    const key = bwDeviceKey(device);
+    seen.add(key);
+    const before = prevByKey.get(key);
+    if (!before) return { key, device, status: "new", changes: [] };
+    const changes = deviceDriftFields(before, device);
+    return { key, device, status: changes.length ? "changed" : "returning", changes };
+  });
+  const missing = [...prevByKey.entries()].filter(([k]) => !seen.has(k)).map(([, d]) => d);
+  const summary = devices.reduce(
+    (acc, d) => { acc[d.status] += 1; return acc; },
+    { new: 0, returning: 0, changed: 0 },
+  );
+  summary.missing = missing.length;
+  return { devices, missing, summary };
+}
+
 export function generateBuildingDashboard(snapshot, { siteId = null, buildingId = null, floorId = null, equipId = null, title = "S-Tier Building Workspace" } = {}) {
   const entities = snapshot?.entities || [];
   const points = entities.filter((e) =>
@@ -315,6 +461,48 @@ export function generateBuildingDashboard(snapshot, { siteId = null, buildingId 
   };
 }
 
+// ---------------------------------------------------------------------------
+// Phase 2 — live control & commissioning. Pure decoders + verify logic.
+// ---------------------------------------------------------------------------
+
+/**
+ * Decode a BACnet priority-array read into 16 slots. `values` is the decoded property
+ * value array (each {kind, value}; empty slots are kind "null"). BACnet priority 1 is
+ * highest, so the commanding slot is the lowest-numbered non-null one.
+ */
+export function parsePriorityArray(values) {
+  const slots = [];
+  for (let i = 0; i < 16; i++) {
+    const v = Array.isArray(values) ? values[i] : null;
+    const isNull = !v || v.kind === "null" || v.kind == null || v.value == null;
+    slots.push({ level: i + 1, active: !isNull, value: isNull ? null : v.value, kind: isNull ? null : v.kind });
+  }
+  const activeSlot = slots.find((s) => s.active) || null;
+  return { slots, activeLevel: activeSlot ? activeSlot.level : null, activeValue: activeSlot ? activeSlot.value : null };
+}
+
+/** Decode a BACnet status-flags bit-string into named flags. Accepts the {kind,bits} value, a raw bits string, or a property entry. */
+export function interpretStatusFlags(input) {
+  const names = ["inAlarm", "fault", "overridden", "outOfService"];
+  const labels = ["in-alarm", "fault", "overridden", "out-of-service"];
+  let bits = "";
+  if (typeof input === "string") bits = input;
+  else if (input && typeof input.bits === "string") bits = input.bits;
+  else if (input && Array.isArray(input.values) && input.values[0]) bits = input.values[0].bits || "";
+  const at = (i) => bits.charAt(i) === "1";
+  const out = { raised: [] };
+  names.forEach((n, i) => { out[n] = at(i); if (at(i)) out.raised.push(labels[i]); });
+  return out;
+}
+
+/** Does a commissioning readback match the commanded value (numeric tolerance, else exact)? */
+export function commissioningValueMatches(got, expected, tolerance = 0.5) {
+  if (got == null) return false;
+  const g = Number(got), e = Number(expected);
+  if (!Number.isFinite(g) || !Number.isFinite(e)) return String(got) === String(expected);
+  return Math.abs(g - e) <= (Number.isFinite(tolerance) ? tolerance : 0.5);
+}
+
 export async function runCommissioning({ points, bacnet, writeProperty, options = {}, now = () => Date.now() }) {
   const startedAt = new Date(now()).toISOString();
   const steps = [];
@@ -345,19 +533,55 @@ export async function runCommissioning({ points, bacnet, writeProperty, options 
     }
 
     const commandValue = point.commandValue ?? options.commandValue;
-    if ((point.tags?.writable || options.commandAll) && writeProperty && commandValue != null) {
+    const priority = options.priority || 8;
+    const writable = point.tags?.writable || options.commandAll;
+    const isBinary = [3, 4, 5].includes(Number(ref.objectType)); // BI / BO / BV
+    const wantVerify = Boolean(options.verify);
+
+    // Read back present-value after a command and record whether it landed.
+    const verifyReadback = async (expected) => {
       try {
-        await writeProperty({ point, ref, value: commandValue, priority: options.priority || 8 });
-        step(point, "command", "pass", { value: commandValue, priority: options.priority || 8 });
-        // Relinquish has its own try/catch: if the command succeeded but the
-        // relinquish failed, the point is left overridden — that's a distinct
-        // (and operationally serious) failure, not a command failure.
-        try {
-          await writeProperty({ point, ref, value: null, priority: options.priority || 8, relinquish: true });
-          step(point, "relinquish", "pass", { priority: options.priority || 8 });
-        } catch (relinquishErr) {
-          step(point, "relinquish", "fail", { error: String(relinquishErr && relinquishErr.message ? relinquishErr.message : relinquishErr) });
+        const after = await bacnet.readPoint({ deviceInstance: ref.deviceInstance }, ref.objectType, ref.instance);
+        const got = extractPresentValue(after);
+        const ok = commissioningValueMatches(got, expected, options.tolerance);
+        step(point, "verify", ok ? "pass" : "fail", {
+          expected, value: got,
+          ...(ok ? {} : { error: got == null ? "no readback" : "value did not change as commanded (possible stuck output or higher-priority override)" }),
+        });
+      } catch (err) {
+        step(point, "verify", "fail", { expected, error: String(err && err.message ? err.message : err) });
+      }
+    };
+
+    // Relinquish helper (its own try/catch: a failed relinquish leaves the point
+    // overridden — a distinct, operationally serious failure, not a command failure).
+    const relinquish = async () => {
+      try {
+        await writeProperty({ point, ref, value: null, priority, relinquish: true });
+        step(point, "relinquish", "pass", { priority });
+      } catch (relinquishErr) {
+        step(point, "relinquish", "fail", { error: String(relinquishErr && relinquishErr.message ? relinquishErr.message : relinquishErr) });
+      }
+    };
+
+    if (writable && writeProperty && options.toggleVerify && isBinary) {
+      // Toggle-and-verify: drive active then inactive, confirming each, then release.
+      try {
+        for (const state of [1, 0]) {
+          await writeProperty({ point, ref, value: state, priority });
+          step(point, "command", "pass", { value: state, priority });
+          if (wantVerify) await verifyReadback(state);
         }
+        await relinquish();
+      } catch (err) {
+        step(point, "command", "fail", { error: String(err && err.message ? err.message : err) });
+      }
+    } else if (writable && writeProperty && commandValue != null) {
+      try {
+        await writeProperty({ point, ref, value: commandValue, priority });
+        step(point, "command", "pass", { value: commandValue, priority });
+        if (wantVerify) await verifyReadback(commandValue);
+        await relinquish();
       } catch (err) {
         step(point, "command", "fail", { error: String(err && err.message ? err.message : err) });
       }

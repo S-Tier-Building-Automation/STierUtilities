@@ -34,6 +34,16 @@ const APDU_TIMEOUT: Duration = Duration::from_millis(3000);
 /// Send attempts per confirmed request (bacnet-stack default).
 const APDU_ATTEMPTS: u32 = 3;
 
+/// Proposed window for our *outbound* segmented requests. We use stop-and-wait
+/// (window 1): send a segment, await its SegmentACK, send the next. Large
+/// outbound requests are rare (only a big WriteProperty), so the simplicity of
+/// stop-and-wait beats sliding-window throughput here.
+const OUT_SEGMENT_WINDOW: u8 = 1;
+
+/// Largest standard BACnet APDU (used when a peer's max-APDU is unknown, so we
+/// only segment outbound requests that exceed even the biggest standard buffer).
+const MAX_STANDARD_APDU: usize = 1476;
+
 /// Hard cap on object-list size for the index-by-index fallback.
 const MAX_OBJECTS: u64 = 5000;
 
@@ -57,6 +67,17 @@ pub struct DeviceRef {
     pub network: Option<u16>,
     #[serde(default)]
     pub mac: Option<String>,
+    /// The device's negotiated max-APDU (from its I-Am), when known. Lets the
+    /// client segment an outbound request that wouldn't fit one of the device's
+    /// APDUs. Absent (older callers) means "assume the largest standard APDU".
+    #[serde(default)]
+    pub max_apdu: Option<u32>,
+    /// The device's segmentation support from its I-Am ("both"/"transmit"/
+    /// "receive"/"none"), when known. Used to reject an outbound request that
+    /// would need segmenting before we send it to a device that can't receive
+    /// segments. Absent means "unknown — try it and let the device decide".
+    #[serde(default)]
+    pub segmentation: Option<String>,
 }
 
 /// A discovered device. `name`/`vendor_name`/`model_name` are filled by the
@@ -176,6 +197,30 @@ struct Discovery {
 struct Target {
     sa: SocketAddr,
     route: Option<(u16, Vec<u8>)>,
+    /// The device's max-APDU when known (else `None` → assume the largest
+    /// standard APDU). Drives whether an outbound request must be segmented.
+    max_apdu: Option<u32>,
+    /// The device's segmentation support ("both"/"transmit"/"receive"/"none"),
+    /// when known. Gates whether we may send it a segmented request.
+    segmentation: Option<String>,
+}
+
+impl Target {
+    /// Whether the device can RECEIVE a segmented request from us — true for
+    /// "both"/"receive". Unknown (`None`) is treated as yes (best effort: the
+    /// device aborts if it can't), so callers that don't carry the capability
+    /// keep working unchanged.
+    fn accepts_segmented_requests(&self) -> bool {
+        !matches!(self.segmentation.as_deref(), Some("transmit") | Some("none"))
+    }
+}
+
+/// A SegmentACK the peer sent for our outbound segmented request. We send with a
+/// window of 1 (stop-and-wait), so the peer's granted window isn't needed here.
+#[derive(Debug, Clone, Copy)]
+struct SegAck {
+    negative: bool,
+    sequence: u8,
 }
 
 /// Accumulates a segmented ComplexAck reply across datagrams, keyed by invoke id.
@@ -238,6 +283,9 @@ struct Client {
     discovery: Mutex<Option<Discovery>>,
     /// In-flight segmented-reply reassembly buffers, keyed by invoke id.
     segments: Mutex<HashMap<u8, SegmentBuffer>>,
+    /// Waiters for SegmentACKs to our *outbound* segmented requests, keyed by
+    /// invoke id. Present only while a segmented request is being transmitted.
+    seg_acks: Mutex<HashMap<u8, mpsc::Sender<SegAck>>>,
     cov: Mutex<HashMap<u32, CovEntry>>,
     next_process: Mutex<u32>,
     /// Bumped each time a device's objects are read; a detached name-enrichment
@@ -250,6 +298,22 @@ struct Client {
     /// `AppHandle` in the static pulls the full Wry/WebView2 runtime into the
     /// reader path and breaks the (headless) unit-test binary at load time.
     cov_tx: Mutex<Option<mpsc::Sender<CovEvent>>>,
+    /// The BBMD we're registered with as a foreign device, if any. Set while a
+    /// keep-alive thread holds the registration open; discovery routes its
+    /// broadcasts through this BBMD instead of the local wire.
+    bbmd: Mutex<Option<BbmdRegistration>>,
+    /// Outstanding waiters for a BVLC-Result, keyed by the BBMD we sent a
+    /// Register-Foreign-Device to. The reader thread routes the asynchronous
+    /// result back here (BVLC-Result carries no invoke id — only the source).
+    fdr_waiters: Mutex<HashMap<SocketAddr, mpsc::Sender<u16>>>,
+}
+
+/// An active foreign-device registration with a BBMD. The keep-alive thread
+/// re-registers before `ttl` expires and stops when `active` clears.
+struct BbmdRegistration {
+    addr: SocketAddr,
+    ttl: u16,
+    active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Client {
@@ -275,10 +339,13 @@ impl Client {
             next_invoke: Mutex::new(1),
             discovery: Mutex::new(None),
             segments: Mutex::new(HashMap::new()),
+            seg_acks: Mutex::new(HashMap::new()),
             cov: Mutex::new(HashMap::new()),
             next_process: Mutex::new(1),
             objects_gen: AtomicUsize::new(0),
             cov_tx: Mutex::new(None),
+            bbmd: Mutex::new(None),
+            fdr_waiters: Mutex::new(HashMap::new()),
         });
         let for_thread = Arc::clone(&client);
         thread::spawn(move || reader_loop(for_thread, reader));
@@ -308,8 +375,26 @@ impl Client {
     }
 
     /// Sends a confirmed request and waits for its outcome, retrying on
-    /// timeout. `apdu` must already carry `invoke_id`.
+    /// timeout. `apdu` must already carry `invoke_id`. Requests larger than the
+    /// peer's APDU are transmitted as a segmented ConfirmedRequest.
     fn request(&self, target: &Target, apdu: &[u8], invoke_id: u8) -> Result<Outcome, String> {
+        // The whole APDU must fit one of the peer's APDUs; otherwise segment it.
+        // Default to the largest standard APDU when the peer's size is unknown,
+        // so we only segment requests that no device could accept unsegmented.
+        let peer_max = target.max_apdu.map(|m| m as usize).unwrap_or(MAX_STANDARD_APDU).max(50);
+        if apdu.len() > peer_max {
+            // Don't even try if the device told us it can't receive segments —
+            // surface a clear error instead of waiting for its Abort.
+            if !target.accepts_segmented_requests() {
+                return Err(format!(
+                    "request is {} bytes but the device's APDU is {peer_max} and it does not \
+                     accept segmented requests (segmentation: {})",
+                    apdu.len(),
+                    target.segmentation.as_deref().unwrap_or("unknown"),
+                ));
+            }
+            return self.request_segmented(target, apdu, invoke_id, peer_max);
+        }
         let npdu = codec::encode_npdu(
             true,
             target.route.as_ref().map(|(net, mac)| (*net, mac.as_slice())),
@@ -342,6 +427,113 @@ impl Client {
         self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&invoke_id);
         // Drop any partial reassembly so a late stray segment can't seed a buffer
         // that outlives the transaction.
+        self.segments.lock().unwrap_or_else(|e| e.into_inner()).remove(&invoke_id);
+        result
+    }
+
+    /// Transmits a confirmed request too large for one APDU as a segmented
+    /// ConfirmedRequest, then waits for the reply. Stop-and-wait: each segment is
+    /// sent and its SegmentACK awaited before the next, so the peer paces us and
+    /// a lost segment is retransmitted. The final reply (which may itself be a
+    /// segmented ComplexAck, reassembled by the normal inbound path) arrives on
+    /// the usual pending channel.
+    fn request_segmented(
+        &self,
+        target: &Target,
+        apdu: &[u8],
+        invoke_id: u8,
+        peer_max: usize,
+    ) -> Result<Outcome, String> {
+        // The segmentable body is the request APDU minus its 3-byte unsegmented
+        // header (type, max-segs/max-apdu, invoke). What remains is the service
+        // choice + service request, which is what gets split across segments.
+        let body = apdu.get(3..).ok_or("request too short to segment")?;
+        // Each segment frame (5-byte segmented header + chunk) must fit peer_max.
+        let chunk_size = peer_max.saturating_sub(5).max(1);
+        let chunks: Vec<&[u8]> = body.chunks(chunk_size).collect();
+        let total = chunks.len();
+        if total < 2 {
+            return Err("segmentation computed a single segment (internal error)".into());
+        }
+        if total > MAX_SEGMENTS {
+            return Err(format!(
+                "request needs {total} segments, exceeding the {MAX_SEGMENTS}-segment cap"
+            ));
+        }
+
+        let route = target.route.as_ref().map(|(net, mac)| (*net, mac.as_slice()));
+        let send_segment = |seq: usize| -> Result<(), String> {
+            let more = seq + 1 < total;
+            let seg_apdu = codec::encode_confirmed_request_segment(
+                invoke_id,
+                seq as u8,
+                OUT_SEGMENT_WINDOW,
+                more,
+                chunks[seq],
+            );
+            let mut payload = codec::encode_npdu(true, route);
+            payload.extend_from_slice(&seg_apdu);
+            self.socket
+                .send_to(&codec::bvlc_encode(codec::BVLC_ORIGINAL_UNICAST, &payload), target.sa)
+                .map(|_| ())
+                .map_err(|e| format!("segment send failed: {e}"))
+        };
+
+        // Register both the final-reply waiter and the SegmentACK waiter before
+        // sending anything, so no ack/reply can race ahead of us.
+        let (tx, rx) = mpsc::channel();
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(invoke_id, (target.sa, target.route.clone(), tx));
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.seg_acks.lock().unwrap_or_else(|e| e.into_inner()).insert(invoke_id, ack_tx);
+
+        let result = (|| {
+            // Send segments 0..total-1, awaiting each one's SegmentACK; the final
+            // segment (more=0) is sent without waiting for an ack — the reply
+            // follows it.
+            let mut seq = 0usize;
+            while seq < total {
+                send_segment(seq)?;
+                if seq + 1 >= total {
+                    break; // last segment sent; await the reply below
+                }
+                // Await the SegmentACK for `seq`, retrying the segment on timeout.
+                let mut attempts = 0u32;
+                loop {
+                    match ack_rx.recv_timeout(APDU_TIMEOUT) {
+                        Ok(ack) if ack.negative => {
+                            // Retransmit from the segment the peer is missing.
+                            seq = ack.sequence as usize;
+                            send_segment(seq)?;
+                        }
+                        Ok(ack) if ack.sequence as usize >= seq => break, // acked
+                        Ok(_) => {} // stale/duplicate ack for an older segment — keep waiting
+                        Err(_) => {
+                            attempts += 1;
+                            if attempts >= APDU_ATTEMPTS {
+                                return Err(format!(
+                                    "no SegmentACK for segment {seq} after {APDU_ATTEMPTS} attempts"
+                                ));
+                            }
+                            send_segment(seq)?;
+                        }
+                    }
+                }
+                seq += 1;
+            }
+            // All segments sent; await the actual response. A trailing SegmentACK
+            // for the final segment (if any) lands on ack_rx and is simply dropped.
+            match rx.recv_timeout(APDU_TIMEOUT) {
+                Ok(Outcome::Failed(e)) => Err(e),
+                Ok(outcome) => Ok(outcome),
+                Err(_) => Err(format!("no response from {} after a segmented request", target.sa)),
+            }
+        })();
+
+        self.pending.lock().unwrap_or_else(|e| e.into_inner()).remove(&invoke_id);
+        self.seg_acks.lock().unwrap_or_else(|e| e.into_inner()).remove(&invoke_id);
         self.segments.lock().unwrap_or_else(|e| e.into_inner()).remove(&invoke_id);
         result
     }
@@ -466,6 +658,18 @@ impl Client {
         }
     }
 
+    /// Routes an inbound SegmentACK (the peer acknowledging one of OUR request
+    /// segments) to the in-flight segmented send for `invoke_id`, but only from
+    /// the peer (and routed source) that transaction is talking to.
+    fn note_segment_ack(&self, invoke_id: u8, src: SocketAddr, route: &Option<(u16, Vec<u8>)>, ack: SegAck) {
+        if !self.pending_peer_matches(invoke_id, src, route) {
+            return;
+        }
+        if let Some(tx) = self.seg_acks.lock().unwrap_or_else(|e| e.into_inner()).get(&invoke_id) {
+            let _ = tx.send(ack);
+        }
+    }
+
     fn note_i_am(&self, raw: RawDevice) {
         let mut guard = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(d) = guard.as_mut() {
@@ -486,6 +690,24 @@ impl Client {
         if let Some(d) = guard.as_ref() {
             let _ = d.tx.send(DiscoveryEvent::Routers { router, networks });
         }
+    }
+
+    /// Routes an asynchronous BVLC-Result (e.g. the reply to a Register-Foreign-
+    /// Device) to whoever is waiting on that BBMD. BVLC-Result has no invoke id,
+    /// so the only correlation is the source address we sent the request to.
+    fn note_bvlc_result(&self, src: SocketAddr, code: u16) {
+        if let Some(tx) = self.fdr_waiters.lock().unwrap_or_else(|e| e.into_inner()).remove(&src) {
+            let _ = tx.send(code);
+        }
+    }
+
+    /// The BBMD we're currently registered with, if any.
+    fn registered_bbmd(&self) -> Option<SocketAddr> {
+        self.bbmd
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|b| b.addr)
     }
 
     /// Ensures a COV emitter is running: on first call it creates the channel
@@ -604,7 +826,14 @@ fn handle_frame(client: &Client, frame: &[u8], src: SocketAddr) {
     let Ok(bvlc) = codec::bvlc_decode(frame) else { return };
     match bvlc.function {
         codec::BVLC_ORIGINAL_UNICAST | codec::BVLC_ORIGINAL_BROADCAST | codec::BVLC_FORWARDED_NPDU => {}
-        _ => return, // BVLC-Result and BBMD table traffic — nothing pending on them
+        // A BBMD's reply to our Register-Foreign-Device — hand it to the waiter.
+        codec::BVLC_RESULT => {
+            if let Some(code) = codec::decode_bvlc_result(frame) {
+                client.note_bvlc_result(src, code);
+            }
+            return;
+        }
+        _ => return, // other BBMD table traffic — nothing pending on it
     }
     // For Forwarded-NPDU (via a BBMD) the real peer is the embedded origin.
     let effective_src = bvlc
@@ -717,6 +946,14 @@ fn handle_frame(client: &Client, frame: &[u8], src: SocketAddr) {
             &npdu.source,
             Outcome::Failed(format!("request aborted: {}", codec::abort_reason_name(reason))),
         ),
+        // The peer acknowledging one of our outbound request segments. The
+        // granted window is ignored (we send stop-and-wait with window 1).
+        Apdu::SegmentAck { invoke_id, negative, sequence, window: _ } => client.note_segment_ack(
+            invoke_id,
+            effective_src,
+            &npdu.source,
+            SegAck { negative, sequence },
+        ),
         _ => {}
     }
 }
@@ -787,7 +1024,7 @@ fn resolve_device(d: &DeviceRef) -> Result<Target, String> {
     let route = d
         .network
         .map(|net| (net, d.mac.as_deref().map(parse_hex).unwrap_or_default()));
-    Ok(Target { sa, route })
+    Ok(Target { sa, route, max_apdu: d.max_apdu, segmentation: d.segmentation.clone() })
 }
 
 // ---------------------------------------------------------------------------
@@ -913,6 +1150,44 @@ fn subscribe_cov_core(
     }
 }
 
+/// Registers this client as a foreign device with `bbmd` for `ttl` seconds and
+/// waits for the BBMD's BVLC-Result. Unlike a confirmed APDU there's no invoke
+/// id, so the reply is correlated purely by source address via `fdr_waiters`.
+/// Retries on timeout like a confirmed request.
+fn register_foreign_device_core(client: &Client, bbmd: SocketAddr, ttl: u16) -> Result<(), String> {
+    let frame = codec::encode_register_foreign_device(ttl);
+    let (tx, rx) = mpsc::channel();
+    client
+        .fdr_waiters
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(bbmd, tx);
+    let result = (|| {
+        for _ in 0..APDU_ATTEMPTS {
+            client
+                .socket
+                .send_to(&frame, bbmd)
+                .map_err(|e| format!("register-foreign-device send failed: {e}"))?;
+            match rx.recv_timeout(APDU_TIMEOUT) {
+                Ok(0x0000) => return Ok(()),
+                Ok(code) => {
+                    return Err(format!(
+                        "BBMD {bbmd} refused registration (BVLC-Result 0x{code:04X})"
+                    ))
+                }
+                Err(_) => continue, // timeout — retry
+            }
+        }
+        Err(format!("no BVLC-Result from BBMD {bbmd} after {APDU_ATTEMPTS} attempts"))
+    })();
+    client
+        .fdr_waiters
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&bbmd);
+    result
+}
+
 // ---------------------------------------------------------------------------
 // Discovery
 // ---------------------------------------------------------------------------
@@ -943,13 +1218,19 @@ fn discover_core(
     let (tx, rx) = mpsc::channel();
     *client.discovery.lock().unwrap_or_else(|e| e.into_inner()) = Some(Discovery { tx, seen: HashSet::new() });
 
+    // When registered with a BBMD, a *broadcast* can't go out the local wire
+    // (we're on a different subnet); it must be distributed by the BBMD. Unicast
+    // probes still go direct — BBMDs bridge broadcast, not normal IP routing.
+    let bbmd = client.registered_bbmd();
+
     let result = (|| {
         let whois = codec::encode_who_is(low, high);
         let mut sent = 0usize;
         let mut last_err = String::new();
         for sa in &targets {
             let broadcast = is_broadcast_target(sa);
-            let bvlc_fn = if broadcast { codec::BVLC_ORIGINAL_BROADCAST } else { codec::BVLC_ORIGINAL_UNICAST };
+            // Global-broadcast NPDU (DNET 0xFFFF) on broadcasts so the Who-Is
+            // also reaches devices on networks behind routers.
             let npdu = if broadcast {
                 codec::encode_npdu(false, Some((codec::BROADCAST_NETWORK, &[])))
             } else {
@@ -957,9 +1238,16 @@ fn discover_core(
             };
             let mut payload = npdu;
             payload.extend_from_slice(&whois);
-            match client.socket.send_to(&codec::bvlc_encode(bvlc_fn, &payload), sa) {
+            // A registered BBMD distributes our broadcasts; the destination is the
+            // BBMD, not the (unreachable) remote broadcast address.
+            let (bvlc_fn, dest) = match (broadcast, bbmd) {
+                (true, Some(b)) => (codec::BVLC_DISTRIBUTE_BROADCAST, b),
+                (true, None) => (codec::BVLC_ORIGINAL_BROADCAST, *sa),
+                (false, _) => (codec::BVLC_ORIGINAL_UNICAST, *sa),
+            };
+            match client.socket.send_to(&codec::bvlc_encode(bvlc_fn, &payload), dest) {
                 Ok(_) => sent += 1,
-                Err(e) => last_err = format!("Who-Is to {sa} failed: {e}"),
+                Err(e) => last_err = format!("Who-Is to {dest} failed: {e}"),
             }
             // Also ask routers to identify themselves, so devices on networks
             // behind them (MS/TP trunks etc.) get swept too.
@@ -968,7 +1256,7 @@ fn discover_core(
                 &[],
                 if broadcast { Some((codec::BROADCAST_NETWORK, &[])) } else { None },
             );
-            let _ = client.socket.send_to(&codec::bvlc_encode(bvlc_fn, &wirtn), sa);
+            let _ = client.socket.send_to(&codec::bvlc_encode(bvlc_fn, &wirtn), dest);
         }
         if sent == 0 {
             return Err(last_err);
@@ -1007,13 +1295,18 @@ fn discover_core(
                 }
                 Ok(DiscoveryEvent::Routers { router, networks }) => {
                     // Sweep each newly-announced network with a remote-broadcast
-                    // Who-Is sent via its router.
+                    // Who-Is (DNET = that network). Direct to the router normally;
+                    // via the BBMD (which can reach the router) in foreign-device
+                    // mode, where the router's address may not be IP-reachable.
                     for net in networks {
                         if swept_networks.insert(net) {
                             let mut payload = codec::encode_npdu(false, Some((net, &[])));
                             payload.extend_from_slice(&whois);
-                            let frame = codec::bvlc_encode(codec::BVLC_ORIGINAL_UNICAST, &payload);
-                            let _ = client.socket.send_to(&frame, router);
+                            let (bvlc_fn, dest) = match bbmd {
+                                Some(b) => (codec::BVLC_DISTRIBUTE_BROADCAST, b),
+                                None => (codec::BVLC_ORIGINAL_UNICAST, router),
+                            };
+                            let _ = client.socket.send_to(&codec::bvlc_encode(bvlc_fn, &payload), dest);
                         }
                     }
                 }
@@ -1034,6 +1327,8 @@ fn enrich_device(client: &Client, dev: &mut BacnetDevice) {
         address: dev.address.clone(),
         network: dev.network,
         mac: dev.mac.clone(),
+        max_apdu: Some(dev.max_apdu),
+        segmentation: Some(dev.segmentation.clone()),
     }) else {
         return;
     };
@@ -1658,20 +1953,44 @@ const TREND_CHUNK: i32 = 20;
 /// Hard cap on records fetched in one trend read.
 const TREND_MAX: u32 = 2000;
 
-fn format_log_timestamp(rec: &codec::LogRecord) -> String {
-    let d = rec.date.as_ref().map(render_value).unwrap_or_default();
-    let t = rec.time.as_ref().map(render_value).unwrap_or_default();
+fn format_log_timestamp(date: &Option<BacnetValue>, time: &Option<BacnetValue>) -> String {
+    let d = date.as_ref().map(render_value).unwrap_or_default();
+    let t = time.as_ref().map(render_value).unwrap_or_default();
     format!("{d} {t}").trim().to_string()
 }
 
 fn to_trend_records(recs: &[codec::LogRecord]) -> Vec<TrendRecord> {
     recs.iter()
         .map(|r| TrendRecord {
-            timestamp: format_log_timestamp(r),
+            timestamp: format_log_timestamp(&r.date, &r.time),
             value: render_value(&r.datum),
             status: r.status.clone().unwrap_or_default(),
         })
         .collect()
+}
+
+/// Trend-log-multiple records carry several datums per timestamp (one per
+/// monitored property); join them so they read naturally in the single value
+/// column. A status-only record (log-disabled / buffer-purged) has no datums.
+fn to_trend_records_multiple(recs: &[codec::LogMultipleRecord]) -> Vec<TrendRecord> {
+    recs.iter()
+        .map(|r| TrendRecord {
+            timestamp: format_log_timestamp(&r.date, &r.time),
+            value: r.data.iter().map(render_value).collect::<Vec<_>>().join(" | "),
+            status: r.status.clone().unwrap_or_default(),
+        })
+        .collect()
+}
+
+/// Decodes one ReadRange itemData batch into trend rows, picking the record
+/// shape from the object type: trend-log-multiple (27) yields multi-datum
+/// records, every other type the single-datum form.
+fn decode_trend_batch(item_data: &[u8], multiple: bool) -> Vec<TrendRecord> {
+    if multiple {
+        to_trend_records_multiple(&codec::decode_log_multiple_records(item_data))
+    } else {
+        to_trend_records(&codec::decode_log_records(item_data))
+    }
 }
 
 /// Reads the most-recent records from a trend log's `log-buffer`, returned in
@@ -1689,6 +2008,7 @@ fn read_trend_core(
     max_records: u32,
 ) -> Result<TrendResult, String> {
     let want = max_records.clamp(1, TREND_MAX);
+    let multiple = object.object_type == codec::OBJECT_TYPE_TREND_LOG_MULTIPLE;
 
     // How many records exist? (best-effort — some devices omit record-count.)
     let total = match read_property(client, target, object, codec::PROP_RECORD_COUNT, None) {
@@ -1715,7 +2035,7 @@ fn read_trend_core(
             let remaining = want as usize - records.len();
             let chunk = remaining.min(TREND_CHUNK as usize) as i32;
             let ack = read_range_core(client, target, object, anchor, -chunk)?;
-            let mut batch = to_trend_records(&codec::decode_log_records(&ack.item_data));
+            let mut batch = decode_trend_batch(&ack.item_data, multiple);
             let got = batch.len() as u32;
             if got == 0 {
                 break;
@@ -1744,7 +2064,7 @@ fn read_trend_core(
                 break;
             }
             let ack = read_range_core(client, target, object, pos, TREND_CHUNK)?;
-            let batch = to_trend_records(&codec::decode_log_records(&ack.item_data));
+            let batch = decode_trend_batch(&ack.item_data, multiple);
             let got = batch.len() as u32;
             if got == 0 {
                 break;
@@ -1911,6 +2231,395 @@ pub async fn bacnet_unsubscribe_cov(
     .map_err(|e| format!("unsubscribe task panicked: {e}"))?
 }
 
+// ---------------------------------------------------------------------------
+// Foreign-device registration (BBMD)
+// ---------------------------------------------------------------------------
+
+/// Default foreign-device lifetime. The BBMD keeps us in its table for this long
+/// plus a 30 s grace period; the keep-alive re-registers at half this interval.
+const FDR_DEFAULT_TTL: u16 = 60;
+
+/// Floor on the registration lifetime — a tiny TTL would re-register constantly.
+const FDR_MIN_TTL: u16 = 10;
+
+/// Consecutive re-registration failures before the keep-alive gives up (the BBMD
+/// is gone or unreachable) and drops the registration.
+const FDR_MAX_FAILURES: u32 = 3;
+
+/// The current foreign-device registration, surfaced to the frontend.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ForeignDeviceStatus {
+    bbmd: String,
+    ttl_seconds: u16,
+}
+
+/// Registers this client as a foreign device with a BBMD so broadcast discovery
+/// (Who-Is) reaches devices on other IP subnets. A background thread keeps the
+/// registration alive until [`bacnet_unregister_foreign_device`] is called (or
+/// the BBMD becomes unreachable). Registering again replaces any prior BBMD.
+#[tauri::command]
+pub async fn bacnet_register_foreign_device(
+    bbmd: String,
+    ttl_seconds: Option<u16>,
+) -> Result<ForeignDeviceStatus, String> {
+    let client = client()?;
+    let addr = parse_target(&bbmd)?;
+    let ttl = ttl_seconds.unwrap_or(FDR_DEFAULT_TTL).max(FDR_MIN_TTL);
+
+    tauri::async_runtime::spawn_blocking(move || {
+        register_foreign_device_core(&client, addr, ttl)?;
+
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        // Replace any previous registration, stopping its keep-alive first.
+        {
+            let mut guard = client.bbmd.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(prev) = guard.take() {
+                prev.active.store(false, Ordering::Relaxed);
+            }
+            *guard = Some(BbmdRegistration { addr, ttl, active: Arc::clone(&active) });
+        }
+
+        // Keep-alive: re-register at half the TTL, well before expiry.
+        let refresh_secs = (ttl as u64 / 2).max(5);
+        let client_bg = Arc::clone(&client);
+        thread::spawn(move || {
+            let mut failures = 0u32;
+            while active.load(Ordering::Relaxed) {
+                // Sleep in short slices so unregister takes effect promptly.
+                for _ in 0..(refresh_secs * 2) {
+                    if !active.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(Duration::from_millis(500));
+                }
+                if !active.load(Ordering::Relaxed) {
+                    return;
+                }
+                match register_foreign_device_core(&client_bg, addr, ttl) {
+                    Ok(()) => failures = 0,
+                    Err(_) => {
+                        failures += 1;
+                        if failures >= FDR_MAX_FAILURES {
+                            active.store(false, Ordering::Relaxed);
+                            // Drop the registration only if it's still ours (a
+                            // newer register call may have replaced it).
+                            let mut g = client_bg.bbmd.lock().unwrap_or_else(|e| e.into_inner());
+                            if g.as_ref().map(|b| Arc::ptr_eq(&b.active, &active)).unwrap_or(false) {
+                                *g = None;
+                            }
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        Ok(ForeignDeviceStatus { bbmd: addr.to_string(), ttl_seconds: ttl })
+    })
+    .await
+    .map_err(|e| format!("register-foreign-device task panicked: {e}"))?
+}
+
+/// Stops the foreign-device registration. We simply stop re-registering and let
+/// the BBMD drop us at TTL expiry (there's no de-register BVLC; sending one and
+/// waiting would needlessly block on a device that's about to forget us anyway).
+#[tauri::command]
+pub async fn bacnet_unregister_foreign_device() -> Result<(), String> {
+    let client = client()?;
+    if let Some(reg) = client.bbmd.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        reg.active.store(false, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Reports the active foreign-device registration, or `None` if not registered.
+#[tauri::command]
+pub fn bacnet_foreign_device_status() -> Result<Option<ForeignDeviceStatus>, String> {
+    let client = client()?;
+    let guard = client.bbmd.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(guard.as_ref().map(|b| ForeignDeviceStatus {
+        bbmd: b.addr.to_string(),
+        ttl_seconds: b.ttl,
+    }))
+}
+
+// ---------------------------------------------------------------------------
+// Alarms & events
+// ---------------------------------------------------------------------------
+
+/// One active/unacknowledged alarm, flattened for the frontend. Sourced from
+/// GetEventInformation (preferred) or the older GetAlarmSummary fallback.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AlarmEntry {
+    object_type: u16,
+    instance: u32,
+    type_name: String,
+    name: String,
+    event_state: String,
+    notify_type: String,
+    /// Whether the transition matching the current event-state is acknowledged.
+    acknowledged: bool,
+    /// Human list of acknowledged transitions, e.g. "to-offnormal, to-normal".
+    ack_transitions: String,
+    priority: Option<u32>,
+    timestamp: String,
+    /// Which service this came from: "event-information" or "alarm-summary".
+    source: String,
+}
+
+/// Maps an event-state to the transition index (0 to-offnormal, 1 to-fault,
+/// 2 to-normal) whose timestamp/priority/ack-bit is the relevant one to show.
+fn transition_index(event_state: u32) -> usize {
+    match event_state {
+        0 => 2, // normal -> to-normal
+        1 => 1, // fault -> to-fault
+        _ => 0, // offnormal / high-limit / low-limit / life-safety -> to-offnormal
+    }
+}
+
+fn bit_is_set(bits: &str, idx: usize) -> bool {
+    bits.chars().nth(idx) == Some('1')
+}
+
+fn render_ack_transitions(bits: &str) -> String {
+    const NAMES: [&str; 3] = ["to-offnormal", "to-fault", "to-normal"];
+    let acked: Vec<&str> = NAMES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| bit_is_set(bits, *i))
+        .map(|(_, n)| *n)
+        .collect();
+    if acked.is_empty() { "none".into() } else { acked.join(", ") }
+}
+
+fn render_timestamp(ts: &codec::BacnetTimeStamp) -> String {
+    match ts {
+        codec::BacnetTimeStamp::Time(v) => render_value(v),
+        codec::BacnetTimeStamp::Sequence(n) => format!("#{n}"),
+        codec::BacnetTimeStamp::DateTime { date, time } => format_log_timestamp(date, time),
+    }
+}
+
+fn event_summary_to_entry(s: &codec::EventSummary) -> AlarmEntry {
+    let idx = transition_index(s.event_state);
+    AlarmEntry {
+        object_type: s.object.object_type,
+        instance: s.object.instance,
+        type_name: codec::object_type_name(s.object.object_type),
+        name: String::new(),
+        event_state: codec::event_state_name(s.event_state),
+        notify_type: codec::notify_type_name(s.notify_type),
+        acknowledged: bit_is_set(&s.acknowledged_transitions, idx),
+        ack_transitions: render_ack_transitions(&s.acknowledged_transitions),
+        priority: s.event_priorities.get(idx).copied(),
+        timestamp: s.event_timestamps.get(idx).map(render_timestamp).unwrap_or_default(),
+        source: "event-information".into(),
+    }
+}
+
+fn alarm_summary_to_entry(e: &codec::AlarmSummaryEntry) -> AlarmEntry {
+    let idx = transition_index(e.alarm_state);
+    AlarmEntry {
+        object_type: e.object.object_type,
+        instance: e.object.instance,
+        type_name: codec::object_type_name(e.object.object_type),
+        name: String::new(),
+        event_state: codec::event_state_name(e.alarm_state),
+        notify_type: String::new(),
+        acknowledged: bit_is_set(&e.acknowledged_transitions, idx),
+        ack_transitions: render_ack_transitions(&e.acknowledged_transitions),
+        priority: None,
+        timestamp: String::new(),
+        source: "alarm-summary".into(),
+    }
+}
+
+/// Hard cap on alarms pulled in one GetEventInformation paging loop.
+const MAX_ALARMS: usize = 2000;
+
+/// Pages through GetEventInformation, resuming with `lastReceivedObjectIdentifier`
+/// while the device reports `moreEvents`.
+fn get_event_information_core(client: &Client, target: &Target) -> Result<Vec<codec::EventSummary>, String> {
+    let mut all: Vec<codec::EventSummary> = Vec::new();
+    let mut last: Option<ObjectId> = None;
+    loop {
+        let invoke = client.alloc_invoke();
+        let apdu = codec::encode_get_event_information(invoke, last);
+        let res = match client.request(target, &apdu, invoke)? {
+            Outcome::Complex { service: codec::SERVICE_GET_EVENT_INFORMATION, payload } => {
+                codec::decode_get_event_information_ack(&payload)?
+            }
+            Outcome::Complex { service, .. } => return Err(format!("unexpected ack for service {service}")),
+            Outcome::Simple => return Err("unexpected simple ack for GetEventInformation".into()),
+            Outcome::Failed(e) => return Err(e),
+        };
+        let more = res.more_events;
+        last = res.summaries.last().map(|s| s.object);
+        all.extend(res.summaries);
+        if !more || last.is_none() || all.len() >= MAX_ALARMS {
+            break;
+        }
+    }
+    Ok(all)
+}
+
+fn get_alarm_summary_core(client: &Client, target: &Target) -> Result<Vec<codec::AlarmSummaryEntry>, String> {
+    let invoke = client.alloc_invoke();
+    let apdu = codec::encode_get_alarm_summary(invoke);
+    match client.request(target, &apdu, invoke)? {
+        Outcome::Complex { service: codec::SERVICE_GET_ALARM_SUMMARY, payload } => {
+            Ok(codec::decode_get_alarm_summary_ack(&payload))
+        }
+        Outcome::Complex { service, .. } => Err(format!("unexpected ack for service {service}")),
+        Outcome::Simple => Ok(Vec::new()),
+        Outcome::Failed(e) => Err(e),
+    }
+}
+
+/// Lists a device's active/unacknowledged alarms: GetEventInformation first
+/// (richer — timestamps, priorities, notify-type), falling back to the older
+/// GetAlarmSummary when a device doesn't support it. Resolves object names
+/// best-effort so the list is human-readable.
+fn get_alarms_core(client: &Client, target: &Target) -> Result<Vec<AlarmEntry>, String> {
+    let mut entries: Vec<AlarmEntry> = match get_event_information_core(client, target) {
+        Ok(summaries) => summaries.iter().map(event_summary_to_entry).collect(),
+        Err(ev_err) => match get_alarm_summary_core(client, target) {
+            Ok(list) => list.iter().map(alarm_summary_to_entry).collect(),
+            Err(as_err) => {
+                return Err(format!(
+                    "GetEventInformation failed ({ev_err}); GetAlarmSummary fallback failed ({as_err})"
+                ))
+            }
+        },
+    };
+
+    // Resolve object names so the alarm list reads in field terms, not numbers.
+    let ids: Vec<ObjectId> = entries
+        .iter()
+        .map(|e| ObjectId::new(e.object_type, e.instance))
+        .collect();
+    if !ids.is_empty() {
+        let mut names: HashMap<(u16, u32), String> = HashMap::new();
+        enrich_object_names_core(client, target, &ids, || true, |batch| {
+            for (id, name) in batch {
+                names.insert((id.object_type, id.instance), name.clone());
+            }
+        });
+        for e in &mut entries {
+            if let Some(n) = names.get(&(e.object_type, e.instance)) {
+                e.name = n.clone();
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// Lists active and unacknowledged alarms on a device.
+#[tauri::command]
+pub async fn bacnet_get_alarms(device: DeviceRef) -> Result<Vec<AlarmEntry>, String> {
+    let client = client()?;
+    let target = resolve_device(&device)?;
+    tauri::async_runtime::spawn_blocking(move || get_alarms_core(&client, &target))
+        .await
+        .map_err(|e| format!("get-alarms task panicked: {e}"))?
+}
+
+/// What we report as the acknowledgment source in the device's event log.
+const ACK_SOURCE: &str = "S-Tier Utilities";
+
+/// Process id we present when acknowledging. It's only echoed back in the
+/// resulting ack-notification; it doesn't track any subscription.
+const ACK_PROCESS_ID: u32 = 1;
+
+/// Current local date+time as a BACnetTimeStamp (dateTime form), for the
+/// timeOfAcknowledgment field. Uses the OS clock on Windows; elsewhere (headless
+/// tests) a wildcard time, which devices accept for time-of-acknowledgment.
+fn local_datetime() -> codec::BacnetTimeStamp {
+    #[cfg(windows)]
+    {
+        use windows::Win32::System::SystemInformation::GetLocalTime;
+        // SAFETY: GetLocalTime reads the system clock and returns a SYSTEMTIME.
+        let st = unsafe { GetLocalTime() };
+        // BACnet weekday is 1=Mon..7=Sun; SYSTEMTIME wDayOfWeek is 0=Sun..6=Sat.
+        let weekday = if st.wDayOfWeek == 0 { 7 } else { st.wDayOfWeek as u8 };
+        codec::BacnetTimeStamp::DateTime {
+            date: Some(BacnetValue::Date {
+                year: st.wYear,
+                month: st.wMonth as u8,
+                day: st.wDay as u8,
+                weekday,
+            }),
+            time: Some(BacnetValue::Time {
+                hour: st.wHour as u8,
+                minute: st.wMinute as u8,
+                second: st.wSecond as u8,
+                hundredths: (st.wMilliseconds / 10) as u8,
+            }),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        codec::BacnetTimeStamp::DateTime { date: None, time: None }
+    }
+}
+
+/// Acknowledges the active/unacknowledged alarm on `object`. Re-reads the device's
+/// event summaries first so we echo the exact transition timestamp the device
+/// expects (and confirm the alarm is still present) — then sends AcknowledgeAlarm.
+fn acknowledge_alarm_core(client: &Client, target: &Target, object: ObjectId) -> Result<(), String> {
+    let summaries = get_event_information_core(client, target).map_err(|e| {
+        format!(
+            "could not read events to acknowledge ({e}); the device may only support \
+             GetAlarmSummary, which carries no timestamp to match"
+        )
+    })?;
+    let summary = summaries
+        .into_iter()
+        .find(|s| s.object == object)
+        .ok_or("alarm is no longer active or unacknowledged on the device")?;
+    let idx = transition_index(summary.event_state);
+    let event_timestamp = summary
+        .event_timestamps
+        .get(idx)
+        .ok_or("device did not report a timestamp for this transition")?
+        .clone();
+
+    let invoke = client.alloc_invoke();
+    let apdu = codec::encode_acknowledge_alarm(
+        invoke,
+        ACK_PROCESS_ID,
+        object,
+        summary.event_state,
+        &event_timestamp,
+        ACK_SOURCE,
+        &local_datetime(),
+    );
+    match client.request(target, &apdu, invoke)? {
+        Outcome::Simple => Ok(()),
+        Outcome::Complex { .. } => Err("unexpected complex ack for AcknowledgeAlarm".into()),
+        Outcome::Failed(e) => Err(e),
+    }
+}
+
+/// Acknowledges an alarm on a device's event-initiating object. This is a write:
+/// the frontend confirms with the operator and logs it to the activity audit
+/// trail before calling.
+#[tauri::command]
+pub async fn bacnet_acknowledge_alarm(
+    device: DeviceRef,
+    object_type: u16,
+    instance: u32,
+) -> Result<(), String> {
+    let client = client()?;
+    let target = resolve_device(&device)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        acknowledge_alarm_core(&client, &target, ObjectId::new(object_type, instance))
+    })
+    .await
+    .map_err(|e| format!("acknowledge task panicked: {e}"))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1960,6 +2669,8 @@ mod tests {
             address: "10.1.2.3".into(),
             network: Some(2001),
             mac: Some("0C".into()),
+            max_apdu: None,
+            segmentation: None,
         })
         .unwrap();
         assert_eq!(t.sa, "10.1.2.3:47808".parse().unwrap());
@@ -2203,7 +2914,7 @@ mod tests {
         });
 
         let client = Client::new("127.0.0.1:0").unwrap();
-        let target = Target { sa: fake_addr, route: None };
+        let target = Target { sa: fake_addr, route: None, max_apdu: None, segmentation: None };
         let values =
             read_property(&client, &target, ObjectId::new(0, 1), codec::PROP_PRESENT_VALUE, None)
                 .unwrap();
@@ -2262,7 +2973,7 @@ mod tests {
         });
 
         let client = Client::new("127.0.0.1:0").unwrap();
-        let target = Target { sa: fake_addr, route: None };
+        let target = Target { sa: fake_addr, route: None, max_apdu: None, segmentation: None };
         let values =
             read_property(&client, &target, ObjectId::new(0, 1), codec::PROP_PRESENT_VALUE, None)
                 .unwrap();
@@ -2335,7 +3046,7 @@ mod tests {
         });
 
         let client = Client::new("127.0.0.1:0").unwrap();
-        let target = Target { sa: fake_addr, route: None };
+        let target = Target { sa: fake_addr, route: None, max_apdu: None, segmentation: None };
         let err =
             read_property(&client, &target, ObjectId::new(0, 1), codec::PROP_PRESENT_VALUE, None)
                 .unwrap_err();
@@ -2387,7 +3098,7 @@ mod tests {
         });
 
         let client = Client::new("127.0.0.1:0").unwrap();
-        let target = Target { sa: fake_addr, route: None };
+        let target = Target { sa: fake_addr, route: None, max_apdu: None, segmentation: None };
         write_property_core(
             &client,
             &target,
@@ -2423,7 +3134,7 @@ mod tests {
         });
 
         let client = Client::new("127.0.0.1:0").unwrap();
-        let target = Target { sa: fake_addr, route: None };
+        let target = Target { sa: fake_addr, route: None, max_apdu: None, segmentation: None };
         subscribe_cov_core(&client, &target, 7, ObjectId::new(0, 0), false, Some(60)).unwrap();
         t.join().unwrap();
     }
@@ -2495,7 +3206,7 @@ mod tests {
         });
 
         let client = Client::new("127.0.0.1:0").unwrap();
-        let target = Target { sa: fake_addr, route: None };
+        let target = Target { sa: fake_addr, route: None, max_apdu: None, segmentation: None };
         let result = read_trend_core(&client, &target, ObjectId::new(20, 1), 200).unwrap();
         t.join().unwrap();
         assert_eq!(result.record_count, 2);
@@ -2640,7 +3351,7 @@ mod tests {
         });
 
         let client = Client::new("127.0.0.1:0").unwrap();
-        let target = Target { sa: fake_addr, route: None };
+        let target = Target { sa: fake_addr, route: None, max_apdu: None, segmentation: None };
         let err = read_property(&client, &target, ObjectId::new(0, 99), 85, None).unwrap_err();
         t.join().unwrap();
         assert!(err.contains("unknown-object"), "unexpected error text: {err}");
@@ -2699,6 +3410,8 @@ mod tests {
             address: dev.address.clone(),
             network: dev.network,
             mac: dev.mac.clone(),
+            max_apdu: Some(dev.max_apdu),
+            segmentation: Some(dev.segmentation.clone()),
         }) {
             Ok(t) => t,
             Err(e) => {
@@ -2887,6 +3600,96 @@ mod tests {
         assert_eq!(instances, vec![11, 22]);
     }
 
+    #[test]
+    fn foreign_device_registration_and_distributed_discovery() {
+        use std::sync::atomic::AtomicBool;
+
+        // A fake BBMD: acks our Register-Foreign-Device, then answers the
+        // Distribute-Broadcast Who-Is with a Forwarded-NPDU I-Am (as a real BBMD
+        // would when relaying a reply from a device on its own subnet).
+        let bbmd = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bbmd_addr = bbmd.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            // 1. Register-Foreign-Device -> BVLC-Result success.
+            let (frame, src) = recv_frame(&bbmd);
+            let bvlc = codec::bvlc_decode(&frame).unwrap();
+            assert_eq!(bvlc.function, codec::BVLC_REGISTER_FOREIGN_DEVICE);
+            assert_eq!(&frame[4..6], 60u16.to_be_bytes(), "TTL should be carried in the payload");
+            bbmd.send_to(&[0x81, codec::BVLC_RESULT, 0x00, 0x06, 0x00, 0x00], src).unwrap();
+
+            // 2. First Distribute-Broadcast (the Who-Is) -> Forwarded-NPDU I-Am.
+            loop {
+                let (frame, src) = recv_frame(&bbmd);
+                let bvlc = codec::bvlc_decode(&frame).unwrap();
+                if bvlc.function != codec::BVLC_DISTRIBUTE_BROADCAST {
+                    continue; // the companion Who-Is-Router-To-Network frame
+                }
+                let mut apdu = vec![codec::PDU_UNCONFIRMED, codec::SERVICE_I_AM];
+                codec::encode_application_value(
+                    &mut apdu,
+                    &BacnetValue::ObjectIdentifier { object_type: 8, instance: 4242 },
+                );
+                codec::encode_application_value(&mut apdu, &BacnetValue::Unsigned { value: 1476 });
+                codec::encode_application_value(&mut apdu, &BacnetValue::Enumerated { value: 3 });
+                codec::encode_application_value(&mut apdu, &BacnetValue::Unsigned { value: 99 });
+                let mut npdu = codec::encode_npdu(false, None);
+                npdu.extend_from_slice(&apdu);
+                // Forwarded-NPDU origin = the real device's B/IP address 10.20.30.40:47808.
+                let mut payload = vec![10, 20, 30, 40, 0xBA, 0xC0];
+                payload.extend_from_slice(&npdu);
+                bbmd.send_to(&codec::bvlc_encode(codec::BVLC_FORWARDED_NPDU, &payload), src)
+                    .unwrap();
+                break;
+            }
+        });
+
+        let client = Client::new("127.0.0.1:0").unwrap();
+        register_foreign_device_core(&client, bbmd_addr, 60).expect("registration should succeed");
+        // The command stores this; set it directly for the core-level test.
+        *client.bbmd.lock().unwrap() = Some(BbmdRegistration {
+            addr: bbmd_addr,
+            ttl: 60,
+            active: Arc::new(AtomicBool::new(true)),
+        });
+        assert_eq!(client.registered_bbmd(), Some(bbmd_addr));
+
+        // A broadcast Who-Is now goes to the BBMD (not the local wire).
+        let devices = discover_core(
+            &client,
+            "255.255.255.255",
+            None,
+            None,
+            Duration::from_millis(900),
+            |_| {},
+        )
+        .unwrap();
+        t.join().unwrap();
+
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].instance, 4242);
+        assert_eq!(devices[0].address, "10.20.30.40:47808");
+        assert_eq!(devices[0].network, None);
+    }
+
+    #[test]
+    fn bvlc_result_routes_only_to_matching_waiter() {
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let bbmd: SocketAddr = "192.0.2.10:47808".parse().unwrap();
+        let other: SocketAddr = "192.0.2.99:47808".parse().unwrap();
+        let (tx, rx) = mpsc::channel();
+        client.fdr_waiters.lock().unwrap().insert(bbmd, tx);
+
+        // A result from an unrelated source must not fire (or remove) the waiter.
+        client.note_bvlc_result(other, 0x0000);
+        assert!(rx.try_recv().is_err());
+        assert!(client.fdr_waiters.lock().unwrap().contains_key(&bbmd));
+
+        // The matching source delivers the code and clears the waiter.
+        client.note_bvlc_result(bbmd, 0x0030);
+        assert_eq!(rx.try_recv().unwrap(), 0x0030);
+        assert!(client.fdr_waiters.lock().unwrap().is_empty());
+    }
+
     /// Deep read of one big routed device: full object-list walk (exercises
     /// the indexed fallback for real), streamed name enrichment with adaptive
     /// RPM chunks, and full property reads on a spread of objects. Defaults to
@@ -2908,6 +3711,8 @@ mod tests {
             address: addr.clone(),
             network: Some(net),
             mac: Some(mac.clone()),
+            max_apdu: None,
+            segmentation: None,
         })
         .unwrap();
         println!("== deep read: device {instance} via {addr} net {net} mac {mac} ==");
@@ -2980,6 +3785,8 @@ mod tests {
                 address: dev.address.clone(),
                 network: dev.network,
                 mac: dev.mac.clone(),
+                max_apdu: Some(dev.max_apdu),
+                segmentation: Some(dev.segmentation.clone()),
             }) else { continue };
             let Ok(objects) = read_object_ids_core(&client, &t, dev.instance, |_, _| {}) else { continue };
             if let Some(o) = objects.iter().find(|o| matches!(o.object_type, 0 | 2)) {
@@ -2992,6 +3799,8 @@ mod tests {
             address: dev.address.clone(),
             network: dev.network,
             mac: dev.mac.clone(),
+            max_apdu: Some(dev.max_apdu),
+            segmentation: Some(dev.segmentation.clone()),
         })
         .unwrap();
         println!(
@@ -3042,32 +3851,96 @@ mod tests {
         let target = std::env::var("BACNET_TARGET").unwrap_or_else(|_| "192.168.1.255".into());
         let client = Client::new("0.0.0.0:0").unwrap();
         let devices = discover_core(&client, &target, None, None, Duration::from_secs(5), |_| {}).unwrap();
-        println!("scanning {} devices for a trend-log…", devices.len());
+        println!("scanning {} devices for trend-log / trend-log-multiple…", devices.len());
 
-        // Check up to 40 devices for a trend-log (type 20) object.
+        // Read one trend-log (type 20) and one trend-log-multiple (type 27) so
+        // both the single- and multiple-record decoders get exercised on real
+        // gear. Scan up to 40 devices.
+        let mut read_single = false;
+        let mut read_multiple = false;
         for dev in devices.iter().take(40) {
+            if read_single && read_multiple {
+                break;
+            }
             let Ok(t) = resolve_device(&DeviceRef {
                 address: dev.address.clone(),
                 network: dev.network,
                 mac: dev.mac.clone(),
+                max_apdu: Some(dev.max_apdu),
+                segmentation: Some(dev.segmentation.clone()),
             }) else { continue };
             let Ok(objects) = read_object_ids_core(&client, &t, dev.instance, |_, _| {}) else { continue };
-            let Some(tl) = objects.iter().find(|o| o.object_type == 20) else { continue };
-            let object = ObjectId::new(tl.object_type, tl.instance);
-            println!("found trend-log {}:{} on device {} ({})", tl.object_type, tl.instance, dev.instance, dev.address);
-            match read_trend_core(&client, &t, object, 20) {
-                Ok(res) => {
-                    println!("  record-count {}, read {} records:", res.record_count, res.records.len());
-                    for r in res.records.iter().take(10) {
-                        println!("    {} = {} [{}]", r.timestamp, r.value, r.status);
-                    }
-                    assert!(res.record_count > 0 || !res.records.is_empty(), "trend log returned nothing");
-                    return;
+            for tl in objects.iter().filter(|o| matches!(o.object_type, 20 | 27)) {
+                let done = if tl.object_type == 27 { read_multiple } else { read_single };
+                if done {
+                    continue;
                 }
-                Err(e) => println!("  read failed: {e}"),
+                let object = ObjectId::new(tl.object_type, tl.instance);
+                println!(
+                    "found {} {}:{} on device {} ({})",
+                    codec::object_type_name(tl.object_type), tl.object_type, tl.instance, dev.instance, dev.address,
+                );
+                match read_trend_core(&client, &t, object, 20) {
+                    Ok(res) => {
+                        println!("  record-count {}, read {} records:", res.record_count, res.records.len());
+                        for r in res.records.iter().take(10) {
+                            println!("    {} = {} [{}]", r.timestamp, r.value, r.status);
+                        }
+                        assert!(res.record_count > 0 || !res.records.is_empty(), "trend log returned nothing");
+                        if tl.object_type == 27 { read_multiple = true } else { read_single = true }
+                    }
+                    Err(e) => println!("  read failed: {e}"),
+                }
             }
         }
-        println!("no readable trend-log object found in the first 40 devices (not a failure).");
+        if !read_single && !read_multiple {
+            println!("no readable trend-log/-multiple object found in the first 40 devices (not a failure).");
+        } else {
+            println!("validated: trend-log={read_single}, trend-log-multiple={read_multiple}");
+        }
+    }
+
+    /// Live alarm scan (read-only): discover, then ask up to 25 devices for their
+    /// active/unacknowledged alarms via GetEventInformation (GetAlarmSummary
+    /// fallback). Prints what's in alarm. Changes nothing on any device.
+    ///
+    ///   cargo test live_get_alarms -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_get_alarms() {
+        let target = std::env::var("BACNET_TARGET").unwrap_or_else(|_| "192.168.1.255".into());
+        let client = Client::new("0.0.0.0:0").unwrap();
+        let devices = discover_core(&client, &target, None, None, Duration::from_secs(5), |_| {}).unwrap();
+        println!("scanning up to 25 of {} devices for alarms…", devices.len());
+
+        let mut total = 0usize;
+        let mut with_alarms = 0usize;
+        let mut supported = 0usize;
+        for dev in devices.iter().take(25) {
+            let Ok(t) = resolve_device(&DeviceRef {
+                address: dev.address.clone(),
+                network: dev.network,
+                mac: dev.mac.clone(),
+                max_apdu: Some(dev.max_apdu),
+                segmentation: Some(dev.segmentation.clone()),
+            }) else { continue };
+            // Err = device doesn't support the alarm services — skip quietly.
+            if let Ok(alarms) = get_alarms_core(&client, &t) {
+                supported += 1;
+                if !alarms.is_empty() {
+                    with_alarms += 1;
+                    total += alarms.len();
+                    println!("device {} ({}): {} alarm(s) [{}]", dev.instance, dev.address, alarms.len(), alarms[0].source);
+                    for a in alarms.iter().take(8) {
+                        println!(
+                            "    {}:{} {} state={} ack={} prio={:?} since={}",
+                            a.object_type, a.instance, a.name, a.event_state, a.acknowledged, a.priority, a.timestamp,
+                        );
+                    }
+                }
+            }
+        }
+        println!("== {total} alarm record(s) across {with_alarms} device(s); {supported}/25 answered an alarm service ==");
     }
 
     #[test]
@@ -3243,7 +4116,7 @@ mod tests {
         });
 
         let client = Client::new("127.0.0.1:0").unwrap();
-        let target = Target { sa: fake_addr, route: Some((2001, vec![0x0C])) };
+        let target = Target { sa: fake_addr, route: Some((2001, vec![0x0C])), max_apdu: None, segmentation: None };
         write_property_core(
             &client,
             &target,
@@ -3255,5 +4128,184 @@ mod tests {
         )
         .unwrap();
         t.join().unwrap();
+    }
+
+    #[test]
+    fn large_write_is_segmented() {
+        // A fake device with a tiny (50-byte) APDU. Writing a long string forces
+        // the client to segment the request; the fake acks each segment, then
+        // replies once it has the whole thing.
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            let mut body = Vec::new();
+            let mut segments = 0usize;
+            loop {
+                let (frame, src) = recv_frame(&fake);
+                let bvlc = codec::bvlc_decode(&frame).unwrap();
+                let npdu = codec::decode_npdu(&frame[bvlc.payload_offset..]).unwrap();
+                let apdu = &frame[bvlc.payload_offset + npdu.apdu_offset..];
+                assert_eq!(apdu[0] & 0xF0, codec::PDU_CONFIRMED);
+                assert!(apdu[0] & 0x08 != 0, "request must be segmented");
+                let invoke = apdu[2];
+                let seq = apdu[3];
+                let more = apdu[0] & 0x04 != 0;
+                body.extend_from_slice(&apdu[5..]); // service-choice + data chunk
+                segments += 1;
+
+                // Acknowledge this segment (we're the request receiver → SRV set).
+                let ack = codec::encode_segment_ack(false, true, invoke, seq, 1);
+                let mut p = codec::encode_npdu(false, None);
+                p.extend_from_slice(&ack);
+                fake.send_to(&codec::bvlc_encode(codec::BVLC_ORIGINAL_UNICAST, &p), src).unwrap();
+
+                if !more {
+                    // Whole request received — reply with a WriteProperty SimpleACK.
+                    let reply = vec![codec::PDU_SIMPLE_ACK, invoke, codec::SERVICE_WRITE_PROPERTY];
+                    let mut p = codec::encode_npdu(false, None);
+                    p.extend_from_slice(&reply);
+                    fake.send_to(&codec::bvlc_encode(codec::BVLC_ORIGINAL_UNICAST, &p), src).unwrap();
+                    break;
+                }
+            }
+            (segments, body)
+        });
+
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let target = Target { sa: fake_addr, route: None, max_apdu: Some(50), segmentation: None };
+        let big = BacnetValue::CharacterString { value: "x".repeat(300) };
+        write_property_core(
+            &client,
+            &target,
+            ObjectId::new(2, 7),
+            codec::PROP_PRESENT_VALUE,
+            None,
+            &[big],
+            None,
+        )
+        .unwrap();
+
+        let (segments, body) = t.join().unwrap();
+        assert!(segments >= 2, "expected the write to span multiple segments, got {segments}");
+        // The reassembled body is the original service-choice + request data.
+        assert_eq!(body[0], codec::SERVICE_WRITE_PROPERTY);
+        let reassembled = codec::decode_apdu(
+            &[&[codec::PDU_CONFIRMED, codec::MAX_SEGS_MAX_APDU, 0u8], body.as_slice()].concat(),
+        )
+        .unwrap();
+        assert!(matches!(
+            reassembled,
+            Apdu::ConfirmedRequest { service, .. } if service == codec::SERVICE_WRITE_PROPERTY
+        ));
+    }
+
+    #[test]
+    fn large_write_to_non_segmenting_device_is_rejected_up_front() {
+        // A device that doesn't accept segmented requests: a too-large write must
+        // fail immediately with a clear error and send nothing over the wire.
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        fake.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let target = Target {
+            sa: fake_addr,
+            route: None,
+            max_apdu: Some(50),
+            segmentation: Some("none".into()),
+        };
+        let err = write_property_core(
+            &client,
+            &target,
+            ObjectId::new(2, 7),
+            codec::PROP_PRESENT_VALUE,
+            None,
+            &[BacnetValue::CharacterString { value: "x".repeat(300) }],
+            None,
+        )
+        .unwrap_err();
+        assert!(err.contains("does not accept segmented requests"), "unexpected error: {err}");
+
+        // Nothing should have been transmitted (the gate returns before sending).
+        let mut buf = [0u8; 64];
+        assert!(fake.recv_from(&mut buf).is_err(), "no frame should have been sent");
+    }
+
+    /// Low-traffic live recon (read-only): one Who-Is, then a Read-BDT probe of
+    /// each local device to find which are BBMDs (the relays usable for foreign-
+    /// device registration). Prints candidates — no per-device property reads.
+    ///
+    ///   cargo test live_find_bbmd -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_find_bbmd() {
+        let target = std::env::var("BACNET_TARGET").unwrap_or_else(|_| "255.255.255.255".into());
+        let client = Client::new("0.0.0.0:0").unwrap();
+        let devices = discover_core(&client, &target, None, None, Duration::from_secs(5), |_| {}).unwrap();
+        println!("== discovered {} device(s) via {target} ==", devices.len());
+
+        let mut local: Vec<String> = devices
+            .iter()
+            .filter(|d| d.network.is_none())
+            .map(|d| d.address.clone())
+            .collect();
+        local.sort();
+        local.dedup();
+        println!("== probing {} local device(s) for a BBMD (Read-BDT) ==", local.len());
+        let mut bbmds = Vec::new();
+        for addr in local {
+            // Err = not a BBMD (or didn't answer Read-BDT) — skip quietly.
+            if let Ok(entries) = probe_bdt(&addr) {
+                println!("  BBMD: {addr} ({} BDT entries)", entries.len());
+                for e in entries.iter().take(8) {
+                    println!("      {e}");
+                }
+                bbmds.push(addr);
+            }
+        }
+        println!("== {} BBMD(s) found: {bbmds:?} ==", bbmds.len());
+        println!("   To exercise foreign-device discovery against one:");
+        println!("   $env:BACNET_BBMD=\"<ip>\"; cargo test live_foreign_device_discovery -- --ignored --nocapture");
+    }
+
+    /// Live foreign-device discovery (read-only): register with a real BBMD on
+    /// another subnet, then run a distributed Who-Is and list what answers.
+    /// Compares it against a plain local broadcast to show the BBMD's reach.
+    ///
+    ///   $env:BACNET_BBMD="10.0.5.1"; cargo test live_foreign_device_discovery -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn live_foreign_device_discovery() {
+        let bbmd_str = std::env::var("BACNET_BBMD")
+            .expect("set BACNET_BBMD to the BBMD's IP (the cross-subnet broadcast relay)");
+        let ttl: u16 = std::env::var("BACNET_BBMD_TTL").ok().and_then(|s| s.parse().ok()).unwrap_or(60);
+        let bbmd = parse_target(&bbmd_str).unwrap();
+        let client = Client::new("0.0.0.0:0").unwrap();
+
+        // Baseline: a plain local broadcast (what we'd see WITHOUT the BBMD).
+        let local = discover_core(&client, "255.255.255.255", None, None, Duration::from_secs(5), |_| {})
+            .unwrap();
+        println!("== local broadcast: {} device(s) ==", local.len());
+
+        println!("== registering as foreign device with BBMD {bbmd} (ttl {ttl}s) ==");
+        register_foreign_device_core(&client, bbmd, ttl).expect("BBMD registration failed");
+        *client.bbmd.lock().unwrap() = Some(BbmdRegistration {
+            addr: bbmd,
+            ttl,
+            active: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        });
+
+        let devices = discover_core(&client, "255.255.255.255", None, None, Duration::from_secs(6), |d| {
+            println!(
+                "  I-Am: {} @ {}{} vendor {}",
+                d.instance,
+                d.address,
+                d.network.map(|n| format!(" net{n}/{}", d.mac.clone().unwrap_or_default())).unwrap_or_default(),
+                d.vendor_id
+            );
+        })
+        .unwrap();
+        println!("== via BBMD: {} device(s) ({} more than local) ==", devices.len(), devices.len().saturating_sub(local.len()));
+        assert!(!devices.is_empty(), "no devices answered via the BBMD — wrong BBMD IP or no FDR support?");
     }
 }
