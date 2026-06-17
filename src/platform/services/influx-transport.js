@@ -29,8 +29,9 @@ export function buildGrafanaPanelUrl(config, spec = {}) {
 
 export function createInfluxTransport({ invoke, config }) {
   if (typeof invoke !== "function") throw new Error("createInfluxTransport requires an invoke function");
-  if (!config || !Number.isFinite(config.influxPort)) throw new Error("createInfluxTransport requires a PackConfig");
-  if (!Number.isFinite(config.grafanaPort)) throw new Error("createInfluxTransport requires a PackConfig with a numeric grafanaPort");
+  const validPort = (p) => Number.isInteger(p) && p >= 1 && p <= 65535;
+  if (!config || !validPort(config.influxPort)) throw new Error("createInfluxTransport requires a PackConfig with a valid influxPort (1-65535)");
+  if (!validPort(config.grafanaPort)) throw new Error("createInfluxTransport requires a PackConfig with a valid grafanaPort (1-65535)");
 
   return {
     /** Deliver a batch of normalized points. Throws on failure so the service re-queues. */

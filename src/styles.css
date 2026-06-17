@@ -6,6 +6,8 @@
   --border-strong: #3a4159;
   --text: #e5e7eb;
   --text-dim: #9ca3af;
+  --info: #38bdf8;
+  --danger: #ef4444;
   --accent: #6366f1;
   --accent-2: #818cf8;
   --ok: #22c55e;
@@ -14,6 +16,10 @@
 
   /* Elevation is reserved for true overlays (modal, popover) only — panels use borders. */
   --shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  --shadow-lg: 0 10px 28px rgba(0, 0, 0, 0.55);
+
+  /* Default transition duration for hovers/toggles. */
+  --fast: 120ms;
 
   /* Spacing scale (4px-based). --gap = default layout gap, --pad-card = default panel padding. */
   --sp-1: 2px;
@@ -33,6 +39,7 @@
 
   /* Type ramp (tight, console-grade). */
   --fs-label: 11px;   /* uppercase micro labels */
+  --fs-xs: 11px;
   --fs-sm: 12px;
   --fs-body: 13px;
   --fs-md: 14px;      /* section / card titles */

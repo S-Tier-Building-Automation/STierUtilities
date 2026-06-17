@@ -47,7 +47,17 @@ pub struct AuthSyncStatus {
     pub message: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+impl Default for AuthSyncStatus {
+    fn default() -> Self {
+        Self {
+            mode: "local".into(),
+            message: "Local-first profile. Choose a sync folder to share state across devices."
+                .into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthState {
     pub device_id: String,
@@ -65,27 +75,10 @@ pub struct AuthState {
     pub orgs: Vec<AuthOrg>,
     #[serde(default)]
     pub session: Option<AuthSession>,
+    // Defaulted so loading an older auth.json that predates this field doesn't
+    // fail deserialization (which would silently reset the whole profile).
+    #[serde(default)]
     pub sync_status: AuthSyncStatus,
-}
-
-impl Default for AuthState {
-    fn default() -> Self {
-        Self {
-            device_id: String::new(),
-            sync_folder: String::new(),
-            last_synced_at: None,
-            active_user_id: String::new(),
-            active_org_id: String::new(),
-            users: Vec::new(),
-            orgs: Vec::new(),
-            session: None,
-            sync_status: AuthSyncStatus {
-                mode: "local".into(),
-                message: "Local-first profile. Choose a sync folder to share state across devices."
-                    .into(),
-            },
-        }
-    }
 }
 
 pub fn now_epoch() -> u64 {

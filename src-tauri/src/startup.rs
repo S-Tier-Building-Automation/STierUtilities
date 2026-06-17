@@ -246,5 +246,6 @@ pub fn start_startup_warmup(app: AppHandle) {
 
 #[tauri::command]
 pub fn app_startup_status() -> StartupWarmupStatus {
-    STARTUP_STATUS.lock().unwrap().clone()
+    // Poison-tolerant: a panicked warmup task must not crash status polling.
+    STARTUP_STATUS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }

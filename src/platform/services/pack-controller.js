@@ -49,7 +49,13 @@ export function createPackController({ invoke, timeseries, sleep = (ms) => new P
     status: () => invoke("observability_status"),
     packStatus: () => invoke("observability_pack_status"),
     install: () => invoke("observability_install"),
-    stop: () => invoke("observability_stop"),
+    async stop() {
+      // Clear `connected` so a later connect()/bringUp() actually re-attaches the
+      // transport instead of short-circuiting on stale state after a stop/crash.
+      const r = await invoke("observability_stop");
+      connected = false;
+      return r;
+    },
 
     async ensureConfig() { return ensureConfig(); },
     async writeConfigs() { await ensureConfig(); return invoke("observability_write_configs", { config }); },

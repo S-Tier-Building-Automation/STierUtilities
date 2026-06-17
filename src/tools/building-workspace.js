@@ -203,6 +203,9 @@ export function pointEntityFromBacnet({ siteId, buildingId, floorId, equipId, de
   const deviceInstance = Number(device.instance ?? device.deviceInstance);
   const objectType = Number(object.objectType);
   const instance = Number(object.instance);
+  if (![deviceInstance, objectType, instance].every(Number.isFinite)) {
+    throw new Error("point import requires numeric BACnet device instance, object type, and object instance");
+  }
   const name = object.name || `${object.typeName || objectType}:${instance}`;
   const unitProp = props.find((p) => p && (p.name === "units" || p.id === 117));
   const sourceRef = bacnetSourceRef(deviceInstance, objectType, instance);

@@ -53,7 +53,10 @@ export function createHistorian({ bacnet, scheduler, timeseries, now = () => Dat
 
   const api = {
     addPoint(point) {
-      if (deviceTag(point && point.device) === "?") {
+      const tag = String(deviceTag(point && point.device)).trim();
+      // Reject not just the "?" sentinel but other unusable identifiers
+      // (NaN deviceInstance, empty id) that would otherwise form a junk key.
+      if (!tag || tag === "?" || tag === "NaN" || tag === "undefined" || tag === "null") {
         throw new Error("historian addPoint requires a resolvable device identifier (deviceInstance/instance/id)");
       }
       const existing = points.find((p) => keyOf(p) === keyOf(point));

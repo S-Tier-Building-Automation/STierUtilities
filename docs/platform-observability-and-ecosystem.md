@@ -3,7 +3,7 @@
 > Status: **Implemented (v0.6 dev)** · Author: architecture review · Target: v0.6 → v1.0
 >
 > **Implementation status:** all seven roadmap phases are built and unit-tested
-> (149 JS tests via `npm test`; Rust tests are run with
+> (154 JS tests via `npm test`; Rust tests are run with
 > `cargo test --manifest-path src-tauri/Cargo.toml`). See
 > [§9 Implementation status](#9--implementation-status) for the phase-by-phase
 > file + test map. The heavy I/O that can't run in CI (downloading the ~400 MB
@@ -341,7 +341,7 @@ persistence (stable ports/token across restarts), graceful shutdown on `ExitRequ
 `pack-controller.bringUp()` orchestration, and the Observability page Install/Start/Stop/Health
 UI + Historian point persistence. An adversarial review of those changes caught + fixed the
 InfluxDB Windows download-URL form (`influxdb2-<ver>-windows.zip`). The JS suite currently
-passes with 149 tests; run Rust verification with `cargo test --manifest-path src-tauri/Cargo.toml`.
+passes with 154 tests; run Rust verification with `cargo test --manifest-path src-tauri/Cargo.toml`.
 
 ### 9.1 Release-hardening backlog
 
@@ -349,8 +349,8 @@ These are the remaining documented items before calling the platform release-rea
 
 | Item | Why it matters | Current pointer |
 | --- | --- | --- |
-| Pin Observability Pack archive hashes | Downloads currently warn and proceed when a SHA-256 pin is absent; release builds should make missing/mismatched hashes a hard error. | [observability.rs](../src-tauri/src/observability.rs) |
-| Move secrets to OS keychain | Tokens are localhost-only today, but Windows Credential Manager is the right storage target for release hardening. | [secrets.rs](../src-tauri/src/secrets.rs) |
+| ✅ Pin Observability Pack archive hashes (done) | SHA-256 is now pinned per component (influxd/telegraf/grafana); a missing or mismatched hash is a hard error before extraction, so unverified binaries are never run. | [observability.rs](../src-tauri/src/observability.rs) |
+| Move secrets to OS keychain | The token is now OS-CSPRNG-generated and localhost-only; Windows Credential Manager remains the right storage target for same-user isolation. | [secrets.rs](../src-tauri/src/secrets.rs) |
 | Live Observability smoke test | Verify in a real app run: `pnpm tauri dev` → Install → Start → write a metric → InfluxDB receives it → Grafana renders it. | Observability page |
 | MCP third-party install UX | The proxy/permission path is tested, but a polished live install/manage flow still needs product work. | Settings MCP install + `mcp-loader` |
 | Sign third-party manifests | Needed before any broader plugin/tool distribution story. | Future manifest trust layer |

@@ -25,7 +25,9 @@ function normalizeTags(tags) {
   const out = {};
   for (const [k, v] of Object.entries(tags)) {
     const key = String(k || "").trim();
-    if (!key) continue;
+    // Skip prototype-polluting keys so a malicious/garbled tag can't alter the
+    // object's behavior or skew tag/filter semantics.
+    if (!key || key === "__proto__" || key === "constructor" || key === "prototype") continue;
     out[key] = v === "" ? true : v;
   }
   return out;
@@ -204,7 +206,9 @@ export function createInventory({ storage = createMemoryInventoryStorage(), now 
             .filter(Boolean)
             .some((v) => String(v).toLowerCase().includes(q)));
       }
-      rows.sort((a, b) => (a.type.localeCompare(b.type) || a.name.localeCompare(b.name)));
+      rows.sort((a, b) =>
+        String(a.type || "").localeCompare(String(b.type || "")) ||
+        String(a.name || "").localeCompare(String(b.name || "")));
       return rows.map(clone);
     },
 
