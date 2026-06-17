@@ -378,9 +378,10 @@ a:hover { text-decoration: underline; }
 .info-btn:hover { background: var(--bg-elev-2); color: var(--text); }
 .info-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
-/* Generic modal (overlay — keeps its shadow) */
+/* Generic modal (overlay — keeps its shadow). Sits above the toast stack
+   (z-index 1000) so a transient toast can't overlap a confirm dialog. */
 .modal-overlay {
-  position: fixed; inset: 0; z-index: 200;
+  position: fixed; inset: 0; z-index: 1100;
   display: flex; align-items: center; justify-content: center;
   padding: 24px;
   background: rgba(0, 0, 0, 0.55);
