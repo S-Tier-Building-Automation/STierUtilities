@@ -178,6 +178,27 @@ export function createInventory({ storage = createMemoryInventoryStorage(), now 
       return clone(normalized);
     },
 
+    // Batch upsert: normalize + insert every row, then persist ONCE. A per-row
+    // upsertEntity re-serializes the whole entity array on every call (O(N^2) on a
+    // large import); this collapses that to a single save. Source-ref de-dupe still
+    // works within the batch because each normalized row is set into `ids` before the
+    // next is normalized, so a later row sharing a ref merges into the earlier entity.
+    upsertMany(entities) {
+      const list = Array.isArray(entities) ? entities : [];
+      const touched = [];
+      const seen = new Set();
+      for (const entity of list) {
+        const normalized = normalizeEntity(entity);
+        ids.set(normalized.id, normalized);
+        if (!seen.has(normalized.id)) {
+          seen.add(normalized.id);
+          touched.push(normalized.id);
+        }
+      }
+      if (touched.length) persist();
+      return touched.map((id) => clone(ids.get(id)));
+    },
+
     removeEntity(id) {
       const ok = ids.delete(id);
       if (ok) persist();

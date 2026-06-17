@@ -601,8 +601,21 @@ pub fn write_pack_configs(paths: &PackPaths, cfg: &PackConfig) -> Result<(), Str
     std::fs::create_dir_all(&provisioning).map_err(|e| e.to_string())?;
     let dash_prov = paths.config_dir().join("provisioning").join("dashboards");
     std::fs::create_dir_all(&dash_prov).map_err(|e| e.to_string())?;
+    // Grafana also probes these provisioning dirs on startup; we don't ship any
+    // plugin/alerting provisioning, but pre-creating them empty avoids the noisy
+    // "cannot find the file specified" errors Grafana logs when they're missing.
+    for sub in ["plugins", "alerting"] {
+        std::fs::create_dir_all(paths.config_dir().join("provisioning").join(sub))
+            .map_err(|e| e.to_string())?;
+    }
     // Grafana's persistent state dir (survives version updates).
     std::fs::create_dir_all(paths.grafana_data_dir()).map_err(|e| e.to_string())?;
+    // The external-plugins dir (grafana.ini `plugins = {data}/plugins`). We bundle
+    // no plugins, but Grafana opens this path at startup to scan for them (including
+    // the image renderer); if it's missing it logs `failed to open plugins path`
+    // ("Failed to get renderer plugin sources"). Creating it empty silences that —
+    // image rendering isn't used here (panels are embedded as live iframes).
+    std::fs::create_dir_all(paths.grafana_data_dir().join("plugins")).map_err(|e| e.to_string())?;
 
     std::fs::write(paths.config_dir().join("telegraf.conf"), telegraf_conf(cfg))
         .map_err(|e| e.to_string())?;
@@ -978,14 +991,20 @@ fn start_blocking(app: tauri::AppHandle, config: PackConfig) -> Result<(), Strin
 
     let mut sup = SUPERVISOR.lock().map_err(|_| "supervisor lock poisoned")?;
 
-    if sup.influx.is_none() {
+    // Each spawn is guarded by both the in-memory handle AND a live port check.
+    // The handle is per-process, so after a non-graceful exit (crash / force-kill
+    // during dev) the previous run's children are orphaned and still hold their
+    // (persisted) ports. Without the port check we'd re-spawn a duplicate that
+    // collides on bind ("Only one usage of each socket address"); instead we treat
+    // an already-serving port as the running instance and reuse it.
+    if sup.influx.is_none() && !port_open(config.influx_port) {
         sup.influx = Some(spawn_component(
             &paths,
             "influxd",
             &influxd_args(&config, &paths.data_dir()),
         )?);
     }
-    if sup.telegraf.is_none() {
+    if sup.telegraf.is_none() && !port_open(config.telegraf_listener_port) {
         let conf = paths
             .config_dir()
             .join("telegraf.conf")
@@ -997,7 +1016,7 @@ fn start_blocking(app: tauri::AppHandle, config: PackConfig) -> Result<(), Strin
             &["--config".into(), conf],
         )?);
     }
-    if sup.grafana.is_none() {
+    if sup.grafana.is_none() && !port_open(config.grafana_port) {
         // grafana 10+: `grafana server --config <ini> --homepath <install dir>`.
         let ini = paths
             .config_dir()

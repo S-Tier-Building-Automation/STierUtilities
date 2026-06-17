@@ -1,14 +1,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  bwClassifyDiscovery,
   bwDeviceInboxCandidates,
   bwImportPlanItems,
+  bwModelObjectsBatch,
   bwModelQueuedDevices,
+  bwPlanDeviceObjects,
   bwQueueInboxDevices,
+  bwResolveDeviceConflict,
+  commissioningValueMatches,
   exportCommissioningCsv,
   exportCommissioningMarkdown,
   generateBuildingDashboard,
   historianPointFromEntity,
+  interpretStatusFlags,
+  parsePriorityArray,
   pointEntityFromBacnet,
   runCommissioning,
   suggestEquipmentName,
@@ -174,6 +181,88 @@ test("equipment names are suggested from common object naming", () => {
   assert.equal(suggestEquipmentName("AHU_1_SAT"), "AHU");
 });
 
+test("bwPlanDeviceObjects groups objects by inferred equipment and applies a name template", () => {
+  const device = { instance: 100, name: "Controller 100" };
+  const objects = [
+    { objectType: 0, instance: 1, typeName: "AI", name: "VAV-101 Zone Temp" },
+    { objectType: 0, instance: 2, typeName: "AI", name: "VAV-101 Zone Setpoint" },
+    { objectType: 0, instance: 3, typeName: "AI", name: "AHU_1_SAT" },
+  ];
+  const { items, equips } = bwPlanDeviceObjects({ device, objects, template: "{equip}-{type}{instance}" });
+  assert.deepEqual(equips, ["VAV-101", "AHU"]);
+  assert.equal(items[0].equipName, "VAV-101");
+  assert.equal(items[0].pointName, "VAV-101-AI1");
+  assert.equal(items[1].equipName, "VAV-101");
+  assert.equal(items[2].equipName, "AHU");
+});
+
+test("bwPlanDeviceObjects keeps the object's own name when no template is given", () => {
+  const { items } = bwPlanDeviceObjects({ device: { instance: 5 }, objects: [{ objectType: 0, instance: 9, name: "Outside Air Temp" }] });
+  assert.equal(items[0].pointName, "Outside Air Temp");
+});
+
+test("bwModelObjectsBatch builds point entities with resolved equip ids and templated names", () => {
+  const device = { instance: 100, address: "10.0.0.5" };
+  const items = [
+    { object: { objectType: 0, instance: 1, typeName: "AI", name: "Zone Temp" }, equipName: "VAV-101", pointName: "VAV-101-AI1" },
+  ];
+  const points = bwModelObjectsBatch({
+    siteId: "site:1", buildingId: "b:1", floorId: "f:1", device, items,
+    equipIdByName: { "VAV-101": "equip:vav-101" },
+  });
+  assert.equal(points.length, 1);
+  assert.equal(points[0].equipId, "equip:vav-101");
+  assert.equal(points[0].name, "VAV-101-AI1");
+  assert.equal(points[0].sourceRefs[0], "bacnet:100:0:1");
+});
+
+test("bwResolveDeviceConflict replace re-points the equip and its points to the new instance", () => {
+  const modeledDevice = {
+    id: "equip:old", type: "equip", name: "RTU-1", deviceInstance: 100, address: "10.0.0.5",
+    deviceRef: { address: "10.0.0.5", deviceInstance: 100 }, tags: { equip: true, device: true },
+  };
+  const points = [
+    { id: "point:1", type: "point", deviceInstance: 100, sourceRefs: ["bacnet:100:0:1"], deviceRef: { address: "10.0.0.5", deviceInstance: 100 } },
+    { id: "point:other", type: "point", deviceInstance: 200, sourceRefs: ["bacnet:200:0:1"] },
+  ];
+  const device = { instance: 250, address: "10.0.0.9" };
+  const { action, updated } = bwResolveDeviceConflict({ action: "replace", modeledDevice, device, points });
+  assert.equal(action, "replace");
+  assert.equal(updated.length, 2); // the equip plus only the matching point
+  assert.equal(updated[0].deviceInstance, 250);
+  assert.equal(updated[0].address, "10.0.0.9");
+  assert.equal(updated[1].id, "point:1");
+  assert.equal(updated[1].sourceRefs[0], "bacnet:250:0:1");
+  assert.equal(updated[1].deviceInstance, 250);
+});
+
+test("bwResolveDeviceConflict with a non-replace action makes no changes", () => {
+  const r = bwResolveDeviceConflict({ action: "both", modeledDevice: { deviceInstance: 1 }, device: { instance: 2 }, points: [] });
+  assert.deepEqual(r, { action: "both", updated: [] });
+});
+
+test("bwClassifyDiscovery flags new, returning, changed, and missing devices", () => {
+  const prev = [
+    { instance: 1, address: "10.0.0.1", modelName: "A" },
+    { instance: 2, address: "10.0.0.2" },
+    { instance: 3, address: "10.0.0.3" },
+  ];
+  const current = [
+    { instance: 1, address: "10.0.0.1", modelName: "A" },
+    { instance: 2, address: "10.0.0.99" },
+    { instance: 4, address: "10.0.0.4" },
+  ];
+  const { devices, missing, summary } = bwClassifyDiscovery(prev, current);
+  const byInst = Object.fromEntries(devices.map((d) => [d.device.instance, d]));
+  assert.equal(byInst[1].status, "returning");
+  assert.equal(byInst[2].status, "changed");
+  assert.deepEqual(byInst[2].changes, ["address"]);
+  assert.equal(byInst[4].status, "new");
+  assert.equal(missing.length, 1);
+  assert.equal(missing[0].instance, 3);
+  assert.deepEqual(summary, { new: 1, returning: 1, changed: 1, missing: 1 });
+});
+
 test("dashboard generation is stable and includes building panels", () => {
   const inv = createInventory({ storage: createMemoryInventoryStorage(), now: () => 1 });
   inv.upsertEntity({ id: "site:main", type: "site", name: "Main" });
@@ -199,6 +288,66 @@ test("dashboard generation is stable and includes building panels", () => {
   const emptyQ = empty.panels.find((p) => p.title === "Present value trend").targets[0].query;
   assert.doesNotMatch(emptyQ, /"point:rat"/);
   assert.match(emptyQ, /__no_modeled_points__/);
+});
+
+test("parsePriorityArray maps 16 slots and finds the commanding level", () => {
+  const values = Array.from({ length: 16 }, () => ({ kind: "null" }));
+  values[7] = { kind: "real", value: 72 };   // priority 8
+  values[15] = { kind: "real", value: 68 };  // priority 16 (relinquish default-ish)
+  const { slots, activeLevel, activeValue } = parsePriorityArray(values);
+  assert.equal(slots.length, 16);
+  assert.equal(slots[7].active, true);
+  assert.equal(slots[7].value, 72);
+  assert.equal(slots[0].active, false);
+  assert.equal(activeLevel, 8); // lowest-numbered (highest-priority) non-null slot
+  assert.equal(activeValue, 72);
+});
+
+test("interpretStatusFlags names the raised bits", () => {
+  const f = interpretStatusFlags({ kind: "bitstring", bits: "1010" });
+  assert.equal(f.inAlarm, true);
+  assert.equal(f.fault, false);
+  assert.equal(f.overridden, true);
+  assert.equal(f.outOfService, false);
+  assert.deepEqual(f.raised, ["in-alarm", "overridden"]);
+  // also accepts a property entry and a raw string
+  assert.equal(interpretStatusFlags("0100").fault, true);
+  assert.equal(interpretStatusFlags({ values: [{ bits: "0001" }] }).outOfService, true);
+});
+
+test("commissioningValueMatches uses tolerance for numbers and exact for non-numeric", () => {
+  assert.equal(commissioningValueMatches(72.2, 72, 0.5), true);
+  assert.equal(commissioningValueMatches(75, 72, 0.5), false);
+  assert.equal(commissioningValueMatches(null, 72), false);
+  assert.equal(commissioningValueMatches(1, 1), true);
+});
+
+test("commissioning verify reads back and flags a stuck output", async () => {
+  // Writable point; readback returns the commanded value -> verify pass.
+  const okBacnet = {
+    readPoint: async () => [{ id: 85, name: "present-value", values: [{ kind: "real", value: 70 }] }],
+  };
+  const writes = [];
+  const writeProperty = async (w) => { writes.push(w); };
+  const points = [{ id: "p1", name: "AO-1", tags: { writable: true }, sourceRefs: ["bacnet:1:1:5"] }];
+  let run = await runCommissioning({
+    points, bacnet: okBacnet, writeProperty,
+    options: { commandValue: 70, verify: true, priority: 8 }, now: () => 1,
+  });
+  assert.deepEqual(run.steps.map((s) => s.status), ["pass", "pass", "pass", "pass"]); // read, command, verify, relinquish
+
+  // Readback never moves -> verify fail (stuck), and the run is marked failed.
+  const stuckBacnet = {
+    readPoint: async () => [{ id: 85, name: "present-value", values: [{ kind: "real", value: 0 }] }],
+  };
+  run = await runCommissioning({
+    points, bacnet: stuckBacnet, writeProperty,
+    options: { commandValue: 70, verify: true }, now: () => 1,
+  });
+  const verifyStep = run.steps.find((s) => s.check === "verify");
+  assert.equal(verifyStep.status, "fail");
+  assert.match(verifyStep.error, /stuck|override/i);
+  assert.equal(run.status, "fail");
 });
 
 test("commissioning runner records pass/fail/skip deterministically", async () => {

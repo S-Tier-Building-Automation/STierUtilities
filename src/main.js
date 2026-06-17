@@ -9,17 +9,23 @@ import { validateManifest } from "./platform/manifest.js";
 import { grantsFromInstall, approveInstall } from "./platform/mcp-loader.js";
 import { buildMcpFactories } from "./platform/services/mcp-client.js";
 import {
+  bwClassifyDiscovery,
   bwDeviceInboxCandidates,
   bwDeviceKey,
   bwFindModeledDeviceForBacnet,
   bwImportPlanItems,
+  bwModelObjectsBatch,
   bwModelQueuedDevices,
+  bwPlanDeviceObjects,
   bwQueueInboxDevices,
   bwRemoveQueuedDevices,
+  commissioningValueMatches,
   exportCommissioningCsv,
   exportCommissioningMarkdown,
   generateBuildingDashboard,
   historianPointFromEntity,
+  interpretStatusFlags,
+  parsePriorityArray,
   pointEntityFromBacnet,
   runCommissioning,
   suggestEquipmentName,
@@ -458,6 +464,7 @@ function setLibraryView(view) {
 }
 
 function setView(view) {
+  bwStopLivePoll(); // tear down any live poll when leaving the current view
   userState.view = view;
   saveUserState();
   renderAll();
@@ -751,6 +758,48 @@ function openModal({ title, body = [] } = {}) {
   document.body.appendChild(overlay);
   activeModal = { overlay, onKey };
   closeBtn.focus(); // land keyboard focus inside the dialog
+}
+
+// A modal yes/no confirmation. Resolves true if the user confirms, false on
+// cancel/dismiss. Used to gate consequential writes (e.g. acknowledging alarms).
+function confirmAction({ title = "Confirm", message = "", confirmLabel = "Confirm", danger = false } = {}) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (v) => { if (!settled) { settled = true; closeModal(); resolve(v); } };
+    const confirmBtn = el("button", {
+      class: danger ? "btn btn-danger" : "btn btn-primary",
+      onclick: () => done(true),
+    }, confirmLabel);
+    const cancelBtn = el("button", { class: "btn btn-ghost", onclick: () => done(false) }, "Cancel");
+    const body = el("div", { class: "confirm-body" },
+      el("p", {}, message),
+      el("div", { class: "confirm-actions" }, cancelBtn, confirmBtn),
+    );
+    openModal({ title, body: [body] });
+    // openModal focuses its close button; move focus to the safe default.
+    cancelBtn.focus();
+  });
+}
+
+// --- Toast notifications ---
+// Non-modal, transient feedback (write succeeded, poll failed, import done). Themed
+// with the --ok/--warn/--error tokens. Stacks in a fixed container; click to dismiss.
+let toastContainer = null;
+function toast(message, kind = "ok", timeoutMs = 4000) {
+  if (typeof document === "undefined") return null;
+  if (!toastContainer || !document.body.contains(toastContainer)) {
+    toastContainer = el("div", { class: "toast-stack", "aria-live": "polite" });
+    document.body.appendChild(toastContainer);
+  }
+  const node = el("div", { class: `toast toast-${kind}`, role: "status" }, String(message));
+  const remove = () => {
+    node.remove();
+    if (toastContainer && !toastContainer.childElementCount) { toastContainer.remove(); toastContainer = null; }
+  };
+  node.addEventListener("click", remove);
+  toastContainer.appendChild(node);
+  setTimeout(remove, Math.max(1000, timeoutMs));
+  return node;
 }
 
 // ============================================================================
@@ -2507,18 +2556,29 @@ let bac = {
   objectsLoading: false,
   objectsProgress: null,  // { done, total } during index-by-index walks
   objectFilter: "",
+  objectTypeFilter: new Set(), // selected typeName strings; empty = all types
+  objectInstanceMin: "",
+  objectInstanceMax: "",
+  objectSelection: new Set(),  // "type:instance" keys chosen for bulk import
+  objectNameTemplate: "",      // optional naming template for bulk import
+  objectTypesOpen: false,      // is the type-filter <details> popover open
   selectedObjectKey: null, // "type:instance"
   props: [],              // PropertyEntry[] for the selected object
   propsLoading: false,
   cov: { processId: null, objectKey: null, busy: false, updates: 0, lastAt: null },
   trend: { loading: false, records: [], recordCount: 0, truncated: false, objectKey: null, max: "200" },
+  alarms: { loading: false, entries: [], deviceKey: null, error: null, ran: false },
   write: { propertyId: "85", kind: "real", value: "", priority: "", arrayIndex: "" },
   target: "255.255.255.255",
   lowLimit: "",
   highLimit: "",
+  // Foreign-device (BBMD) registration: reach broadcast discovery across subnets.
+  bbmd: { address: "", ttl: "60", status: null, busy: false },
   listenersReady: false,
   discoveryRan: false,
   lastDiscoveryCount: null,
+  driftSummary: null,          // { new, returning, changed, missing } vs the last scan
+  deviceStatusByKey: {},       // device key -> "new" | "returning" | "changed"
 };
 
 function bacStatusPill() {
@@ -2533,8 +2593,17 @@ function bacSelectedDevice() {
 }
 
 // The DeviceRef the backend needs to reach a device (router addressing included).
+// maxApdu + segmentation let the backend segment an outbound request that won't
+// fit the device's APDU (e.g. a large WriteProperty), or reject it up front when
+// the device can't receive segments.
 function bacDeviceRef(d) {
-  return { address: d.address, network: d.network ?? null, mac: d.mac ?? null };
+  return {
+    address: d.address,
+    network: d.network ?? null,
+    mac: d.mac ?? null,
+    maxApdu: d.maxApdu ?? null,
+    segmentation: d.segmentation ?? null,
+  };
 }
 
 function bacObjectKey(o) { return `${o.objectType}:${o.instance}`; }
@@ -2708,6 +2777,13 @@ function bacnetRead() {
       invoke("bacnet_subscribe_cov", { device, deviceInstance, objectType, instance, confirmed }),
     unsubscribeCov: ({ device, objectType, instance, processId }) =>
       invoke("bacnet_unsubscribe_cov", { device, objectType, instance, processId }),
+    registerForeignDevice: ({ bbmd, ttlSeconds = null }) =>
+      invoke("bacnet_register_foreign_device", { bbmd, ttlSeconds }),
+    unregisterForeignDevice: () => invoke("bacnet_unregister_foreign_device"),
+    foreignDeviceStatus: () => invoke("bacnet_foreign_device_status"),
+    getAlarms: (device) => invoke("bacnet_get_alarms", { device }),
+    acknowledgeAlarm: ({ device, objectType, instance }) =>
+      invoke("bacnet_acknowledge_alarm", { device, objectType, instance }),
   };
 }
 
@@ -2737,6 +2813,7 @@ async function bacDiscover() {
     });
     bac.devices = devices;
     bac.lastDiscoveryCount = devices.length;
+    bacRecordDiscoveryDrift(devices);
     logTo("bacnet", `Discovery finished — ${devices.length} device${devices.length === 1 ? "" : "s"}.`, devices.length ? "ok" : "warn");
   } catch (err) {
     bac.lastDiscoveryCount = null;
@@ -2748,6 +2825,82 @@ async function bacDiscover() {
   }
 }
 
+// Register/unregister with a BBMD as a foreign device, so a subsequent Who-Is is
+// distributed across IP subnets (the host needn't be on the BACnet LAN). A
+// background keep-alive in the backend holds the registration open.
+async function bacToggleForeignDevice() {
+  if (bac.bbmd.busy) return;
+  const api = bacnetRead();
+  bac.bbmd.busy = true;
+  renderAll();
+  try {
+    if (bac.bbmd.status) {
+      await api.unregisterForeignDevice();
+      bac.bbmd.status = null;
+      logTo("bacnet", "Unregistered from BBMD (will expire at TTL).", "info");
+    } else {
+      const addr = bac.bbmd.address.trim();
+      if (!addr) { logTo("bacnet", "Enter the BBMD's IP address to register.", "warn"); return; }
+      const ttl = parseInt(bac.bbmd.ttl, 10);
+      const status = await api.registerForeignDevice({
+        bbmd: addr,
+        ttlSeconds: Number.isFinite(ttl) ? ttl : null,
+      });
+      bac.bbmd.status = status;
+      logTo("bacnet", `Registered as foreign device with ${status.bbmd} (TTL ${status.ttlSeconds}s). Broadcasts now route through the BBMD.`, "ok");
+    }
+  } catch (err) {
+    logTo("bacnet", `Foreign-device registration failed: ${err}`, "error");
+  } finally {
+    bac.bbmd.busy = false;
+    renderAll();
+  }
+}
+
+// Classify a fresh discovery against the persisted baseline (new/returning/changed +
+// missing) and store the new baseline for next time. Local-only; never blocks discovery.
+function bacRecordDiscoveryDrift(devices) {
+  try {
+    const prev = Array.isArray(userState.bacnetDiscoveryCache) ? userState.bacnetDiscoveryCache : [];
+    const drift = bwClassifyDiscovery(prev, devices);
+    bac.driftSummary = drift.summary;
+    bac.deviceStatusByKey = Object.fromEntries(drift.devices.map((d) => [d.key, d.status]));
+    userState.bacnetDiscoveryCache = devices.map((d) => ({
+      key: d.key, instance: d.instance, address: d.address,
+      network: d.network ?? null, mac: d.mac ?? null,
+      vendorId: d.vendorId ?? null, modelName: d.modelName ?? null, name: d.name ?? null,
+    }));
+    saveUserState();
+  } catch (_) {
+    bac.driftSummary = null;
+    bac.deviceStatusByKey = {};
+  }
+}
+
+function bacDriftSummaryEl() {
+  const s = bac.driftSummary;
+  if (!s) return null;
+  const parts = [];
+  if (s.new) parts.push(`${s.new} new`);
+  if (s.returning) parts.push(`${s.returning} returning`);
+  if (s.changed) parts.push(`${s.changed} changed`);
+  if (s.missing) parts.push(`${s.missing} missing`);
+  if (!parts.length) return null;
+  return el("span", {
+    class: "muted small bac-drift-summary",
+    title: "Compared to the previous discovery on this machine",
+  }, `· ${parts.join(" · ")} since last scan`);
+}
+
+function bacDeviceStatusBadge(d) {
+  const status = bac.deviceStatusByKey[d.key];
+  if (!status || status === "returning") return null;
+  return el("span", {
+    class: `bac-badge bac-badge-${status}`,
+    title: status === "new" ? "Not seen in the previous scan" : "Address/vendor/model changed since the previous scan",
+  }, status);
+}
+
 async function bacSelectDevice(key) {
   if (bac.selectedDeviceKey === key) return;
   if (bac.cov.processId != null) await bacCovStop();
@@ -2756,6 +2909,10 @@ async function bacSelectDevice(key) {
   bac.selectedObjectKey = null;
   bac.props = [];
   bac.objectFilter = "";
+  bac.objectTypeFilter.clear();
+  bac.objectInstanceMin = "";
+  bac.objectInstanceMax = "";
+  bac.objectSelection.clear();
   const dev = bacSelectedDevice();
   if (!dev) { renderAll(); return; }
   bac.objectsLoading = true;
@@ -3107,13 +3264,29 @@ function bacTimestamp() {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}`;
 }
 
+// Shared object-filter predicate (free text + type set + instance range). Used by the
+// Advanced Inspector object browser and the Building Workspace point-import modal so both
+// filter identically.
+function bacObjectMatches(o, { q = "", types = null, min = "", max = "" } = {}) {
+  if (types && types.size && !types.has(o.typeName)) return false;
+  const mn = parseInt(min, 10);
+  if (Number.isFinite(mn) && Number(o.instance) < mn) return false;
+  const mx = parseInt(max, 10);
+  if (Number.isFinite(mx) && Number(o.instance) > mx) return false;
+  const qq = String(q).trim().toLowerCase();
+  if (qq && !(
+    String(o.name || "").toLowerCase().includes(qq) ||
+    String(o.typeName || "").toLowerCase().includes(qq) ||
+    String(o.instance).includes(qq)
+  )) return false;
+  return true;
+}
+
 function bacFilteredObjects() {
-  const q = bac.objectFilter.trim().toLowerCase();
-  if (!q) return bac.objects;
-  return bac.objects.filter((o) =>
-    o.name.toLowerCase().includes(q) ||
-    o.typeName.toLowerCase().includes(q) ||
-    String(o.instance).includes(q));
+  return bac.objects.filter((o) => bacObjectMatches(o, {
+    q: bac.objectFilter, types: bac.objectTypeFilter,
+    min: bac.objectInstanceMin, max: bac.objectInstanceMax,
+  }));
 }
 
 function bacApplyObjectFilter() {
@@ -3122,11 +3295,22 @@ function bacApplyObjectFilter() {
   if (list) list.replaceChildren(...bacObjectRows());
   const count = document.getElementById("bac-object-count");
   if (count) count.textContent = bacObjectCountText();
+  const bulkbar = document.getElementById("bac-object-bulkbar");
+  if (bulkbar) bulkbar.replaceWith(bacObjectBulkBar());
+}
+
+function bacObjectFiltersActive() {
+  return Boolean(
+    bac.objectFilter.trim() ||
+    bac.objectTypeFilter.size ||
+    String(bac.objectInstanceMin).trim() ||
+    String(bac.objectInstanceMax).trim(),
+  );
 }
 
 function bacObjectCountText() {
   const total = bac.objects.length;
-  if (!bac.objectFilter.trim()) return `${total} object${total === 1 ? "" : "s"}`;
+  if (!bacObjectFiltersActive()) return `${total} object${total === 1 ? "" : "s"}`;
   return `${bacFilteredObjects().length} of ${total} shown`;
 }
 
@@ -3148,7 +3332,7 @@ function bacDeviceRows() {
       onclick: () => bacSelectDevice(d.key),
     },
       el("td", { class: "bac-num" }, String(d.instance)),
-      el("td", {}, d.name || el("span", { class: "muted" }, "—")),
+      el("td", {}, d.name || el("span", { class: "muted" }, "—"), bacDeviceStatusBadge(d)),
       el("td", { class: "bac-mono" }, bacAddressText(d)),
       el("td", {}, bacVendorText(d) || el("span", { class: "muted" }, "—")),
       el("td", {}, d.modelName || el("span", { class: "muted" }, "—")),
@@ -3193,11 +3377,25 @@ function bacObjectRows() {
     else msg = "Select a device to list its objects.";
     return [el("li", { class: "muted small bac-object-empty" }, msg)];
   }
-  return objects.map((o) => {
+  // Group by object type so a large device reads like Niagara's point folders.
+  const sorted = [...objects].sort((a, b) =>
+    String(a.typeName).localeCompare(String(b.typeName)) || Number(a.instance) - Number(b.instance));
+  const countByType = sorted.reduce((m, o) => m.set(o.typeName, (m.get(o.typeName) || 0) + 1), new Map());
+  const rows = [];
+  let lastType = null;
+  for (const o of sorted) {
+    if (o.typeName !== lastType) {
+      lastType = o.typeName;
+      rows.push(el("li", { class: "bac-object-group", role: "presentation" },
+        el("span", {}, lastType),
+        el("span", { class: "muted small" }, String(countByType.get(lastType))),
+      ));
+    }
     const key = bacObjectKey(o);
     const active = key === bac.selectedObjectKey;
-    return el("li", {
-      class: `bac-object-row ${active ? "bac-row-active" : ""}`,
+    const checked = bac.objectSelection.has(key);
+    rows.push(el("li", {
+      class: `bac-object-row ${active ? "bac-row-active" : ""}${checked ? " bac-object-checked" : ""}`,
       role: "button",
       tabindex: "0",
       onclick: () => bacSelectObject(key),
@@ -3205,6 +3403,12 @@ function bacObjectRows() {
         if (e.key === "Enter" || e.key === " ") { e.preventDefault(); bacSelectObject(key); }
       },
     },
+      el("input", {
+        type: "checkbox", class: "bac-object-check",
+        checked: checked ? "checked" : undefined,
+        "aria-label": `Select ${o.typeName}:${o.instance} for import`,
+        onclick: (e) => { e.stopPropagation(); bacToggleObjectSelect(key); },
+      }),
       el("span", { class: "bac-object-type" }, `${o.typeName}:${o.instance}`),
       el("span", { class: "bac-object-name" }, o.name || ""),
       el("button", {
@@ -3212,8 +3416,227 @@ function bacObjectRows() {
         title: "Import this object into Building Workspace and historize it",
         onclick: (e) => { e.stopPropagation(); bwHistorizeSelectedObject(o); },
       }, "Historize"),
-    );
+    ));
+  }
+  return rows;
+}
+
+// ---- object browser: type/instance filters, multi-select, bulk import, export ----
+
+function bacObjectTypeNames() {
+  return [...new Set(bac.objects.map((o) => o.typeName))].sort((a, b) => String(a).localeCompare(String(b)));
+}
+
+function bacToggleObjectType(typeName) {
+  if (bac.objectTypeFilter.has(typeName)) bac.objectTypeFilter.delete(typeName);
+  else bac.objectTypeFilter.add(typeName);
+  // A row that just became hidden shouldn't stay selected for import.
+  for (const key of [...bac.objectSelection]) {
+    const obj = bac.objects.find((o) => bacObjectKey(o) === key);
+    if (obj && bac.objectTypeFilter.size && !bac.objectTypeFilter.has(obj.typeName)) bac.objectSelection.delete(key);
+  }
+  renderAll();
+}
+
+function bacToggleObjectSelect(key) {
+  if (bac.objectSelection.has(key)) bac.objectSelection.delete(key);
+  else bac.objectSelection.add(key);
+  bacApplyObjectFilter();
+}
+
+function bacSelectAllFiltered() {
+  for (const o of bacFilteredObjects()) bac.objectSelection.add(bacObjectKey(o));
+  bacApplyObjectFilter();
+}
+
+function bacClearObjectSelection() {
+  bac.objectSelection.clear();
+  bacApplyObjectFilter();
+}
+
+function bacSelectedObjectsForBulk() {
+  return bac.objects.filter((o) => bac.objectSelection.has(bacObjectKey(o)));
+}
+
+function bacObjectsToCsv(objects) {
+  const esc = (v) => {
+    const s = v == null ? "" : String(v);
+    return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  };
+  const lines = [["objectType", "typeName", "instance", "name"].join(",")];
+  for (const o of objects) lines.push([o.objectType, o.typeName, o.instance, o.name].map(esc).join(","));
+  return lines.join("\r\n");
+}
+
+function bacExportObjects() {
+  const dev = bacSelectedDevice();
+  const objects = bacFilteredObjects();
+  if (!objects.length) { toast("No objects to export.", "warn"); return; }
+  const csv = bacObjectsToCsv(objects);
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = el("a", { href: url, download: `bacnet-objects-${dev ? dev.instance : "device"}-${bacTimestamp()}.csv` });
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  toast(`Exported ${objects.length} object${objects.length === 1 ? "" : "s"} to CSV.`, "ok");
+}
+
+// Bulk-model the checked objects into the active site/building/floor: group them by
+// inferred equipment, create/reuse one equip per group, then upsert all points in a
+// single inventory write (inventory.upsertMany). Reuses the same equip/point helpers
+// as the single-object Historize path.
+function bacBulkImportSelected() {
+  const inv = inventoryInstance();
+  const dev = bacSelectedDevice();
+  const objects = bacSelectedObjectsForBulk();
+  if (!inv) { toast("Building model is not ready.", "error"); return; }
+  if (!dev || !objects.length) { toast("Select one or more objects first.", "warn"); return; }
+  const { site, building, floor } = bwEnsureLocation(inv);
+  const plan = bwPlanDeviceObjects({ device: dev, objects, template: bac.objectNameTemplate });
+  const equipIdByName = new Map();
+  for (const name of plan.equips) {
+    let equip = bwEntityByName(inv, { type: "equip", floorId: floor.id }, name)
+      || inv.upsertEntity({
+        type: "equip", siteId: site.id, buildingId: building.id, floorId: floor.id, parentId: floor.id,
+        name, tags: { equip: true },
+      });
+    equip = inv.applyTemplate(equip.id, bwTemplateForName(name));
+    equipIdByName.set(name, equip.id);
+  }
+  const points = bwModelObjectsBatch({
+    siteId: site.id, buildingId: building.id, floorId: floor.id, device: dev, items: plan.items, equipIdByName,
   });
+  const saved = inv.upsertMany(points);
+  bwSaveState();
+  bac.objectSelection.clear();
+  logTo("building-workspace", `Imported ${saved.length} point${saved.length === 1 ? "" : "s"} from device ${dev.instance} into ${floor.name}.`, "ok");
+  toast(`Imported ${saved.length} point${saved.length === 1 ? "" : "s"} into ${floor.name}. Open Building Workspace to model further.`, "ok");
+  renderAll();
+}
+
+// Saved object-filter presets (persisted in user state).
+function bacObjectPresets() {
+  if (!userState.bacnetObjectPresets || typeof userState.bacnetObjectPresets !== "object") userState.bacnetObjectPresets = {};
+  return userState.bacnetObjectPresets;
+}
+
+function bacSaveObjectPreset() {
+  const name = (prompt("Save the current object filter as a preset named:", "") || "").trim();
+  if (!name) return;
+  bacObjectPresets()[name] = {
+    q: bac.objectFilter,
+    types: [...bac.objectTypeFilter],
+    min: bac.objectInstanceMin,
+    max: bac.objectInstanceMax,
+  };
+  saveUserState();
+  toast(`Saved filter preset "${name}".`, "ok");
+  renderAll();
+}
+
+function bacApplyObjectPreset(name) {
+  const preset = bacObjectPresets()[name];
+  if (!preset) return;
+  bac.objectFilter = preset.q || "";
+  bac.objectTypeFilter = new Set(Array.isArray(preset.types) ? preset.types : []);
+  bac.objectInstanceMin = preset.min || "";
+  bac.objectInstanceMax = preset.max || "";
+  renderAll();
+}
+
+// The filter toolbar (type chips + instance range + presets + CSV export) above the list.
+function bacObjectToolbar() {
+  const typeNames = bacObjectTypeNames();
+  const presets = Object.keys(bacObjectPresets());
+  const typeChips = typeNames.map((t) => {
+    const on = bac.objectTypeFilter.has(t);
+    return el("button", {
+      type: "button",
+      class: `bac-type-chip${on ? " bac-type-chip-on" : ""}`,
+      "aria-pressed": on ? "true" : "false",
+      onclick: () => bacToggleObjectType(t),
+    }, t);
+  });
+  return el("div", { class: "bac-object-toolbar" },
+    el("input", {
+      type: "search", class: "nm-input bac-object-filter",
+      placeholder: "Filter objects…",
+      "aria-label": "Filter objects",
+      value: bac.objectFilter,
+      oninput: (e) => { bac.objectFilter = e.target.value; bacApplyObjectFilter(); },
+    }),
+    el("div", { class: "bac-object-range" },
+      el("span", { class: "muted small" }, "Instance"),
+      el("input", {
+        type: "number", class: "nm-input bac-range-input", placeholder: "min",
+        "aria-label": "Minimum instance", value: bac.objectInstanceMin,
+        oninput: (e) => { bac.objectInstanceMin = e.target.value; bacApplyObjectFilter(); },
+      }),
+      el("span", { class: "muted small" }, "–"),
+      el("input", {
+        type: "number", class: "nm-input bac-range-input", placeholder: "max",
+        "aria-label": "Maximum instance", value: bac.objectInstanceMax,
+        oninput: (e) => { bac.objectInstanceMax = e.target.value; bacApplyObjectFilter(); },
+      }),
+    ),
+    typeNames.length
+      ? el("details", {
+          class: "bac-type-filter",
+          open: bac.objectTypesOpen ? "open" : undefined,
+          ontoggle: (e) => { bac.objectTypesOpen = e.target.open; },
+        },
+          el("summary", {}, `Types${bac.objectTypeFilter.size ? ` (${bac.objectTypeFilter.size})` : ""}`),
+          el("div", { class: "bac-type-chips" },
+            ...typeChips,
+            bac.objectTypeFilter.size
+              ? el("button", { type: "button", class: "btn-ghost bac-type-clear", onclick: () => { bac.objectTypeFilter.clear(); renderAll(); } }, "Clear types")
+              : null,
+          ),
+        )
+      : null,
+    el("div", { class: "bac-object-presets" },
+      presets.length
+        ? el("select", {
+            class: "nm-input bac-preset-select", "aria-label": "Apply a saved filter preset",
+            onchange: (e) => { if (e.target.value) bacApplyObjectPreset(e.target.value); },
+          },
+            el("option", { value: "" }, "Presets…"),
+            ...presets.map((p) => el("option", { value: p }, p)),
+          )
+        : null,
+      el("button", { type: "button", class: "btn-ghost", title: "Save the current filter as a preset", onclick: bacSaveObjectPreset }, "Save filter"),
+      el("button", { type: "button", class: "btn-ghost", title: "Download the filtered object list as CSV", onclick: bacExportObjects }, "Export CSV"),
+    ),
+  );
+}
+
+// The bulk-action bar: shown once a device's objects are loaded so "Select all" and
+// the name template are reachable; the import button enables when rows are checked.
+function bacObjectBulkBar() {
+  const n = bac.objectSelection.size;
+  const visible = bacFilteredObjects().length;
+  if (!bac.objects.length) return el("div", { id: "bac-object-bulkbar", class: "bac-object-bulkbar" });
+  return el("div", { id: "bac-object-bulkbar", class: "bac-object-bulkbar bac-object-bulkbar-on" },
+    el("span", { class: "muted small" }, n ? `${n} selected` : ""),
+    el("input", {
+      type: "text", class: "nm-input bac-name-template",
+      placeholder: "Name template, e.g. {equip}-{type}{instance}",
+      title: "Optional. Tokens: {equip} {type} {instance} {name}. Blank keeps each object's own name.",
+      "aria-label": "Point name template",
+      value: bac.objectNameTemplate,
+      oninput: (e) => { bac.objectNameTemplate = e.target.value; },
+    }),
+    el("button", { type: "button", class: "btn-ghost", onclick: bacSelectAllFiltered }, `Select all${visible ? ` (${visible})` : ""}`),
+    n ? el("button", { type: "button", class: "btn-ghost", onclick: bacClearObjectSelection }, "Clear") : null,
+    el("button", {
+      type: "button", class: "btn bac-bulk-import",
+      disabled: n ? undefined : "disabled",
+      title: "Model the selected objects as points under the active floor",
+      onclick: bacBulkImportSelected,
+    }, n ? `Import ${n} point${n === 1 ? "" : "s"}` : "Import points"),
+  );
 }
 
 function bacAdapterTarget(adapterName = bwSelectedNetworkAdapterName()) {
@@ -3240,6 +3663,130 @@ function bacPropRows(flashIds) {
       el("td", { class: "bac-prop-value" }, p.display),
     );
   });
+}
+
+// ---- alarms (GetEventInformation / GetAlarmSummary) ----
+
+async function bacReadAlarms() {
+  const dev = bacSelectedDevice();
+  if (!dev || bac.alarms.loading) return;
+  bac.alarms.loading = true;
+  bac.alarms.deviceKey = dev.key;
+  bac.alarms.error = null;
+  renderAll();
+  try {
+    const entries = await bacnetRead().getAlarms(bacDeviceRef(dev));
+    // Ignore if the user switched devices mid-read.
+    if (bac.selectedDeviceKey !== dev.key) return;
+    bac.alarms.entries = entries;
+    bac.alarms.ran = true;
+    const active = entries.filter((e) => e.eventState !== "normal").length;
+    logTo("bacnet", `Read ${entries.length} alarm record${entries.length === 1 ? "" : "s"} from ${bacDeviceLabel(dev)} (${active} not normal).`, entries.length ? "ok" : "info");
+  } catch (err) {
+    if (bac.selectedDeviceKey !== dev.key) return;
+    bac.alarms.entries = [];
+    bac.alarms.error = String(err);
+    bac.alarms.ran = true;
+    logTo("bacnet", `Alarm read failed for ${bacDeviceLabel(dev)}: ${err}`, "error");
+  } finally {
+    // Clear loading whenever this read still owns the alarms slot, even if the
+    // user switched devices mid-read — otherwise the button stays disabled.
+    if (bac.alarms.deviceKey === dev.key) {
+      bac.alarms.loading = false;
+      renderAll();
+    }
+  }
+}
+
+async function bacAcknowledgeAlarm(alarm) {
+  const dev = bacSelectedDevice();
+  if (!dev) return;
+  const label = `${alarm.typeName}:${alarm.instance}${alarm.name ? ` (${alarm.name})` : ""}`;
+  const ok = await confirmAction({
+    title: "Acknowledge alarm",
+    message: `Acknowledge the "${alarm.eventState}" alarm on ${label} at ${bacDeviceLabel(dev)}? ` +
+      `This writes an acknowledgment to the device and is logged.`,
+    confirmLabel: "Acknowledge",
+  });
+  if (!ok) return;
+  // Audit trail: record intent and outcome in the activity log.
+  logTo("bacnet", `ACK requested — ${label} (${alarm.eventState}) on ${bacDeviceLabel(dev)}.`, "warn");
+  try {
+    await bacnetRead().acknowledgeAlarm({
+      device: bacDeviceRef(dev),
+      objectType: alarm.objectType,
+      instance: alarm.instance,
+    });
+    logTo("bacnet", `ACK accepted by device — ${label}.`, "ok");
+    toast(`Acknowledged ${label}`, "ok");
+    await bacReadAlarms(); // refresh so the ack state reflects reality
+  } catch (err) {
+    logTo("bacnet", `ACK failed — ${label}: ${err}`, "error");
+    toast(`Acknowledge failed: ${err}`, "error");
+  }
+}
+
+function bacAlarmRows() {
+  const fresh = bac.alarms.deviceKey === bac.selectedDeviceKey;
+  const entries = fresh ? bac.alarms.entries : [];
+  if (!entries.length) return [];
+  return entries.map((a) => {
+    const stateCls = a.eventState === "normal" ? "" : "bac-alarm-active";
+    const action = a.acknowledged
+      ? el("span", { class: "muted small" }, "ack'd")
+      : el("button", {
+          class: "btn-ghost",
+          title: "Acknowledge this alarm on the device (writes)",
+          onclick: () => bacAcknowledgeAlarm(a),
+        }, "Ack");
+    return el("tr", { class: stateCls },
+      el("td", {}, `${a.typeName}:${a.instance}`),
+      el("td", {}, a.name || "—"),
+      el("td", {}, a.eventState),
+      el("td", {}, a.acknowledged ? "yes" : "no"),
+      el("td", {}, a.priority != null ? String(a.priority) : "—"),
+      el("td", {}, a.timestamp || "—"),
+      el("td", {}, action),
+    );
+  });
+}
+
+function bacAlarmsSection() {
+  const dev = bacSelectedDevice();
+  if (!dev) return null;
+  const fresh = bac.alarms.deviceKey === dev.key;
+  const rows = bacAlarmRows();
+  let status = "";
+  if (bac.alarms.loading && fresh) status = "Reading alarms…";
+  else if (fresh && bac.alarms.error) status = `Error: ${bac.alarms.error}`;
+  else if (fresh && bac.alarms.ran && rows.length === 0) status = "No active or unacknowledged alarms.";
+  return el("section", { class: "plugin-section" },
+    el("div", { class: "section-head" },
+      el("h3", {}, `Alarms — ${bacDeviceLabel(dev)}`),
+      el("button", {
+        class: "btn-ghost",
+        disabled: bac.alarms.loading ? "disabled" : undefined,
+        title: "List active and unacknowledged alarms (GetEventInformation / GetAlarmSummary)",
+        onclick: bacReadAlarms,
+      }, bac.alarms.loading && fresh ? "…" : "Read alarms"),
+    ),
+    status ? el("p", { class: "muted small" }, status) : null,
+    rows.length
+      ? el("div", { class: "table-scroll" },
+          el("table", { class: "bac-table" },
+            el("thead", {}, el("tr", {},
+              el("th", {}, "Object"),
+              el("th", {}, "Name"),
+              el("th", {}, "State"),
+              el("th", {}, "Ack'd"),
+              el("th", {}, "Priority"),
+              el("th", {}, "Since"),
+              el("th", {}, "Action"),
+            )),
+            el("tbody", {}, ...rows),
+          ))
+      : null,
+  );
 }
 
 // ---- trend logs (ReadRange) ----
@@ -3527,6 +4074,26 @@ function renderBacnetPage() {
       }, "Find live hosts")
     : null;
 
+  const fdrRegistered = !!bac.bbmd.status;
+  const bbmdInput = el("input", {
+    type: "text", class: "nm-input",
+    placeholder: "BBMD IP (e.g. 10.0.5.1)",
+    disabled: (fdrRegistered || bac.bbmd.busy) ? "disabled" : undefined,
+    value: bac.bbmd.address,
+    oninput: (e) => { bac.bbmd.address = e.target.value; },
+  });
+  const bbmdTtlInput = el("input", {
+    type: "text", class: "nm-input bac-range-input", placeholder: "TTL s",
+    disabled: (fdrRegistered || bac.bbmd.busy) ? "disabled" : undefined,
+    value: bac.bbmd.ttl,
+    oninput: (e) => { bac.bbmd.ttl = e.target.value; },
+  });
+  const bbmdBtn = el("button", {
+    class: fdrRegistered ? "btn btn-ghost" : "btn",
+    disabled: bac.bbmd.busy ? "disabled" : undefined,
+    onclick: bacToggleForeignDevice,
+  }, bac.bbmd.busy ? "…" : (fdrRegistered ? "Unregister" : "Register"));
+
   const discoverSection = el("section", { class: "plugin-section" },
     el("div", { class: "nm-pane-head" },
       el("div", { class: "nm-pane-head-text" },
@@ -3546,6 +4113,18 @@ function renderBacnetPage() {
       discoverBtn,
       scanBtn,
     ),
+    el("div", { class: "bac-discover-controls bac-fdr-controls" },
+      el("label", { class: "nm-field bac-target-field" },
+        el("span", { class: "nm-field-label" }, "BBMD (foreign device)"), bbmdInput),
+      el("label", { class: "nm-field" },
+        el("span", { class: "nm-field-label" }, "TTL"), bbmdTtlInput),
+      bbmdBtn,
+      fdrRegistered
+        ? el("span", { class: "muted small" },
+            `Registered with ${bac.bbmd.status.bbmd} — broadcasts route through the BBMD.`)
+        : el("span", { class: "muted small" },
+            "Optional: reach devices on other IP subnets via a BBMD."),
+    ),
     bac.discovering ? bacDiscoveryProgressEl("bac-discovery-progress") : null,
     bacTargetChips(),
   );
@@ -3555,6 +4134,7 @@ function renderBacnetPage() {
     el("div", { class: "section-head" },
       el("h3", {}, "Devices"),
       el("span", { id: "bac-device-count", class: "muted small" }, bacDeviceCountText()),
+      bacDriftSummaryEl(),
     ),
     hasDevices
       ? el("div", { class: "bac-device-toolbar" },
@@ -3586,13 +4166,8 @@ function renderBacnetPage() {
       el("h3", {}, dev ? `Objects — ${bacDeviceLabel(dev)}` : "Objects"),
       el("span", { id: "bac-object-count", class: "muted small" }, bacObjectCountText()),
     ),
-    el("input", {
-      type: "search", class: "nm-input bac-object-filter",
-      placeholder: "Filter objects…",
-      "aria-label": "Filter objects",
-      value: bac.objectFilter,
-      oninput: (e) => { bac.objectFilter = e.target.value; bacApplyObjectFilter(); },
-    }),
+    bacObjectToolbar(),
+    bacObjectBulkBar(),
     el("p", { id: "bac-objects-status", class: "muted small" },
       bac.objectsLoading
         ? (bac.objectsProgress
@@ -3639,6 +4214,7 @@ function renderBacnetPage() {
     discoverSection,
     devicesSection,
     browseSection,
+    bacAlarmsSection(),
   );
 }
 
@@ -4180,6 +4756,10 @@ function bwStateFromUserState() {
     cxMin: "",
     cxMax: "",
     cxNotes: "",
+    cxCommand: "",
+    cxPriority: "8",
+    cxVerify: false,
+    cxToggle: false,
   };
 }
 
@@ -5018,6 +5598,9 @@ function bwImportDiscoveredDevicesToFloor(floorId, keys = null) {
   bwModelQueuedDevicesToFloor(floorId, importKeys);
 }
 
+// State for the Building Workspace "Discover & import points" review modal.
+let bwPointImport = null;
+
 async function bwDiscoverDevicePoints(equipId) {
   const inv = inventoryInstance();
   const equip = inv && inv.getEntity(equipId);
@@ -5025,8 +5608,8 @@ async function bwDiscoverDevicePoints(equipId) {
   const site = inv.getEntity(equip.siteId);
   const building = inv.getEntity(equip.buildingId);
   const floor = inv.getEntity(equip.floorId || equip.parentId);
-  const device = equip.deviceRef || { deviceInstance: equip.deviceInstance };
-  const deviceInstance = Number(equip.deviceInstance ?? device.deviceInstance ?? device.instance);
+  const deviceRef = equip.deviceRef || { deviceInstance: equip.deviceInstance };
+  const deviceInstance = Number(equip.deviceInstance ?? deviceRef.deviceInstance ?? deviceRef.instance);
   if (!Number.isFinite(deviceInstance)) {
     logTo("building-workspace", `${equip.name} is missing a BACnet device instance.`, "warn");
     return;
@@ -5035,26 +5618,172 @@ async function bwDiscoverDevicePoints(equipId) {
   bwRenderModelScope({ details: true });
   try {
     const bacnet = platform ? platform.capability("bacnet.read.v1") : bacnetRead();
-    const objects = await bacnet.listObjects(device, deviceInstance);
-    let imported = 0;
-    for (const object of objects || []) {
-      inv.upsertEntity(pointEntityFromBacnet({
-        siteId: site?.id || equip.siteId,
-        buildingId: building?.id || equip.buildingId,
-        floorId: floor?.id || equip.floorId,
-        equipId: equip.id,
-        device: { ...device, instance: deviceInstance, deviceInstance },
-        object,
-      }));
-      imported++;
+    const objects = (await bacnet.listObjects(deviceRef, deviceInstance)) || [];
+    const device = { ...deviceRef, instance: deviceInstance, deviceInstance };
+    // Pre-skip objects already modeled as points under this equip.
+    const existing = new Set(
+      inv.listEntities({ type: "point", equipId: equip.id }).flatMap((p) => p.sourceRefs || []),
+    );
+    const refOf = (o) => `bacnet:${deviceInstance}:${o.objectType}:${o.instance}`;
+    bwPointImport = {
+      equip, site, building, floor, device, objects, existing,
+      selection: new Set(objects.filter((o) => !existing.has(refOf(o))).map((o) => `${o.objectType}:${o.instance}`)),
+      q: "", typeFilter: new Set(), typesOpen: false, min: "", max: "", template: "",
+    };
+    if (!objects.length) {
+      logTo("building-workspace", `No objects returned from ${equip.name}.`, "warn");
     }
-    logTo("building-workspace", `Imported ${imported} point${imported === 1 ? "" : "s"} from ${equip.name}.`, imported ? "ok" : "warn");
+    bwOpenPointImportModal();
   } catch (err) {
     logTo("building-workspace", `Point discovery failed for ${equip.name}: ${err}`, "error");
   } finally {
     bw.busy = false;
     bwRenderModelScope({ tree: true, details: true, header: true });
   }
+}
+
+function bwPointImportRefOf(o) {
+  return `bacnet:${bwPointImport.device.deviceInstance}:${o.objectType}:${o.instance}`;
+}
+
+function bwPointImportFiltered() {
+  const s = bwPointImport;
+  return s.objects.filter((o) => bacObjectMatches(o, { q: s.q, types: s.typeFilter, min: s.min, max: s.max }));
+}
+
+function bwOpenPointImportModal() {
+  const s = bwPointImport;
+  if (!s) return;
+  openModal({ title: `Discover & import points — ${s.equip.name}`, body: bwPointImportBody() });
+}
+
+function bwPointImportBody() {
+  const s = bwPointImport;
+  return el("div", { class: "bw-import" },
+    el("p", { class: "muted small" },
+      `${s.objects.length} object${s.objects.length === 1 ? "" : "s"} on device ${s.device.deviceInstance}. `
+      + `Importing into ${s.floor?.name || "this floor"} under ${s.equip.name}. Already-modeled objects start unticked.`),
+    bwPointImportToolbar(),
+    el("div", { class: "bw-import-listwrap" },
+      el("ul", { id: "bw-import-list", class: "bac-object-list" }, ...bwPointImportRows())),
+    bwPointImportFooter(),
+  );
+}
+
+function bwPointImportToolbar() {
+  const s = bwPointImport;
+  const types = [...new Set(s.objects.map((o) => o.typeName))].sort((a, b) => String(a).localeCompare(String(b)));
+  return el("div", { class: "bac-object-toolbar" },
+    el("input", {
+      type: "search", class: "nm-input bac-object-filter", placeholder: "Filter objects…",
+      "aria-label": "Filter objects", value: s.q,
+      oninput: (e) => { s.q = e.target.value; bwPointImportRefresh(); },
+    }),
+    el("div", { class: "bac-object-range" },
+      el("span", { class: "muted small" }, "Instance"),
+      el("input", { type: "number", class: "nm-input bac-range-input", placeholder: "min", "aria-label": "Minimum instance", value: s.min, oninput: (e) => { s.min = e.target.value; bwPointImportRefresh(); } }),
+      el("span", { class: "muted small" }, "–"),
+      el("input", { type: "number", class: "nm-input bac-range-input", placeholder: "max", "aria-label": "Maximum instance", value: s.max, oninput: (e) => { s.max = e.target.value; bwPointImportRefresh(); } }),
+    ),
+    types.length
+      ? el("details", {
+          class: "bac-type-filter", open: s.typesOpen ? "open" : undefined,
+          ontoggle: (e) => { s.typesOpen = e.target.open; },
+        },
+          el("summary", {}, `Types${s.typeFilter.size ? ` (${s.typeFilter.size})` : ""}`),
+          el("div", { class: "bac-type-chips" }, ...types.map((t) => {
+            const on = s.typeFilter.has(t);
+            return el("button", {
+              type: "button", class: `bac-type-chip${on ? " bac-type-chip-on" : ""}`,
+              onclick: () => { if (s.typeFilter.has(t)) s.typeFilter.delete(t); else s.typeFilter.add(t); bwOpenPointImportModal(); },
+            }, t);
+          })),
+        )
+      : null,
+  );
+}
+
+function bwPointImportRows() {
+  const s = bwPointImport;
+  const objects = bwPointImportFiltered();
+  if (!objects.length) {
+    return [el("li", { class: "muted small bac-object-empty" }, s.objects.length ? "No objects match the filter." : "No objects on this device.")];
+  }
+  const sorted = [...objects].sort((a, b) =>
+    String(a.typeName).localeCompare(String(b.typeName)) || Number(a.instance) - Number(b.instance));
+  const countByType = sorted.reduce((m, o) => m.set(o.typeName, (m.get(o.typeName) || 0) + 1), new Map());
+  const rows = [];
+  let lastType = null;
+  for (const o of sorted) {
+    if (o.typeName !== lastType) {
+      lastType = o.typeName;
+      rows.push(el("li", { class: "bac-object-group", role: "presentation" },
+        el("span", {}, lastType), el("span", { class: "muted small" }, String(countByType.get(lastType)))));
+    }
+    const key = `${o.objectType}:${o.instance}`;
+    const checked = s.selection.has(key);
+    const already = s.existing.has(bwPointImportRefOf(o));
+    rows.push(el("li", { class: `bac-object-row bw-import-row${checked ? " bac-object-checked" : ""}` },
+      el("input", {
+        type: "checkbox", class: "bac-object-check", checked: checked ? "checked" : undefined,
+        "aria-label": `Import ${o.typeName}:${o.instance}`,
+        onclick: (e) => { if (e.target.checked) s.selection.add(key); else s.selection.delete(key); bwPointImportRefresh(); },
+      }),
+      el("span", { class: "bac-object-type" }, `${o.typeName}:${o.instance}`),
+      el("span", { class: "bac-object-name" }, o.name || "", already ? el("span", { class: "muted small bw-import-already" }, " · modeled") : null),
+    ));
+  }
+  return rows;
+}
+
+function bwPointImportFooter() {
+  const s = bwPointImport;
+  const n = s.selection.size;
+  const visible = bwPointImportFiltered();
+  return el("div", { id: "bw-import-footer", class: "bw-import-footer" },
+    el("input", {
+      type: "text", class: "nm-input bac-name-template",
+      placeholder: "Name template (optional), e.g. {equip}-{type}{instance}",
+      title: "Tokens: {equip} {type} {instance} {name}. Blank keeps each object's own name.",
+      "aria-label": "Point name template", value: s.template,
+      oninput: (e) => { s.template = e.target.value; },
+    }),
+    el("button", { type: "button", class: "btn-ghost", onclick: () => { for (const o of visible) s.selection.add(`${o.objectType}:${o.instance}`); bwPointImportRefresh(); } }, `Select all (${visible.length})`),
+    el("button", { type: "button", class: "btn-ghost", onclick: () => { s.selection.clear(); bwPointImportRefresh(); } }, "Select none"),
+    el("button", {
+      type: "button", class: "btn bac-bulk-import", disabled: n ? undefined : "disabled",
+      onclick: bwImportSelectedPoints,
+    }, n ? `Import ${n} point${n === 1 ? "" : "s"}` : "Import points"),
+  );
+}
+
+function bwPointImportRefresh() {
+  const list = document.getElementById("bw-import-list");
+  if (list) list.replaceChildren(...bwPointImportRows());
+  const footer = document.getElementById("bw-import-footer");
+  if (footer) footer.replaceWith(bwPointImportFooter());
+}
+
+function bwImportSelectedPoints() {
+  const s = bwPointImport;
+  const inv = inventoryInstance();
+  if (!s || !inv) return;
+  const chosen = s.objects.filter((o) => s.selection.has(`${o.objectType}:${o.instance}`));
+  if (!chosen.length) { toast("Select one or more objects first.", "warn"); return; }
+  // Every object belongs to this one device → model all points under the selected equip.
+  const plan = bwPlanDeviceObjects({ device: s.device, objects: chosen, template: s.template });
+  const points = bwModelObjectsBatch({
+    siteId: s.equip.siteId, buildingId: s.equip.buildingId,
+    floorId: s.equip.floorId || s.equip.parentId, device: s.device, items: plan.items,
+  }).map((p) => ({ ...p, equipId: s.equip.id }));
+  const saved = inv.upsertMany(points);
+  bwSaveState();
+  closeModal();
+  logTo("building-workspace", `Imported ${saved.length} point${saved.length === 1 ? "" : "s"} into ${s.equip.name}.`, "ok");
+  toast(`Imported ${saved.length} point${saved.length === 1 ? "" : "s"} into ${s.equip.name}.`, "ok");
+  const refreshed = bwRefreshHistorianForEntity(inv, inv.getEntity(s.equip.id) || s.equip);
+  if (refreshed) histPersist();
+  bwSelectTreeEntity(inv.getEntity(s.equip.id) || s.equip);
 }
 
 function bwAddDevice(floorId) {
@@ -5426,6 +6155,7 @@ function bwSetTab(tab) {
   bw.tab = tab;
   bwSaveState();
   bwRenderWorkspaceScope();
+  setTimeout(bwSyncLivePoll, 0); // start/stop live poll for the new tab (after it mounts)
 }
 
 function bwTabs() {
@@ -5733,10 +6463,12 @@ function bwRenderTabScope() {
 function bwRenderModelScope({ tree = false, details = false, header = false } = {}) {
   const inv = inventoryInstance();
   if (!inv || currentPluginId() !== "building-workspace") {
+    bwStopLivePoll();
     renderScoped("page");
     return;
   }
   if (bw.tab !== "model") {
+    bwStopLivePoll();
     bwRenderTabScope();
     return;
   }
@@ -5746,6 +6478,7 @@ function bwRenderModelScope({ tree = false, details = false, header = false } = 
   if (details && detailsNode) detailsNode.replaceWith(bwModelDetails(inv));
   if (header) bwRenderHeaderAddon();
   if ((tree && !treeNode) || (details && !detailsNode)) bwRenderTabScope();
+  bwSyncLivePoll(); // start/stop the live poll to match the current selection
 }
 
 function bwRenderInboxScope() {
@@ -6031,7 +6764,322 @@ function bwDeviceDetails(inv, equip) {
         : null,
       el("select", { class: "nm-input bw-template-select", onchange: (e) => { bw.template = e.target.value; bwSaveState(); } },
         ...templates.map((t) => el("option", { value: t.id, selected: bw.template === t.id || bw.template === t.id.replace("template:", "") ? "selected" : undefined }, t.name)))),
+    bwDeviceLivePanel(inv, equip),
   ];
+}
+
+// ---- Phase 2: live control for a modeled point (present-value, status flags,
+// 16-slot priority array, inline write / relinquish / write+verify) ----
+
+// Auto-poll live data for the currently-selected point/device on the Model tab. The
+// poll updates only its own display container in place, so write inputs keep focus.
+let bwLive = null;          // point poll: { props } | { props:null, error }
+let bwDeviceLive = null;    // device poll: { values: Map(pointId -> { value, display } | { error }) }
+let bwLivePoll = null;      // { kind: "point" | "device", id }
+let bwLiveTimer = null;
+let bwLivePaused = false;
+let bwLiveBusyWrite = false;
+let bwLiveBusyPoll = false;  // guards against overlapping async ticks
+const BW_POINT_POLL_MS = 4000;
+const BW_DEVICE_POLL_MS = 12000;
+const BW_DEVICE_POLL_CAP = 60; // don't hammer a big device every tick
+
+function bwBacnetCap() {
+  return platform ? platform.capability("bacnet.read.v1") : bacnetRead();
+}
+
+// Build the BACnet object reference straight from the modeled point's own fields.
+function bwPointRef(point) {
+  const objectType = Number(point.objectType);
+  const instance = Number(point.instance);
+  if (!Number.isFinite(objectType) || !Number.isFinite(instance)) return null;
+  return { device: point.deviceRef || { deviceInstance: point.deviceInstance }, objectType, instance };
+}
+
+// Encode a write value by object type: binary -> enumerated 0/1, multistate -> unsigned, else real.
+function bwBacnetWriteValue(objectType, raw) {
+  const t = Number(objectType);
+  if ([3, 4, 5].includes(t)) return { kind: "enumerated", value: Number(raw) ? 1 : 0 };
+  if ([13, 14, 19].includes(t)) return { kind: "unsigned", value: Math.max(0, Math.round(Number(raw) || 0)) };
+  return { kind: "real", value: Number(raw) };
+}
+
+function bwPropEntry(props, id, name) {
+  return (props || []).find((p) => p && (p.id === id || p.name === name)) || null;
+}
+
+function bwLivePresentValue(props) {
+  const e = bwPropEntry(props, 85, "present-value");
+  if (!e || e.error || !Array.isArray(e.values) || !e.values.length) return { value: null, display: null };
+  return { value: e.values[0]?.value ?? null, display: e.display ?? String(e.values[0]?.value ?? "") };
+}
+
+function bwStopLivePoll() {
+  if (bwLiveTimer) { clearInterval(bwLiveTimer); bwLiveTimer = null; }
+  bwLivePoll = null;
+  bwLive = null;
+  bwDeviceLive = null;
+}
+
+function bwArmLiveTimer(ms) {
+  if (bwLiveTimer) { clearInterval(bwLiveTimer); bwLiveTimer = null; }
+  if (!bwLivePaused) bwLiveTimer = setInterval(bwLiveTick, ms);
+}
+
+// Start/stop the live poll to match the current single selection on the Model tab.
+// Idempotent: re-selecting the same entity does not restart the timer or drop data.
+function bwSyncLivePoll() {
+  const inv = inventoryInstance();
+  if (!inv || currentPluginId() !== "building-workspace" || bw.tab !== "model") { bwStopLivePoll(); return; }
+  const sel = bwSelectedEntities(inv);
+  const entity = sel.length === 1 ? sel[0] : null;
+  let target = null;
+  if (entity && entity.type === "point" && bwPointRef(entity)) target = { kind: "point", id: entity.id };
+  else if (entity && entity.type === "equip" && (entity.deviceInstance != null || entity.deviceRef)) target = { kind: "device", id: entity.id };
+  if (!target) { bwStopLivePoll(); return; }
+  if (bwLivePoll && bwLivePoll.kind === target.kind && bwLivePoll.id === target.id) return; // already live
+  bwStopLivePoll();
+  bwLivePoll = target;
+  bwLiveTick(); // immediate first read
+  bwArmLiveTimer(target.kind === "point" ? BW_POINT_POLL_MS : BW_DEVICE_POLL_MS);
+}
+
+function bwToggleLivePause() {
+  bwLivePaused = !bwLivePaused;
+  if (bwLivePaused) {
+    if (bwLiveTimer) { clearInterval(bwLiveTimer); bwLiveTimer = null; }
+  } else if (bwLivePoll) {
+    bwLiveTick();
+    bwArmLiveTimer(bwLivePoll.kind === "point" ? BW_POINT_POLL_MS : BW_DEVICE_POLL_MS);
+  }
+  const ind = document.getElementById("bw-live-indicator");
+  if (ind) ind.replaceWith(bwLiveIndicator());
+  const btn = document.getElementById("bw-live-pause");
+  if (btn) btn.textContent = bwLivePaused ? "Resume" : "Pause";
+}
+
+async function bwLiveTick() {
+  // Ticks run sequential async reads that can exceed the poll interval; the busy
+  // guard stops setInterval from stacking concurrent polling loops.
+  if (bwLiveBusyPoll) return;
+  const poll = bwLivePoll;
+  if (!poll) return;
+  const inv = inventoryInstance();
+  // Self-guard: stop if we navigated away or the target is no longer the lone selection.
+  if (!inv || currentPluginId() !== "building-workspace" || bw.tab !== "model") { bwStopLivePoll(); return; }
+  const entity = inv.getEntity(poll.id);
+  if (!entity) { bwStopLivePoll(); return; }
+  bwLiveBusyPoll = true;
+  try {
+    if (poll.kind === "point") {
+      const ref = bwPointRef(entity);
+      if (!ref) { bwStopLivePoll(); return; }
+      try {
+        const props = await bwBacnetCap().readPoint(ref.device, ref.objectType, ref.instance);
+        if (bwLivePoll !== poll) return; // selection moved mid-read
+        bwLive = { props };
+      } catch (err) {
+        if (bwLivePoll !== poll) return;
+        bwLive = { props: null, error: String(err) };
+      }
+      bwUpdateLiveDisplay(entity);
+    } else {
+      const points = inv.listEntities({ type: "point", equipId: entity.id }).slice(0, BW_DEVICE_POLL_CAP);
+      const values = bwDeviceLive?.values || new Map();
+      for (const p of points) {
+        if (bwLivePoll !== poll) return; // bail if selection moved
+        const ref = bwPointRef(p);
+        if (!ref) { values.set(p.id, { error: "no ref" }); continue; }
+        try {
+          const props = await bwBacnetCap().readPoint(ref.device, ref.objectType, ref.instance);
+          if (bwLivePoll !== poll) return; // stale read for a superseded selection
+          const pv = bwLivePresentValue(props);
+          values.set(p.id, { value: pv.value, display: pv.display });
+        } catch (err) {
+          if (bwLivePoll !== poll) return;
+          values.set(p.id, { error: String(err) });
+        }
+        bwDeviceLive = { values };
+        bwUpdateDeviceLive(entity); // progressive update as each point comes back
+      }
+    }
+  } finally {
+    bwLiveBusyPoll = false;
+  }
+}
+
+function bwLiveIndicator() {
+  return bwLivePaused
+    ? el("span", { id: "bw-live-indicator", class: "muted small bw-live-ind" }, "paused")
+    : el("span", { id: "bw-live-indicator", class: "bw-live-ind" }, el("span", { class: "bw-live-dot", title: "Polling live" }), el("span", { class: "muted small" }, "live"));
+}
+
+function bwLiveControls() {
+  return el("div", { class: "section-head bw-live-head" },
+    el("h4", {}, "Live"),
+    el("div", { class: "bw-live-head-right" },
+      bwLiveIndicator(),
+      el("button", { id: "bw-live-pause", class: "btn-ghost", onclick: bwToggleLivePause }, bwLivePaused ? "Resume" : "Pause"),
+    ),
+  );
+}
+
+function bwUpdateLiveDisplay(point) {
+  const node = document.getElementById("bw-live-display");
+  if (node) node.replaceChildren(...bwLiveDisplayChildren(point));
+  const ind = document.getElementById("bw-live-indicator");
+  if (ind) ind.replaceWith(bwLiveIndicator());
+}
+
+function bwUpdateDeviceLive(equip) {
+  const node = document.getElementById("bw-device-live");
+  if (node) node.replaceChildren(...bwDeviceLiveRows(equip));
+  const ind = document.getElementById("bw-live-indicator");
+  if (ind) ind.replaceWith(bwLiveIndicator());
+}
+
+function bwLiveDisplayChildren(point) {
+  const live = bwLive;
+  if (!live) return [el("p", { class: "muted small" }, "Reading…")];
+  if (!live.props) return [el("p", { class: "muted small" }, live.error ? `Read failed: ${live.error}` : "No data.")];
+  const pv = bwLivePresentValue(live.props);
+  const flagsEntry = bwPropEntry(live.props, 111, "status-flags");
+  const flags = flagsEntry ? interpretStatusFlags(flagsEntry.values?.[0]) : null;
+  const prioEntry = bwPropEntry(live.props, 87, "priority-array");
+  const parsed = prioEntry && Array.isArray(prioEntry.values) && prioEntry.values.length ? parsePriorityArray(prioEntry.values) : null;
+  const out = [
+    el("div", { class: "bw-live-pv" },
+      el("span", { class: "bw-live-pv-val" }, pv.display ?? String(pv.value ?? "—")),
+      flags && flags.raised.length
+        ? el("span", { class: "bw-live-flags" }, ...flags.raised.map((f) => el("span", { class: `bw-flag bw-flag-${f.replace(/[^a-z]/g, "")}` }, f)))
+        : el("span", { class: "muted small" }, "no active alarms"),
+    ),
+  ];
+  if (parsed) out.push(el("div", { class: "bw-prio-wrap" }, el("span", { class: "muted small" }, "Priority array (1 = highest)"), bwPriorityRibbon(point, parsed)));
+  return out;
+}
+
+function bwDeviceLiveRows(equip) {
+  const inv = inventoryInstance();
+  if (!inv) return [];
+  const points = inv.listEntities({ type: "point", equipId: equip.id });
+  if (!points.length) return [el("tr", {}, el("td", { class: "muted small", colspan: "3" }, "No modeled points yet — use Discover points."))];
+  const values = bwDeviceLive?.values || new Map();
+  const shown = points.slice(0, BW_DEVICE_POLL_CAP);
+  const rows = shown.map((p) => {
+    const v = values.get(p.id);
+    const cell = !v ? el("span", { class: "muted small" }, "…")
+      : v.error ? el("span", { class: "bw-live-err", title: v.error }, "err")
+      : el("span", { class: "bw-live-val" }, v.display ?? String(v.value ?? "—"));
+    return el("tr", { class: "bw-dlive-row", onclick: () => bwSelectTreeEntity(p) },
+      el("td", {}, p.name || p.id),
+      el("td", { class: "muted small" }, p.objectType != null && p.instance != null ? `${p.objectType}:${p.instance}` : ""),
+      el("td", { class: "bw-dlive-val" }, cell));
+  });
+  if (points.length > shown.length) {
+    rows.push(el("tr", {}, el("td", { class: "muted small", colspan: "3" }, `+${points.length - shown.length} more not polled (cap ${BW_DEVICE_POLL_CAP})`)));
+  }
+  return rows;
+}
+
+async function bwWritePoint(point, { value, priority, relinquish = false, verify = false }) {
+  const ref = bwPointRef(point);
+  if (!ref || bwLiveBusyWrite) return;
+  const pr = priority === "" || priority == null ? null : parseInt(priority, 10);
+  if (relinquish && pr == null) { toast("Relinquish needs a priority (the slot to release).", "warn"); return; }
+  // Guard against blank/invalid input silently coercing to 0 — a real hazard for
+  // setpoints and commandable outputs. Only relinquish (null write) is exempt.
+  if (!relinquish && (value === "" || value == null || !Number.isFinite(Number(value)))) {
+    toast("Enter a numeric value to write.", "warn");
+    return;
+  }
+  const writeVal = relinquish ? { kind: "null" } : bwBacnetWriteValue(ref.objectType, value);
+  bwLiveBusyWrite = true;
+  try {
+    const cap = bwBacnetCap();
+    await cap.writeProperty({ device: ref.device, objectType: ref.objectType, instance: ref.instance, property: 85, value: writeVal, priority: pr });
+    const label = relinquish ? `Released priority ${pr}` : `Wrote ${value}${pr != null ? ` @ p${pr}` : ""}`;
+    logTo("building-workspace", `${label} on ${point.name}.`, "ok");
+    if (verify && !relinquish) {
+      // Read back and confirm the command actually landed.
+      const props = await cap.readPoint(ref.device, ref.objectType, ref.instance);
+      bwLive = { props };
+      bwUpdateLiveDisplay(point);
+      const got = bwLivePresentValue(props).value;
+      const ok = commissioningValueMatches(got, writeVal.value);
+      toast(
+        ok ? `Verified: ${point.name} now reads ${got}` : `Write did NOT land — read back ${got ?? "—"} (stuck output or higher-priority override?)`,
+        ok ? "ok" : "error", ok ? 4000 : 7000,
+      );
+    } else {
+      toast(label, "ok");
+    }
+  } catch (err) {
+    toast(`Write failed: ${err}`, "error");
+    logTo("building-workspace", `Write failed on ${point.name}: ${err}`, "error");
+  } finally {
+    bwLiveBusyWrite = false;
+    // The next poll refreshes the ribbon; nudge one now so the slot updates immediately.
+    if (!bwLivePaused && bwLivePoll && bwLivePoll.kind === "point") bwLiveTick();
+  }
+}
+
+function bwPriorityRibbon(point, parsed) {
+  return el("div", { class: "bw-prio" },
+    ...parsed.slots.map((s) => el("div", {
+      class: `bw-prio-slot${s.active ? " bw-prio-on" : ""}${parsed.activeLevel === s.level ? " bw-prio-active" : ""}`,
+      title: s.active ? `Priority ${s.level} = ${s.value}${parsed.activeLevel === s.level ? " (commanding)" : ""}` : `Priority ${s.level} — empty`,
+    },
+      el("span", { class: "bw-prio-level" }, String(s.level)),
+      el("span", { class: "bw-prio-val" }, s.active ? String(s.value) : "—"),
+      s.active ? el("button", { class: "bw-prio-release", title: `Release priority ${s.level}`, onclick: () => bwWritePoint(point, { priority: s.level, relinquish: true }) }, "×") : null,
+    )),
+  );
+}
+
+function bwWriteControls(point, ref) {
+  const binary = [3, 4, 5].includes(Number(ref.objectType));
+  const valueInput = binary
+    ? el("select", { id: "bw-write-value", class: "nm-input bw-write-value" },
+        el("option", { value: "0" }, "inactive (0)"), el("option", { value: "1" }, "active (1)"))
+    : el("input", { id: "bw-write-value", type: "number", class: "nm-input bw-write-value", placeholder: "value", step: "any" });
+  const prioritySelect = el("select", { id: "bw-write-priority", class: "nm-input bw-write-priority", title: "Command priority (8 = manual operator)" },
+    ...Array.from({ length: 16 }, (_, i) => el("option", { value: String(i + 1), selected: i + 1 === 8 ? "selected" : undefined }, `priority ${i + 1}`)));
+  const readVal = () => document.getElementById("bw-write-value")?.value;
+  const readPrio = () => document.getElementById("bw-write-priority")?.value;
+  return el("div", { class: "bw-write-row" },
+    el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Value"), valueInput),
+    el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Priority"), prioritySelect),
+    el("button", { class: "btn", disabled: bw.busy ? "disabled" : undefined, onclick: () => bwWritePoint(point, { value: readVal(), priority: readPrio() }) }, "Write"),
+    el("button", { class: "btn btn-primary", disabled: bw.busy ? "disabled" : undefined, title: "Write, then read back and confirm it landed", onclick: () => bwWritePoint(point, { value: readVal(), priority: readPrio(), verify: true }) }, "Write & verify"),
+    el("button", { class: "btn-ghost", disabled: bw.busy ? "disabled" : undefined, title: "Release the selected priority slot", onclick: () => bwWritePoint(point, { priority: readPrio(), relinquish: true }) }, "Relinquish"),
+  );
+}
+
+// Auto-polling live panel for a selected point. The #bw-live-display container is what
+// the poll refreshes; write controls live outside it so typed values keep focus.
+function bwLivePanel(inv, point) {
+  const ref = bwPointRef(point);
+  if (!ref) return null;
+  const children = [
+    bwLiveControls(),
+    el("div", { id: "bw-live-display", class: "bw-live-display" }, ...bwLiveDisplayChildren(point)),
+  ];
+  if (point.tags?.writable) children.push(bwWriteControls(point, ref));
+  else children.push(el("p", { class: "muted small" }, "Read-only object (not commandable)."));
+  return el("div", { class: "bw-live" }, ...children);
+}
+
+// Auto-polling live values for every modeled point under a selected device.
+function bwDeviceLivePanel(inv, equip) {
+  if (!(equip.deviceInstance != null || equip.deviceRef)) return null;
+  return el("div", { class: "bw-live" },
+    bwLiveControls(),
+    el("div", { class: "table-scroll" },
+      el("table", { class: "bac-table bw-dlive-table" },
+        el("thead", {}, el("tr", {}, el("th", {}, "Point"), el("th", {}, "Object"), el("th", {}, "Live value"))),
+        el("tbody", { id: "bw-device-live" }, ...bwDeviceLiveRows(equip)))),
+  );
 }
 
 function bwPointDetails(inv, point) {
@@ -6042,6 +7090,7 @@ function bwPointDetails(inv, point) {
       bwDetailRow("Object", point.objectType != null && point.instance != null ? `${point.objectType}:${point.instance}` : ""),
       bwDetailRow("Source", (point.sourceRefs || []).join(", ")),
       bwDetailRow("Tags", Object.keys(point.tags || {}).join(", "))),
+    bwLivePanel(inv, point),
   ];
 }
 
@@ -6181,12 +7230,16 @@ async function bwRunCommissioning(inv) {
         property: 85,
         arrayIndex: null,
         priority,
-        value: relinquish ? { kind: "null" } : { kind: "real", value: Number(value) },
+        value: relinquish ? { kind: "null" } : bwBacnetWriteValue(ref.objectType, value),
       }),
       options: {
         min: bw.cxMin,
         max: bw.cxMax,
         notes: bw.cxNotes,
+        commandValue: String(bw.cxCommand ?? "").trim() === "" ? null : Number(bw.cxCommand),
+        verify: Boolean(bw.cxVerify),
+        toggleVerify: Boolean(bw.cxToggle),
+        priority: parseInt(bw.cxPriority, 10) || 8,
       },
     });
     const saved = inv.recordCommissioningRun(run);
@@ -6212,6 +7265,16 @@ function bwCommissioningTab(inv) {
       el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Min"), el("input", { class: "nm-input bac-range-input", value: bw.cxMin, oninput: (e) => { bw.cxMin = e.target.value; } })),
       el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Max"), el("input", { class: "nm-input bac-range-input", value: bw.cxMax, oninput: (e) => { bw.cxMax = e.target.value; } })),
       el("button", { class: "btn btn-primary", disabled: bw.busy || points.length === 0 ? "disabled" : undefined, onclick: () => bwRunCommissioning(inv) }, bw.busy ? "Running…" : "Run checks")),
+    el("div", { class: "bac-discover-controls bw-cx-command" },
+      el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Command (optional)"),
+        el("input", { class: "nm-input bac-range-input", placeholder: "value", value: bw.cxCommand || "", oninput: (e) => { bw.cxCommand = e.target.value; } })),
+      el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Priority"),
+        el("select", { class: "nm-input bw-write-priority", onchange: (e) => { bw.cxPriority = e.target.value; } },
+          ...Array.from({ length: 16 }, (_, i) => el("option", { value: String(i + 1), selected: String(i + 1) === String(bw.cxPriority || "8") ? "selected" : undefined }, `p${i + 1}`)))),
+      el("label", { class: "bw-cx-check" }, el("input", { type: "checkbox", checked: bw.cxVerify ? "checked" : undefined, onchange: (e) => { bw.cxVerify = e.target.checked; } }), el("span", {}, "Verify writes (read back)")),
+      el("label", { class: "bw-cx-check" }, el("input", { type: "checkbox", checked: bw.cxToggle ? "checked" : undefined, onchange: (e) => { bw.cxToggle = e.target.checked; } }), el("span", {}, "Toggle binary outputs")),
+    ),
+    el("p", { class: "muted small" }, "Checks read present-value + range. A command value (or toggle) writes to writable points at the chosen priority, optionally verifies the read-back, then relinquishes."),
     el("textarea", { class: "nm-input bw-notes", rows: "3", placeholder: "Operator notes", oninput: (e) => { bw.cxNotes = e.target.value; } }, bw.cxNotes),
     run
       ? el("ol", { class: "plugin-log" },
@@ -6259,6 +7322,7 @@ function renderBuildingWorkspacePage() {
         el("p", { class: "muted" }, "Building Workspace unavailable — the platform kernel did not resolve inventory dependencies.")));
   }
   const body = bwCurrentTabBody(inv);
+  setTimeout(bwSyncLivePoll, 0); // after this page mounts, sync the live poll to the selection
   return el("div", { id: "bw-root", class: "plugin-controls bw-root" },
     bwTabs(),
     el("div", { id: "bw-tab-body" }, body),
@@ -7275,6 +8339,7 @@ listen("clipboardtyper:typed", (event) => {
 // ish; the backend also self-terminates the keep-alive after repeated failures.
 window.addEventListener("pagehide", () => {
   flushUserStatePersistence();
+  bwStopLivePoll();
   if (packFlushTimer) {
     clearInterval(packFlushTimer);
     packFlushTimer = null;

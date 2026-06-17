@@ -175,6 +175,20 @@ export function buildFactories(invoke, options = {}) {
       /** Cancel a COV subscription created by subscribeCov. */
       unsubscribeCov: ({ device, objectType, instance, processId }) =>
         invoke("bacnet_unsubscribe_cov", { device, objectType, instance, processId }),
+      /** Register as a foreign device with a BBMD so broadcast discovery reaches
+       *  other IP subnets. Resolves to { bbmd, ttlSeconds }. */
+      registerForeignDevice: ({ bbmd, ttlSeconds = null }) =>
+        invoke("bacnet_register_foreign_device", { bbmd, ttlSeconds }),
+      /** Stop the foreign-device registration (the BBMD drops us at TTL expiry). */
+      unregisterForeignDevice: () => invoke("bacnet_unregister_foreign_device"),
+      /** The active foreign-device registration, or null. */
+      foreignDeviceStatus: () => invoke("bacnet_foreign_device_status"),
+      /** List a device's active / unacknowledged alarms (GetEventInformation,
+       *  falling back to GetAlarmSummary). */
+      getAlarms: (device) => invoke("bacnet_get_alarms", { device }),
+      /** Acknowledge an alarm on an event-initiating object (a write). */
+      acknowledgeAlarm: ({ device, objectType, instance }) =>
+        invoke("bacnet_acknowledge_alarm", { device, objectType, instance }),
       /** Whether discovery-target suggestions are available (netscan present). */
       canSuggestTargets: () => netscan != null,
       /** Suggest live hosts on a subnet as discovery targets (requires netscan). */

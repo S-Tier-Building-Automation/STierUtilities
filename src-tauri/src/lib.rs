@@ -62,6 +62,15 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_shell::init());
 
+    // Dev-only MCP Bridge: lets the Tauri MCP server drive the webview/IPC.
+    // Debug builds only, bound to localhost so it isn't reachable off-box.
+    #[cfg(debug_assertions)]
+    let builder = builder.plugin(
+        tauri_plugin_mcp_bridge::Builder::new()
+            .bind_address("127.0.0.1")
+            .build(),
+    );
+
     #[cfg(windows)]
     let builder = builder.invoke_handler(tauri::generate_handler![
         app_open_data_dir,
@@ -121,6 +130,11 @@ pub fn run() {
         bacnet::bacnet_read_trend,
         bacnet::bacnet_subscribe_cov,
         bacnet::bacnet_unsubscribe_cov,
+        bacnet::bacnet_register_foreign_device,
+        bacnet::bacnet_unregister_foreign_device,
+        bacnet::bacnet_foreign_device_status,
+        bacnet::bacnet_get_alarms,
+        bacnet::bacnet_acknowledge_alarm,
     ]);
 
     #[cfg(windows)]

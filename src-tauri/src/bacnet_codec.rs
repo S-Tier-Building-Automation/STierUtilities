@@ -25,9 +25,7 @@ pub const BVLL_TYPE_BACNET_IP: u8 = 0x81;
 // kept for the BBMD registration path (cross-subnet discovery).
 pub const BVLC_RESULT: u8 = 0x00;
 pub const BVLC_FORWARDED_NPDU: u8 = 0x04;
-#[allow(dead_code)]
 pub const BVLC_REGISTER_FOREIGN_DEVICE: u8 = 0x05;
-#[allow(dead_code)]
 pub const BVLC_DISTRIBUTE_BROADCAST: u8 = 0x09;
 pub const BVLC_ORIGINAL_UNICAST: u8 = 0x0A;
 pub const BVLC_ORIGINAL_BROADCAST: u8 = 0x0B;
@@ -48,12 +46,15 @@ pub const SERVICE_UNCONFIRMED_COV_NOTIFICATION: u8 = 2;
 pub const SERVICE_WHO_IS: u8 = 8;
 
 // Confirmed service choices.
+pub const SERVICE_ACKNOWLEDGE_ALARM: u8 = 0;
 pub const SERVICE_CONFIRMED_COV_NOTIFICATION: u8 = 1;
+pub const SERVICE_GET_ALARM_SUMMARY: u8 = 3;
 pub const SERVICE_SUBSCRIBE_COV: u8 = 5;
 pub const SERVICE_READ_PROPERTY: u8 = 12;
 pub const SERVICE_READ_PROPERTY_MULTIPLE: u8 = 14;
 pub const SERVICE_WRITE_PROPERTY: u8 = 15;
 pub const SERVICE_READ_RANGE: u8 = 26;
+pub const SERVICE_GET_EVENT_INFORMATION: u8 = 29;
 
 // Confirmed-request octet-0 flag bits (clause 20.1.2).
 /// SEG — this request is itself segmented (we never send segmented requests).
@@ -95,6 +96,9 @@ pub const OBJECT_TYPE_DEVICE: u16 = 8;
 /// here as the canonical constant and used by the codec tests).
 #[allow(dead_code)]
 pub const OBJECT_TYPE_TREND_LOG: u16 = 20;
+/// Trend-log-multiple object type. Its log-buffer holds `BACnetLogMultipleRecord`
+/// (several datums per timestamp) rather than the single-datum `BACnetLogRecord`.
+pub const OBJECT_TYPE_TREND_LOG_MULTIPLE: u16 = 27;
 
 // ---------------------------------------------------------------------------
 // Object identifier
@@ -680,15 +684,13 @@ pub fn bvlc_decode(buf: &[u8]) -> Result<Bvlc, String> {
 }
 
 /// Builds a complete Register-Foreign-Device frame (for reaching devices across
-/// subnets via a BBMD). Not yet wired to a command; kept with its tests for the
-/// foreign-device feature.
-#[allow(dead_code)]
+/// subnets via a BBMD). The BBMD adds us to its Foreign Device Table for
+/// `ttl_seconds` (plus a 30 s grace period) and forwards broadcasts to us.
 pub fn encode_register_foreign_device(ttl_seconds: u16) -> Vec<u8> {
     bvlc_encode(BVLC_REGISTER_FOREIGN_DEVICE, &ttl_seconds.to_be_bytes())
 }
 
 /// Extracts the result code from a BVLC-Result frame payload (0x0000 = success).
-#[allow(dead_code)]
 pub fn decode_bvlc_result(frame: &[u8]) -> Option<u16> {
     if frame.len() >= 6 && frame[0] == BVLL_TYPE_BACNET_IP && frame[1] == BVLC_RESULT {
         Some(u16::from_be_bytes([frame[4], frame[5]]))
@@ -839,7 +841,15 @@ pub enum Apdu {
         window: u8,
         payload_offset: usize,
     },
-    SegmentAck { invoke_id: u8 },
+    SegmentAck {
+        invoke_id: u8,
+        /// NAK: the peer is asking us to retransmit from `sequence`.
+        negative: bool,
+        /// Last in-order segment the peer acknowledges.
+        sequence: u8,
+        /// Window the peer grants before it must ack again.
+        window: u8,
+    },
     Error { invoke_id: u8, service: u8, error_class: u32, error_code: u32 },
     Reject { invoke_id: u8, reason: u8 },
     Abort { invoke_id: u8, reason: u8 },
@@ -886,7 +896,12 @@ pub fn decode_apdu(buf: &[u8]) -> Result<Apdu, String> {
                 payload_offset: svc_at + 1,
             })
         }
-        PDU_SEGMENT_ACK => Ok(Apdu::SegmentAck { invoke_id: *buf.get(1).ok_or_else(err_short)? }),
+        PDU_SEGMENT_ACK => Ok(Apdu::SegmentAck {
+            invoke_id: *buf.get(1).ok_or_else(err_short)?,
+            negative: first & 0x02 != 0,
+            sequence: *buf.get(2).ok_or_else(err_short)?,
+            window: *buf.get(3).ok_or_else(err_short)?,
+        }),
         PDU_ERROR => {
             let invoke_id = *buf.get(1).ok_or_else(err_short)?;
             let service = *buf.get(2).ok_or_else(err_short)?;
@@ -945,6 +960,26 @@ pub fn encode_segment_ack(negative: bool, server: bool, invoke_id: u8, sequence:
         octet0 |= 0x01; // SRV
     }
     vec![octet0, invoke_id, sequence, window]
+}
+
+/// Builds one segment of a segmented ConfirmedRequest. `body_chunk` is a slice
+/// of the concatenated service-choice + service-request octets (i.e. an
+/// unsegmented request APDU with its 3-byte header removed). The SA flag is kept
+/// so the peer may still segment its reply back to us.
+pub fn encode_confirmed_request_segment(
+    invoke_id: u8,
+    sequence: u8,
+    window: u8,
+    more: bool,
+    body_chunk: &[u8],
+) -> Vec<u8> {
+    let mut octet0 = PDU_CONFIRMED | APDU_FLAG_SA | APDU_FLAG_SEGMENTED;
+    if more {
+        octet0 |= APDU_FLAG_MORE;
+    }
+    let mut buf = vec![octet0, MAX_SEGS_MAX_APDU, invoke_id, sequence, window];
+    buf.extend_from_slice(body_chunk);
+    buf
 }
 
 // ---------------------------------------------------------------------------
@@ -1468,6 +1503,22 @@ pub struct LogRecord {
     pub status: Option<String>,
 }
 
+/// Decodes a BIT STRING content octet stream (leading unused-bits count + data)
+/// into a `BacnetValue::BitString`. Empty content yields an empty bit string.
+fn decode_bitstring_content(content: &[u8]) -> BacnetValue {
+    if content.is_empty() {
+        return BacnetValue::BitString { unused_bits: 0, bits: String::new() };
+    }
+    let unused = content[0].min(7);
+    let total = (content.len() - 1) * 8;
+    let usable = total.saturating_sub(unused as usize);
+    let mut bits = String::with_capacity(usable);
+    for i in 0..usable {
+        bits.push(if (content[1 + i / 8] >> (7 - (i % 8))) & 1 == 1 { '1' } else { '0' });
+    }
+    BacnetValue::BitString { unused_bits: unused, bits }
+}
+
 /// Interprets a context-tagged logDatum CHOICE value into a BacnetValue.
 /// Tags (clause 21 BACnetLogRecord.logDatum): 0 log-status (bitstring),
 /// 1 boolean, 2 real, 3 enumerated, 4 unsigned, 5 signed, 6 bitstring, 7 null.
@@ -1480,19 +1531,45 @@ fn decode_log_datum(number: u8, content: &[u8]) -> BacnetValue {
         3 => BacnetValue::Enumerated { value: decode_unsigned_content(content).unwrap_or(0) as u32 },
         4 => BacnetValue::Unsigned { value: decode_unsigned_content(content).unwrap_or(0) },
         5 => BacnetValue::Signed { value: decode_signed_content(content).unwrap_or(0) },
-        0 | 6 if !content.is_empty() => {
-            let unused = content[0].min(7);
-            let total = (content.len() - 1) * 8;
-            let usable = total.saturating_sub(unused as usize);
-            let mut bits = String::with_capacity(usable);
-            for i in 0..usable {
-                bits.push(if (content[1 + i / 8] >> (7 - (i % 8))) & 1 == 1 { '1' } else { '0' });
-            }
-            BacnetValue::BitString { unused_bits: unused, bits }
-        }
+        0 | 6 if !content.is_empty() => decode_bitstring_content(content),
         7 => BacnetValue::Null,
         n => BacnetValue::Unknown { tag: n, hex: hex_string(content) },
     }
+}
+
+/// Interprets one datum of a `BACnetLogMultipleRecord`'s `log-data` SEQUENCE.
+/// The inner CHOICE tags differ from the single-record logDatum (clause 21):
+/// 0 boolean, 1 real, 2 enumerated, 3 unsigned, 4 signed, 5 bitstring, 6 null,
+/// 7 failure (Error). `any-value` [8] is handled separately by the caller.
+fn decode_log_multiple_datum(number: u8, content: &[u8]) -> BacnetValue {
+    match number {
+        0 => BacnetValue::Boolean { value: content.first().map(|b| *b != 0).unwrap_or(false) },
+        1 if content.len() == 4 => {
+            BacnetValue::Real { value: f32::from_be_bytes([content[0], content[1], content[2], content[3]]) }
+        }
+        2 => BacnetValue::Enumerated { value: decode_unsigned_content(content).unwrap_or(0) as u32 },
+        3 => BacnetValue::Unsigned { value: decode_unsigned_content(content).unwrap_or(0) },
+        4 => BacnetValue::Signed { value: decode_signed_content(content).unwrap_or(0) },
+        5 if !content.is_empty() => decode_bitstring_content(content),
+        6 => BacnetValue::Null,
+        n => BacnetValue::Unknown { tag: n, hex: hex_string(content) },
+    }
+}
+
+/// Names the raised bits of a BACnetLogStatus (bit 0 log-disabled, 1 buffer-
+/// purged, 2 log-interrupted), e.g. for a status-only trend record.
+fn log_status_names(content: &[u8]) -> String {
+    let BacnetValue::BitString { bits, .. } = decode_bitstring_content(content) else {
+        return String::new();
+    };
+    const NAMES: [&str; 3] = ["log-disabled", "buffer-purged", "log-interrupted"];
+    let raised: Vec<&str> = bits
+        .chars()
+        .enumerate()
+        .filter(|(_, c)| *c == '1')
+        .filter_map(|(i, _)| NAMES.get(i).copied())
+        .collect();
+    if raised.is_empty() { "ok".into() } else { raised.join(", ") }
 }
 
 /// Decodes a list of BACnetLogRecords from itemData bytes (best-effort: stops at
@@ -1591,6 +1668,437 @@ fn decode_one_log_record(buf: &[u8]) -> Result<(LogRecord, usize), String> {
     }
 
     Ok((LogRecord { date, time, datum, status }, at))
+}
+
+/// One decoded trend-log-multiple record: a timestamp plus the set of datums
+/// logged at that instant (one per monitored property). `status` is set instead
+/// of `data` when the record is a log-status marker (buffer-purged, etc.).
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogMultipleRecord {
+    pub date: Option<BacnetValue>,
+    pub time: Option<BacnetValue>,
+    pub data: Vec<BacnetValue>,
+    pub status: Option<String>,
+}
+
+/// Decodes a list of `BACnetLogMultipleRecord`s from itemData bytes (best-effort,
+/// stopping at the first malformed record like [`decode_log_records`]).
+pub fn decode_log_multiple_records(item_data: &[u8]) -> Vec<LogMultipleRecord> {
+    let mut records = Vec::new();
+    let mut at = 0usize;
+    while at < item_data.len() {
+        match decode_one_log_multiple_record(&item_data[at..]) {
+            Ok((rec, n)) if n > 0 => {
+                records.push(rec);
+                at += n;
+            }
+            _ => break,
+        }
+    }
+    records
+}
+
+fn decode_one_log_multiple_record(buf: &[u8]) -> Result<(LogMultipleRecord, usize), String> {
+    let mut at = 0usize;
+    let mut date = None;
+    let mut time = None;
+
+    // [0] timestamp = BACnetDateTime { date, time } — identical to the single record.
+    let t = decode_tag(buf.get(at..).ok_or_else(err_short)?)?;
+    if t.opening && t.context && t.number == 0 {
+        at += t.header_len;
+        let end = find_closing(buf.get(at..).ok_or_else(err_short)?, 0)?;
+        let inner = buf.get(at..at + end).ok_or_else(err_short)?;
+        let mut i = 0usize;
+        if let Some(rest) = inner.get(i..) {
+            if let Ok((d, n)) = decode_application_value(rest) {
+                i += n;
+                date = Some(d);
+            }
+        }
+        if let Some(rest) = inner.get(i..) {
+            if let Ok((tm, _)) = decode_application_value(rest) {
+                time = Some(tm);
+            }
+        }
+        at += end;
+        at += decode_tag(buf.get(at..).ok_or_else(err_short)?)?.header_len; // closing 0
+    }
+
+    // [1] logData = CHOICE { log-status [0], log-data [1] SEQUENCE OF, time-change [2] }.
+    let t = decode_tag(buf.get(at..).ok_or_else(err_short)?)?;
+    if !(t.opening && t.context && t.number == 1) {
+        return Err("log multiple record: expected opening tag 1 (logData)".into());
+    }
+    at += t.header_len;
+
+    let mut data: Vec<BacnetValue> = Vec::new();
+    let mut status: Option<String> = None;
+
+    let choice = decode_tag(buf.get(at..).ok_or_else(err_short)?)?;
+    if choice.context && !choice.opening && !choice.closing && choice.number == 0 {
+        // log-status [0]: a primitive bit string.
+        let cstart = at + choice.header_len;
+        let content = buf.get(cstart..cstart + choice.lvt as usize).ok_or_else(err_short)?;
+        status = Some(log_status_names(content));
+        at = cstart + choice.lvt as usize;
+    } else if choice.opening && choice.context && choice.number == 1 {
+        // log-data [1]: a SEQUENCE OF datum CHOICE — read until the closing [1].
+        at += choice.header_len;
+        loop {
+            let dt = decode_tag(buf.get(at..).ok_or_else(err_short)?)?;
+            if dt.closing && dt.context && dt.number == 1 {
+                at += dt.header_len;
+                break;
+            }
+            if dt.opening {
+                // any-value [8]: wraps an application-tagged value.
+                let inner_start = at + dt.header_len;
+                if let Ok((v, _)) = decode_application_value(buf.get(inner_start..).ok_or_else(err_short)?) {
+                    data.push(v);
+                }
+                let end = find_closing(buf.get(inner_start..).ok_or_else(err_short)?, dt.number)?;
+                at = inner_start + end;
+                at += decode_tag(buf.get(at..).ok_or_else(err_short)?)?.header_len; // closing
+            } else {
+                let cstart = at + dt.header_len;
+                let content = buf.get(cstart..cstart + dt.lvt as usize).ok_or_else(err_short)?;
+                data.push(decode_log_multiple_datum(dt.number, content));
+                at = cstart + dt.lvt as usize;
+            }
+        }
+    } else if choice.context && !choice.opening && !choice.closing && choice.number == 2 {
+        // time-change [2]: a primitive REAL (clock adjustment in seconds).
+        let cstart = at + choice.header_len;
+        let content = buf.get(cstart..cstart + choice.lvt as usize).ok_or_else(err_short)?;
+        if content.len() == 4 {
+            data.push(BacnetValue::Real {
+                value: f32::from_be_bytes([content[0], content[1], content[2], content[3]]),
+            });
+        }
+        at = cstart + choice.lvt as usize;
+    } else {
+        return Err("log multiple record: unexpected logData CHOICE".into());
+    }
+
+    // closing [1] logData.
+    let ct = decode_tag(buf.get(at..).ok_or_else(err_short)?)?;
+    if ct.closing && ct.context && ct.number == 1 {
+        at += ct.header_len;
+    }
+
+    Ok((LogMultipleRecord { date, time, data, status }, at))
+}
+
+// ---------------------------------------------------------------------------
+// Alarms & events (GetEventInformation / GetAlarmSummary)
+// ---------------------------------------------------------------------------
+
+/// A BACnetTimeStamp CHOICE: a wall-clock time, a sequence number, or a full
+/// date-time. Used by event summaries to mark when each transition occurred.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BacnetTimeStamp {
+    Time(BacnetValue),
+    Sequence(u32),
+    DateTime { date: Option<BacnetValue>, time: Option<BacnetValue> },
+}
+
+/// One BACnetEventSummary from a GetEventInformation-ACK.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventSummary {
+    pub object: ObjectId,
+    pub event_state: u32,
+    /// acknowledged-transitions bit string (to-offnormal, to-fault, to-normal).
+    pub acknowledged_transitions: String,
+    /// One timestamp per transition (to-offnormal, to-fault, to-normal).
+    pub event_timestamps: Vec<BacnetTimeStamp>,
+    pub notify_type: u32,
+    pub event_enable: String,
+    /// Priority per transition (to-offnormal, to-fault, to-normal).
+    pub event_priorities: Vec<u32>,
+}
+
+/// A decoded GetEventInformation-ACK.
+#[derive(Debug, Clone, PartialEq)]
+pub struct GetEventInformationResult {
+    pub summaries: Vec<EventSummary>,
+    pub more_events: bool,
+}
+
+/// One entry of the older GetAlarmSummary-ACK (no timestamps / priorities).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlarmSummaryEntry {
+    pub object: ObjectId,
+    pub alarm_state: u32,
+    pub acknowledged_transitions: String,
+}
+
+/// Encodes a GetEventInformation request. `last_received` resumes a paged scan
+/// from the object after the one given (omitted on the first request).
+pub fn encode_get_event_information(invoke_id: u8, last_received: Option<ObjectId>) -> Vec<u8> {
+    let mut buf = confirmed_header(invoke_id, SERVICE_GET_EVENT_INFORMATION);
+    if let Some(obj) = last_received {
+        encode_context_object_id(&mut buf, 0, obj);
+    }
+    buf
+}
+
+/// Encodes a GetAlarmSummary request (no parameters).
+pub fn encode_get_alarm_summary(invoke_id: u8) -> Vec<u8> {
+    confirmed_header(invoke_id, SERVICE_GET_ALARM_SUMMARY)
+}
+
+/// Encodes the CHOICE content of a BACnetTimeStamp (without the surrounding
+/// context wrapper the caller provides). time [0] / sequenceNumber [1] /
+/// dateTime [2]; an unknown timestamp falls back to a wildcard dateTime.
+fn encode_timestamp_inner(buf: &mut Vec<u8>, ts: &BacnetTimeStamp) {
+    match ts {
+        BacnetTimeStamp::Time(BacnetValue::Time { hour, minute, second, hundredths }) => {
+            encode_tag(buf, 0, true, 4);
+            buf.extend_from_slice(&[*hour, *minute, *second, *hundredths]);
+        }
+        BacnetTimeStamp::Sequence(n) => encode_context_unsigned(buf, 1, *n as u64),
+        BacnetTimeStamp::DateTime { date, time } => {
+            encode_opening_tag(buf, 2);
+            encode_application_value(
+                buf,
+                date.as_ref().unwrap_or(&BacnetValue::Date { year: 0, month: 0xFF, day: 0xFF, weekday: 0xFF }),
+            );
+            encode_application_value(
+                buf,
+                time.as_ref().unwrap_or(&BacnetValue::Time { hour: 0xFF, minute: 0xFF, second: 0xFF, hundredths: 0xFF }),
+            );
+            encode_closing_tag(buf, 2);
+        }
+        // Any other shape (e.g. a non-Time inside Time): emit a wildcard dateTime.
+        _ => {
+            encode_opening_tag(buf, 2);
+            encode_application_value(buf, &BacnetValue::Date { year: 0, month: 0xFF, day: 0xFF, weekday: 0xFF });
+            encode_application_value(buf, &BacnetValue::Time { hour: 0xFF, minute: 0xFF, second: 0xFF, hundredths: 0xFF });
+            encode_closing_tag(buf, 2);
+        }
+    }
+}
+
+/// Encodes a context-tagged CharacterString (charset octet 0 = UTF-8).
+fn encode_context_charstring(buf: &mut Vec<u8>, tag_number: u8, s: &str) {
+    let bytes = s.as_bytes();
+    encode_tag(buf, tag_number, true, 1 + bytes.len() as u32);
+    buf.push(0);
+    buf.extend_from_slice(bytes);
+}
+
+/// Encodes an AcknowledgeAlarm request. `event_timestamp` is the timestamp of
+/// the transition being acknowledged (the device matches it); `time_of_ack` is
+/// when we acknowledged. Returns a SimpleACK on success.
+#[allow(clippy::too_many_arguments)]
+pub fn encode_acknowledge_alarm(
+    invoke_id: u8,
+    process_id: u32,
+    event_object: ObjectId,
+    event_state: u32,
+    event_timestamp: &BacnetTimeStamp,
+    source: &str,
+    time_of_ack: &BacnetTimeStamp,
+) -> Vec<u8> {
+    let mut buf = confirmed_header(invoke_id, SERVICE_ACKNOWLEDGE_ALARM);
+    encode_context_unsigned(&mut buf, 0, process_id as u64);
+    encode_context_object_id(&mut buf, 1, event_object);
+    encode_context_unsigned(&mut buf, 2, event_state as u64);
+    encode_opening_tag(&mut buf, 3);
+    encode_timestamp_inner(&mut buf, event_timestamp);
+    encode_closing_tag(&mut buf, 3);
+    encode_context_charstring(&mut buf, 4, source);
+    encode_opening_tag(&mut buf, 5);
+    encode_timestamp_inner(&mut buf, time_of_ack);
+    encode_closing_tag(&mut buf, 5);
+    buf
+}
+
+/// Decodes a context-tagged BIT STRING into its bit run (e.g. "110").
+fn decode_context_bitstring(buf: &[u8], expected: u8) -> Result<(String, usize), String> {
+    let t = decode_tag(buf)?;
+    if !t.context || t.opening || t.closing || t.number != expected {
+        return Err(format!("expected context bitstring tag {expected}"));
+    }
+    let content = buf
+        .get(t.header_len..t.header_len + t.lvt as usize)
+        .ok_or_else(err_short)?;
+    let BacnetValue::BitString { bits, .. } = decode_bitstring_content(content) else {
+        return Err("bad bitstring".into());
+    };
+    Ok((bits, t.header_len + t.lvt as usize))
+}
+
+/// Decodes one BACnetTimeStamp CHOICE (time [0] / sequenceNumber [1] / dateTime [2]).
+fn decode_timestamp(buf: &[u8]) -> Result<(BacnetTimeStamp, usize), String> {
+    let t = decode_tag(buf)?;
+    if t.context && t.number == 0 && !t.opening && !t.closing {
+        let content = buf
+            .get(t.header_len..t.header_len + t.lvt as usize)
+            .ok_or_else(err_short)?;
+        if content.len() < 4 {
+            return Err("BACnetTimeStamp time too short".into());
+        }
+        let time = BacnetValue::Time {
+            hour: content[0],
+            minute: content[1],
+            second: content[2],
+            hundredths: content[3],
+        };
+        Ok((BacnetTimeStamp::Time(time), t.header_len + t.lvt as usize))
+    } else if t.context && t.number == 1 && !t.opening && !t.closing {
+        let (seq, n) = decode_context_unsigned(buf, 1)?;
+        Ok((BacnetTimeStamp::Sequence(seq as u32), n))
+    } else if t.opening && t.context && t.number == 2 {
+        let mut at = t.header_len;
+        let mut date = None;
+        let mut time = None;
+        if let Ok((d, n)) = decode_application_value(buf.get(at..).ok_or_else(err_short)?) {
+            date = Some(d);
+            at += n;
+        }
+        if let Ok((tm, n)) = decode_application_value(buf.get(at..).ok_or_else(err_short)?) {
+            time = Some(tm);
+            at += n;
+        }
+        let c = decode_tag(buf.get(at..).ok_or_else(err_short)?)?; // closing 2
+        at += c.header_len;
+        Ok((BacnetTimeStamp::DateTime { date, time }, at))
+    } else {
+        Err("unexpected BACnetTimeStamp tag".into())
+    }
+}
+
+/// Decodes one BACnetEventSummary (the context-tagged fields of a summary).
+fn decode_event_summary(buf: &[u8]) -> Result<(EventSummary, usize), String> {
+    let mut at = 0usize;
+    let (object, n) = decode_context_object_id(buf, 0)?;
+    at += n;
+    let (event_state, n) = decode_context_unsigned(buf.get(at..).ok_or_else(err_short)?, 1)?;
+    at += n;
+    let (acknowledged_transitions, n) = decode_context_bitstring(buf.get(at..).ok_or_else(err_short)?, 2)?;
+    at += n;
+
+    // [3] eventTimeStamps (opening .. 3× BACnetTimeStamp .. closing).
+    let t = decode_tag(buf.get(at..).ok_or_else(err_short)?)?;
+    if !(t.opening && t.context && t.number == 3) {
+        return Err("event summary: expected opening tag 3 (timestamps)".into());
+    }
+    at += t.header_len;
+    let mut event_timestamps = Vec::new();
+    loop {
+        let tt = decode_tag(buf.get(at..).ok_or_else(err_short)?)?;
+        if tt.closing && tt.context && tt.number == 3 {
+            at += tt.header_len;
+            break;
+        }
+        let (ts, n) = decode_timestamp(buf.get(at..).ok_or_else(err_short)?)?;
+        event_timestamps.push(ts);
+        at += n;
+    }
+
+    let (notify_type, n) = decode_context_unsigned(buf.get(at..).ok_or_else(err_short)?, 4)?;
+    at += n;
+    let (event_enable, n) = decode_context_bitstring(buf.get(at..).ok_or_else(err_short)?, 5)?;
+    at += n;
+
+    // [6] eventPriorities (opening .. 3× Unsigned .. closing).
+    let t = decode_tag(buf.get(at..).ok_or_else(err_short)?)?;
+    if !(t.opening && t.context && t.number == 6) {
+        return Err("event summary: expected opening tag 6 (priorities)".into());
+    }
+    at += t.header_len;
+    let mut event_priorities = Vec::new();
+    loop {
+        let tt = decode_tag(buf.get(at..).ok_or_else(err_short)?)?;
+        if tt.closing && tt.context && tt.number == 6 {
+            at += tt.header_len;
+            break;
+        }
+        let (v, n) = decode_application_value(buf.get(at..).ok_or_else(err_short)?)?;
+        if let BacnetValue::Unsigned { value } = v {
+            event_priorities.push(value as u32);
+        }
+        at += n;
+    }
+
+    Ok((
+        EventSummary {
+            object,
+            event_state: event_state as u32,
+            acknowledged_transitions,
+            event_timestamps,
+            notify_type: notify_type as u32,
+            event_enable,
+            event_priorities,
+        },
+        at,
+    ))
+}
+
+/// Decodes a GetEventInformation-ACK service payload (bytes after the service choice).
+pub fn decode_get_event_information_ack(payload: &[u8]) -> Result<GetEventInformationResult, String> {
+    let mut at = 0usize;
+    let t = decode_tag(payload.get(at..).ok_or_else(err_short)?)?;
+    if !(t.opening && t.context && t.number == 0) {
+        return Err("GetEventInformation-ACK: expected opening tag 0".into());
+    }
+    at += t.header_len;
+
+    let mut summaries = Vec::new();
+    loop {
+        let tt = decode_tag(payload.get(at..).ok_or_else(err_short)?)?;
+        if tt.closing && tt.context && tt.number == 0 {
+            at += tt.header_len;
+            break;
+        }
+        let (s, n) = decode_event_summary(payload.get(at..).ok_or_else(err_short)?)?;
+        if n == 0 {
+            break;
+        }
+        summaries.push(s);
+        at += n;
+    }
+
+    // [1] moreEvents (context boolean — one content octet).
+    let mut more_events = false;
+    if let Some(rest) = payload.get(at..) {
+        if !rest.is_empty() {
+            let tt = decode_tag(rest)?;
+            if tt.context && tt.number == 1 && !tt.opening && !tt.closing {
+                more_events = rest.get(tt.header_len).map(|b| *b != 0).unwrap_or(false);
+            }
+        }
+    }
+    Ok(GetEventInformationResult { summaries, more_events })
+}
+
+/// Decodes a GetAlarmSummary-ACK payload: a flat SEQUENCE OF (objectId,
+/// alarmState, acknowledgedTransitions), all application-tagged. Best-effort —
+/// stops at the first malformed triple.
+pub fn decode_get_alarm_summary_ack(payload: &[u8]) -> Vec<AlarmSummaryEntry> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    while at < payload.len() {
+        let Ok((v1, n1)) = decode_application_value(&payload[at..]) else { break };
+        let BacnetValue::ObjectIdentifier { object_type, instance } = v1 else { break };
+        at += n1;
+        let Some(rest) = payload.get(at..) else { break };
+        let Ok((v2, n2)) = decode_application_value(rest) else { break };
+        let BacnetValue::Enumerated { value: alarm_state } = v2 else { break };
+        at += n2;
+        let Some(rest) = payload.get(at..) else { break };
+        let Ok((v3, n3)) = decode_application_value(rest) else { break };
+        let BacnetValue::BitString { bits, .. } = v3 else { break };
+        at += n3;
+        out.push(AlarmSummaryEntry {
+            object: ObjectId::new(object_type, instance),
+            alarm_state,
+            acknowledged_transitions: bits,
+        });
+    }
+    out
 }
 
 /// Pulls the object identifiers out of a decoded object-list value set.
@@ -1883,6 +2391,29 @@ pub fn segmentation_name(s: u32) -> &'static str {
         1 => "transmit",
         2 => "receive",
         _ => "none",
+    }
+}
+
+/// Human name for a BACnetEventState (clause 21).
+pub fn event_state_name(s: u32) -> String {
+    match s {
+        0 => "normal".into(),
+        1 => "fault".into(),
+        2 => "offnormal".into(),
+        3 => "high-limit".into(),
+        4 => "low-limit".into(),
+        5 => "life-safety-alarm".into(),
+        n => format!("event-state-{n}"),
+    }
+}
+
+/// Human name for a BACnetNotifyType (clause 21).
+pub fn notify_type_name(t: u32) -> String {
+    match t {
+        0 => "alarm".into(),
+        1 => "event".into(),
+        2 => "ack-notification".into(),
+        n => format!("notify-type-{n}"),
     }
 }
 
@@ -2606,6 +3137,134 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].datum, BacnetValue::Unsigned { value: 42 });
         assert_eq!(records[0].status, None);
+    }
+
+    #[test]
+    fn log_multiple_records_roundtrip() {
+        // A trend-log-multiple buffer: one record with two Real datums (two
+        // monitored points), then a status-only (buffer-purged) record.
+        let mut item_data = Vec::new();
+
+        // Record 1: timestamp + log-data [1] { real 70.5, real 18.0 }.
+        encode_opening_tag(&mut item_data, 0);
+        encode_application_value(&mut item_data, &BacnetValue::Date { year: 2026, month: 6, day: 17, weekday: 3 });
+        encode_application_value(&mut item_data, &BacnetValue::Time { hour: 10, minute: 0, second: 0, hundredths: 0 });
+        encode_closing_tag(&mut item_data, 0);
+        encode_opening_tag(&mut item_data, 1); // logData
+        encode_opening_tag(&mut item_data, 1); // log-data SEQUENCE OF
+        encode_tag(&mut item_data, 1, true, 4); // real-value (inner choice tag 1)
+        item_data.extend_from_slice(&70.5f32.to_be_bytes());
+        encode_tag(&mut item_data, 1, true, 4);
+        item_data.extend_from_slice(&18.0f32.to_be_bytes());
+        encode_closing_tag(&mut item_data, 1);
+        encode_closing_tag(&mut item_data, 1);
+
+        // Record 2: timestamp + log-status [0] with buffer-purged (bit 1) set.
+        encode_opening_tag(&mut item_data, 0);
+        encode_application_value(&mut item_data, &BacnetValue::Date { year: 2026, month: 6, day: 17, weekday: 3 });
+        encode_application_value(&mut item_data, &BacnetValue::Time { hour: 10, minute: 15, second: 0, hundredths: 0 });
+        encode_closing_tag(&mut item_data, 0);
+        encode_opening_tag(&mut item_data, 1); // logData
+        encode_tag(&mut item_data, 0, true, 2); // log-status [0] bitstring
+        item_data.extend_from_slice(&[0x06, 0b0100_0000]); // 6 unused bits, bit1 = buffer-purged
+        encode_closing_tag(&mut item_data, 1);
+
+        let records = decode_log_multiple_records(&item_data);
+        assert_eq!(records.len(), 2);
+        assert_eq!(
+            records[0].data,
+            vec![BacnetValue::Real { value: 70.5 }, BacnetValue::Real { value: 18.0 }]
+        );
+        assert_eq!(records[0].status, None);
+        assert_eq!(
+            records[0].time,
+            Some(BacnetValue::Time { hour: 10, minute: 0, second: 0, hundredths: 0 })
+        );
+        assert!(records[1].data.is_empty());
+        assert_eq!(records[1].status.as_deref(), Some("buffer-purged"));
+    }
+
+    #[test]
+    fn get_event_information_ack_roundtrip() {
+        // One summary: AI-5 offnormal, to-offnormal acknowledged, one dateTime
+        // timestamp, notify-type alarm, priorities [16,0,0], moreEvents false.
+        let mut payload = Vec::new();
+        encode_opening_tag(&mut payload, 0); // listOfEventSummaries
+        encode_context_object_id(&mut payload, 0, ObjectId::new(0, 5));
+        encode_context_unsigned(&mut payload, 1, 2); // eventState offnormal
+        encode_tag(&mut payload, 2, true, 2); // acknowledgedTransitions
+        payload.extend_from_slice(&[5, 0x80]); // "100"
+        encode_opening_tag(&mut payload, 3); // eventTimeStamps
+        encode_opening_tag(&mut payload, 2); // dateTime CHOICE
+        encode_application_value(&mut payload, &BacnetValue::Date { year: 2026, month: 6, day: 17, weekday: 3 });
+        encode_application_value(&mut payload, &BacnetValue::Time { hour: 9, minute: 30, second: 0, hundredths: 0 });
+        encode_closing_tag(&mut payload, 2);
+        encode_closing_tag(&mut payload, 3);
+        encode_context_unsigned(&mut payload, 4, 0); // notifyType alarm
+        encode_tag(&mut payload, 5, true, 2); // eventEnable
+        payload.extend_from_slice(&[5, 0xE0]); // "111"
+        encode_opening_tag(&mut payload, 6); // eventPriorities
+        encode_application_value(&mut payload, &BacnetValue::Unsigned { value: 16 });
+        encode_application_value(&mut payload, &BacnetValue::Unsigned { value: 0 });
+        encode_application_value(&mut payload, &BacnetValue::Unsigned { value: 0 });
+        encode_closing_tag(&mut payload, 6);
+        encode_closing_tag(&mut payload, 0);
+        encode_tag(&mut payload, 1, true, 1); // moreEvents
+        payload.push(0);
+
+        let res = decode_get_event_information_ack(&payload).unwrap();
+        assert!(!res.more_events);
+        assert_eq!(res.summaries.len(), 1);
+        let s = &res.summaries[0];
+        assert_eq!(s.object, ObjectId::new(0, 5));
+        assert_eq!(s.event_state, 2);
+        assert_eq!(s.acknowledged_transitions, "100");
+        assert_eq!(s.notify_type, 0);
+        assert_eq!(s.event_priorities, vec![16, 0, 0]);
+        assert_eq!(s.event_timestamps.len(), 1);
+        assert!(matches!(
+            &s.event_timestamps[0],
+            BacnetTimeStamp::DateTime { time: Some(BacnetValue::Time { hour: 9, .. }), .. }
+        ));
+    }
+
+    #[test]
+    fn get_alarm_summary_ack_decode() {
+        let mut payload = Vec::new();
+        encode_application_value(&mut payload, &BacnetValue::ObjectIdentifier { object_type: 0, instance: 5 });
+        encode_application_value(&mut payload, &BacnetValue::Enumerated { value: 2 });
+        encode_application_value(&mut payload, &BacnetValue::BitString { unused_bits: 5, bits: "100".into() });
+        encode_application_value(&mut payload, &BacnetValue::ObjectIdentifier { object_type: 2, instance: 9 });
+        encode_application_value(&mut payload, &BacnetValue::Enumerated { value: 0 });
+        encode_application_value(&mut payload, &BacnetValue::BitString { unused_bits: 5, bits: "000".into() });
+
+        let entries = decode_get_alarm_summary_ack(&payload);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].object, ObjectId::new(0, 5));
+        assert_eq!(entries[0].alarm_state, 2);
+        assert_eq!(entries[0].acknowledged_transitions, "100");
+        assert_eq!(entries[1].object, ObjectId::new(2, 9));
+        assert_eq!(entries[1].alarm_state, 0);
+    }
+
+    #[test]
+    fn acknowledge_alarm_request_frame() {
+        let ts = BacnetTimeStamp::DateTime {
+            date: Some(BacnetValue::Date { year: 2026, month: 6, day: 17, weekday: 3 }),
+            time: Some(BacnetValue::Time { hour: 9, minute: 30, second: 0, hundredths: 0 }),
+        };
+        let now = BacnetTimeStamp::Time(BacnetValue::Time { hour: 10, minute: 0, second: 0, hundredths: 0 });
+        let apdu = encode_acknowledge_alarm(7, 1, ObjectId::new(0, 5), 2, &ts, "S-Tier", &now);
+        // confirmed+SA, max-seg/apdu, invoke 7, service 0 (AcknowledgeAlarm).
+        assert_eq!(&apdu[..4], &[0x02, 0x45, 0x07, 0x00]);
+        assert_eq!(&apdu[4..6], &[0x09, 0x01]); // [0] process id 1
+        assert_eq!(&apdu[6..11], &[0x1C, 0x00, 0x00, 0x00, 0x05]); // [1] object AI-5
+        assert_eq!(&apdu[11..13], &[0x29, 0x02]); // [2] eventState offnormal
+        // [3] timeStamp and [5] timeOfAcknowledgment are opening/closing wrapped.
+        assert!(apdu.contains(&0x3E) && apdu.contains(&0x3F));
+        assert!(apdu.contains(&0x5E) && apdu.contains(&0x5F));
+        // [4] acknowledgmentSource carries the UTF-8 source string.
+        assert!(apdu.windows(6).any(|w| w == b"S-Tier"));
     }
 
     #[test]
