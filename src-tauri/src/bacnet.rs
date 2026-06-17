@@ -1538,9 +1538,13 @@ pub async fn bacnet_discover(
         for h in handles {
             let _ = h.join();
         }
-        let devices = Arc::try_unwrap(shared)
-            .map(|m| m.into_inner().unwrap_or_default())
-            .unwrap_or_default();
+        // Recover the inner Vec even if the enrichment mutex was poisoned, so a
+        // panicked worker doesn't discard every device we already discovered and
+        // streamed via bacnet:device_update.
+        let devices = match Arc::try_unwrap(shared) {
+            Ok(m) => m.into_inner().unwrap_or_else(|e| e.into_inner()),
+            Err(shared) => shared.lock().unwrap_or_else(|e| e.into_inner()).clone(),
+        };
         Ok(devices)
     })
     .await

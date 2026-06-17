@@ -46,8 +46,9 @@ test("the observability service provides timeseries, resolving consumers' option
   assert.ok(reg.providers.get("timeseries").some((p) => p.toolId === "observability"));
   const ts = reg.resolutions.get("networkmanager").find((r) => r.capability === "timeseries");
   assert.equal(ts.providerId, "observability");
-  // observability has no deps, so it must boot before its consumers.
-  assert.ok(reg.initOrder.indexOf("observability") < reg.initOrder.indexOf("bacnet"));
+  // observability has no deps, so it must boot before networkmanager, which
+  // consumes timeseries. (bacnet doesn't consume timeseries, so its relative
+  // order isn't contractual and isn't asserted here.)
   assert.ok(reg.initOrder.indexOf("observability") < reg.initOrder.indexOf("networkmanager"));
 });
 

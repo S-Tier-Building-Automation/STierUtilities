@@ -83,6 +83,10 @@ function overviewBody(catalog) {
 
 // ---- run ----
 const catalog = buildServiceCatalog(TOOL_MANIFESTS);
+if (!catalog.ok) {
+  console.error("Catalog build failed (manifest resolution error); aborting doc generation.");
+  process.exit(1);
+}
 const refDir = join(OUT, "utilities", "reference");
 mkdirSync(refDir, { recursive: true });
 

@@ -657,8 +657,14 @@ pub fn bvlc_decode(buf: &[u8]) -> Result<Bvlc, String> {
     }
     let function = buf[1];
     let length = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-    if length > buf.len() {
-        return Err(format!("BVLC length {length} exceeds datagram {}", buf.len()));
+    // The BVLC length field is the full BVLL message length. For a UDP datagram
+    // (one message per datagram) it must equal the received size exactly —
+    // anything else means trailing bytes or a truncated/over-declared frame.
+    if length != buf.len() {
+        return Err(format!(
+            "BVLC length {length} does not match datagram {}",
+            buf.len()
+        ));
     }
     let (payload_offset, origin) = if function == BVLC_FORWARDED_NPDU {
         if buf.len() < 10 {
@@ -670,14 +676,6 @@ pub fn bvlc_decode(buf: &[u8]) -> Result<Bvlc, String> {
     } else {
         (4, None)
     };
-    // The declared BVLL length must at least cover its own header; a frame that
-    // claims a length shorter than the header is malformed (reject it rather
-    // than parse trailing bytes as if they were the sender's payload).
-    if length < payload_offset {
-        return Err(format!(
-            "BVLC length {length} is shorter than its {payload_offset}-byte header"
-        ));
-    }
     Ok(Bvlc { function, payload_offset, origin })
 }
 
@@ -1409,6 +1407,11 @@ pub fn decode_read_range_ack(payload: &[u8]) -> Result<ReadRangeAck, String> {
     let content = payload
         .get(at + t.header_len..at + t.header_len + t.lvt as usize)
         .ok_or_else(err_short)?;
+    // A BIT STRING needs the unused-bits octet plus at least one data octet;
+    // otherwise a truncated result-flags would be read as all-false (wrong paging).
+    if content.len() < 2 {
+        return Err("ReadRange-ACK: result-flags bitstring is too short".into());
+    }
     let bit = |i: usize| content.get(1 + i / 8).map(|b| (b >> (7 - (i % 8))) & 1 == 1).unwrap_or(false);
     let (first_item, last_item, more_items) = (bit(0), bit(1), bit(2));
     at += t.header_len + t.lvt as usize;
