@@ -329,6 +329,11 @@ async function bacDiscover() {
 async function bacToggleForeignDevice() {
   if (bac.bbmd.busy) return;
   const api = bacnetRead();
+  const addr = bac.bbmd.address.trim();
+  if (!bac.bbmd.status && !addr) {
+    logTo("bacnet", "Enter the BBMD's IP address to register.", "warn");
+    return;
+  }
   bac.bbmd.busy = true;
   renderAll();
   try {
@@ -337,8 +342,6 @@ async function bacToggleForeignDevice() {
       bac.bbmd.status = null;
       logTo("bacnet", "Unregistered from BBMD (will expire at TTL).", "info");
     } else {
-      const addr = bac.bbmd.address.trim();
-      if (!addr) { logTo("bacnet", "Enter the BBMD's IP address to register.", "warn"); return; }
       const ttl = parseInt(bac.bbmd.ttl, 10);
       const status = await api.registerForeignDevice({
         bbmd: addr,

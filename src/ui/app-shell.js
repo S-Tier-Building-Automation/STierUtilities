@@ -145,11 +145,19 @@ export function createAppShell({
 
   function captureRenderUiState() {
     const active = document.activeElement;
+    let start = null;
+    let end = null;
+    if (active && active !== document.body) {
+      try {
+        start = active.selectionStart;
+        end = active.selectionEnd;
+      } catch (_) { /* checkbox/radio/file inputs throw on selection APIs */ }
+    }
     const activeState = active && active !== document.body && active.id
       ? {
           id: active.id,
-          start: typeof active.selectionStart === "number" ? active.selectionStart : null,
-          end: typeof active.selectionEnd === "number" ? active.selectionEnd : null,
+          start: typeof start === "number" ? start : null,
+          end: typeof end === "number" ? end : null,
         }
       : null;
     return {

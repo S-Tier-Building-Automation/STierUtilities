@@ -235,22 +235,22 @@ export function createUserStateManager({
   }
 
   async function authPickSyncFolder() {
+    if (authSyncBusy) return;
+    authSyncBusy = true;
     try {
-      authSyncBusy = true;
       authSyncMessage = "Opening folder picker...";
       renderAll();
       const folder = await pickFolder();
       if (!folder) {
-        authSyncBusy = false;
         authSyncMessage = "";
-        renderAll();
         return;
       }
       authState = await invoke("auth_set_sync_folder", { folder });
       await authSyncNow({ quiet: true });
     } catch (err) {
-      authSyncBusy = false;
       alert(`Could not connect sync folder: ${err}`);
+    } finally {
+      authSyncBusy = false;
       renderAll();
     }
   }
@@ -266,6 +266,7 @@ export function createUserStateManager({
   }
 
   async function authSyncNow({ quiet = false } = {}) {
+    if (authSyncBusy && !quiet) return;
     try {
       if (!quiet) {
         authSyncBusy = true;
