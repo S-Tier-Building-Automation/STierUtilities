@@ -1,10 +1,13 @@
-// Advanced BACnet Inspector — discovery, browse, COV, alarms.
+// BACnet Manager — discovery, browse, COV, alarms.
 
 import {
   bwClassifyDiscovery,
   bwModelObjectsBatch,
   bwPlanDeviceObjects,
+  pointEntityFromBacnet,
+  suggestEquipmentName,
 } from "../building-workspace.js";
+import { createBacnetInboxUi } from "./bacnet-inbox.js";
 import { confirmAction } from "../../ui/modal.js";
 import { toast } from "../../ui/toast.js";
 
@@ -21,17 +24,102 @@ import { toast } from "../../ui/toast.js";
  * @param {() => void} deps.saveUserState
  * @param {() => string|null} deps.currentPluginId
  * @param {() => object|null} deps.getInventory
- * @param {() => object|null} deps.getBuildingWorkspace
- * @param {() => number} [deps.getInboxQueuedCount]
+ * @param {(scope?: string) => void} deps.renderScoped
+ * @param {(view: string) => void} deps.setView
+ * @param {(id: string) => string} deps.pluginView
  */
-export function createBacnetUi({
-  invoke, listen, el, logTo, renderAll, networkManager, platformHost,
-  userState, saveUserState, currentPluginId, getInventory, getBuildingWorkspace,
-  getInboxQueuedCount = () => 0,
+export function createBacnetManagerUi({
+  invoke, listen, el, logTo, renderAll, renderScoped, networkManager, platformHost,
+  userState, saveUserState, currentPluginId, getInventory, setView, pluginView,
 }) {
 
 function inventoryInstance() {
   return getInventory ? getInventory() : null;
+}
+
+function bmPageTab() {
+  return userState.bacnetManager?.pageTab === "inspect" ? "inspect" : "inbox";
+}
+
+function bmSetPageTab(tab) {
+  if (!userState.bacnetManager || typeof userState.bacnetManager !== "object") userState.bacnetManager = {};
+  userState.bacnetManager.pageTab = tab;
+  saveUserState();
+  renderAll();
+}
+
+function discoveryApi() {
+  return {
+    adapterTarget: bacAdapterTarget,
+    discover: bacDiscover,
+    setTarget: (value) => { bac.target = value; },
+    getDevices: () => bac.devices,
+    clearDiscovery: () => {
+      bac.devices = [];
+      bac.discoveryRan = false;
+      bac.lastDiscoveryCount = null;
+      bac.driftSummary = null;
+      bac.driftMissing = [];
+      bac.deviceStatusByKey = {};
+    },
+    getDiscoveryRan: () => bac.discoveryRan,
+    getLastDiscoveryCount: () => bac.lastDiscoveryCount,
+    isDiscovering: () => bac.discovering,
+    getDriftSummary: () => bac.driftSummary,
+    getDriftMissing: () => bac.driftMissing,
+    driftSummaryEl: bacDriftSummaryEl,
+    deviceDriftBadge: bacDeviceStatusBadge,
+    addressText: bacAddressText,
+    vendorText: bacVendorText,
+    deviceRef: bacDeviceRef,
+    discoveryProgressEl: bacDiscoveryProgressEl,
+    getTarget: () => bac.target,
+  };
+}
+
+function bacModelPathItems(inv, entity) {
+  if (!inv || !entity) return [];
+  const items = [];
+  const site = entity.siteId ? inv.getEntity(entity.siteId) : null;
+  const building = entity.buildingId ? inv.getEntity(entity.buildingId) : null;
+  const floor = entity.floorId ? inv.getEntity(entity.floorId) : null;
+  for (const candidate of [site, building, floor, entity.type === "equip" ? entity : null]) {
+    if (candidate && !items.some((item) => item.id === candidate.id)) items.push(candidate);
+  }
+  if (!items.some((item) => item.id === entity.id)) items.push(entity);
+  return items;
+}
+
+let _inboxUi = null;
+function inboxUi() {
+  if (!_inboxUi) {
+    _inboxUi = createBacnetInboxUi({
+      el, logTo, renderAll, renderScoped, userState, saveUserState,
+      getInventory: inventoryInstance, discovery: discoveryApi(), networkManager,
+      setView, pluginView, currentPluginId,
+      breadcrumbItems: bacModelPathItems,
+    });
+  }
+  return _inboxUi;
+}
+
+function bacImportTargetFloor(inv) {
+  const floorId = userState.bacnetManager?.importFloorId;
+  if (!floorId) return null;
+  const floor = inv.getEntity(floorId);
+  return floor?.type === "floor" ? floor : null;
+}
+
+function bacEntityByName(inv, scope, name) {
+  return inv.listEntities(scope).find((e) => e.name === name) || null;
+}
+
+function bacTemplateForName(name) {
+  const s = String(name || "").toLowerCase();
+  if (s.includes("ahu")) return "ahu";
+  if (s.includes("meter") || s.includes("mtr")) return "meter";
+  if (s.includes("zone")) return "zone";
+  return "vav";
 }
 
 // ============================================================================
@@ -150,11 +238,7 @@ function bacRenderDiscoveryProgressLive() {
     if (next) node.replaceWith(next);
     else node.remove();
   }
-  const count = document.getElementById("bw-device-inbox-count");
-  if (count) {
-    const queued = getInboxQueuedCount();
-    count.textContent = bac.discovering ? "Discovering..." : `${bac.devices.length} discovered · ${queued} queued`;
-  }
+  inboxUi().patchDeviceInboxLive?.();
   const bacCount = document.getElementById("bac-device-count");
   if (bacCount) bacCount.textContent = bacDeviceCountText();
 }
@@ -228,8 +312,8 @@ function bacEnsureListeners() {
 // resolved the optional dependency, so it degrades cleanly if Network Manager
 // is unavailable.
 async function bacSuggestTargets() {
-  const netscan = platformHost("bacnet")?.tryUse("netscan.v1");
-  if (!netscan) { logTo("bacnet", "Network scan capability unavailable.", "warn"); return; }
+  const netscan = platformHost("bacnet-manager")?.tryUse("netscan.v1");
+  if (!netscan) { logTo("bacnet-manager", "Network scan capability unavailable.", "warn"); return; }
   const snap = networkManager.getAdapterSnapshot();
   if (!snap.loaded) {
     try { await networkManager.refreshAdapters(); } catch (_) {}
@@ -240,16 +324,16 @@ async function bacSuggestTargets() {
     const s = networkManager.scanSubnetFor(a.name);
     if (s) { subnet = s; break; }
   }
-  if (!subnet) { logTo("bacnet", "No adapter with a scannable IPv4 subnet to search.", "warn"); return; }
-  logTo("bacnet", `Scanning ${subnet.network}/${subnet.prefix} for live hosts (via Network Manager)…`, "info");
+  if (!subnet) { logTo("bacnet-manager", "No adapter with a scannable IPv4 subnet to search.", "warn"); return; }
+  logTo("bacnet-manager", `Scanning ${subnet.network}/${subnet.prefix} for live hosts (via Network Manager)…`, "info");
   try {
     const result = await netscan.scan(`${subnet.ip}/${subnet.prefix}`);
     const hosts = result?.hosts || [];
-    if (hosts.length === 0) { logTo("bacnet", "No live hosts found on the subnet.", "warn"); return; }
+    if (hosts.length === 0) { logTo("bacnet-manager", "No live hosts found on the subnet.", "warn"); return; }
     const preview = hosts.slice(0, 12).map((h) => h.ip).join(", ");
-    logTo("bacnet", `Found ${hosts.length} live host${hosts.length === 1 ? "" : "s"}: ${preview}${hosts.length > 12 ? "…" : ""}`, "ok");
+    logTo("bacnet-manager", `Found ${hosts.length} live host${hosts.length === 1 ? "" : "s"}: ${preview}${hosts.length > 12 ? "…" : ""}`, "ok");
   } catch (err) {
-    logTo("bacnet", `Host scan failed: ${err}`, "error");
+    logTo("bacnet-manager", `Host scan failed: ${err}`, "error");
   }
 }
 
@@ -257,7 +341,7 @@ async function bacSuggestTargets() {
 // didn't boot, it falls back to direct backend calls so the advanced tool still
 // works — the platform must never take the UI down.
 function bacnetRead() {
-  const cap = platformHost("bacnet")?.tryUse("bacnet.read.v1");
+  const cap = platformHost("bacnet-manager")?.tryUse("bacnet.read.v1");
   if (cap) return cap;
   return {
     listDevices: (o = {}) => invoke("bacnet_discover", {
@@ -313,10 +397,10 @@ async function bacDiscover() {
     bac.devices = devices;
     bac.lastDiscoveryCount = devices.length;
     bacRecordDiscoveryDrift(devices);
-    logTo("bacnet", `Discovery finished — ${devices.length} device${devices.length === 1 ? "" : "s"}.`, devices.length ? "ok" : "warn");
+    logTo("bacnet-manager", `Discovery finished — ${devices.length} device${devices.length === 1 ? "" : "s"}.`, devices.length ? "ok" : "warn");
   } catch (err) {
     bac.lastDiscoveryCount = null;
-    logTo("bacnet", `Discovery failed: ${err}`, "error");
+    logTo("bacnet-manager", `Discovery failed: ${err}`, "error");
   } finally {
     bac.discovering = false;
     bacStopDiscoveryClock();
@@ -332,7 +416,7 @@ async function bacToggleForeignDevice() {
   const api = bacnetRead();
   const addr = bac.bbmd.address.trim();
   if (!bac.bbmd.status && !addr) {
-    logTo("bacnet", "Enter the BBMD's IP address to register.", "warn");
+    logTo("bacnet-manager", "Enter the BBMD's IP address to register.", "warn");
     return;
   }
   bac.bbmd.busy = true;
@@ -341,7 +425,7 @@ async function bacToggleForeignDevice() {
     if (bac.bbmd.status) {
       await api.unregisterForeignDevice();
       bac.bbmd.status = null;
-      logTo("bacnet", "Unregistered from BBMD (will expire at TTL).", "info");
+      logTo("bacnet-manager", "Unregistered from BBMD (will expire at TTL).", "info");
     } else {
       const ttl = parseInt(bac.bbmd.ttl, 10);
       const status = await api.registerForeignDevice({
@@ -349,10 +433,10 @@ async function bacToggleForeignDevice() {
         ttlSeconds: Number.isFinite(ttl) ? ttl : null,
       });
       bac.bbmd.status = status;
-      logTo("bacnet", `Registered as foreign device with ${status.bbmd} (TTL ${status.ttlSeconds}s). Broadcasts now route through the BBMD.`, "ok");
+      logTo("bacnet-manager", `Registered as foreign device with ${status.bbmd} (TTL ${status.ttlSeconds}s). Broadcasts now route through the BBMD.`, "ok");
     }
   } catch (err) {
-    logTo("bacnet", `Foreign-device registration failed: ${err}`, "error");
+    logTo("bacnet-manager", `Foreign-device registration failed: ${err}`, "error");
   } finally {
     bac.bbmd.busy = false;
     renderAll();
@@ -428,10 +512,10 @@ async function bacSelectDevice(key) {
     // overwrite the newer selection with stale results.
     if (bac.selectedDeviceKey !== key) return;
     bac.objects = objects;
-    logTo("bacnet", `Read ${bac.objects.length} objects from ${bacDeviceLabel(dev)}.`, "ok");
+    logTo("bacnet-manager", `Read ${bac.objects.length} objects from ${bacDeviceLabel(dev)}.`, "ok");
   } catch (err) {
     if (bac.selectedDeviceKey !== key) return;
-    logTo("bacnet", `Object list failed for ${bacDeviceLabel(dev)}: ${err}`, "error");
+    logTo("bacnet-manager", `Object list failed for ${bacDeviceLabel(dev)}: ${err}`, "error");
   } finally {
     if (bac.selectedDeviceKey === key) {
       bac.objectsLoading = false;
@@ -463,7 +547,7 @@ async function bacSelectObject(key) {
     bac.props = props;
   } catch (err) {
     if (bac.selectedObjectKey !== key) return;
-    logTo("bacnet", `Property read failed for ${obj.typeName}:${obj.instance}: ${err}`, "error");
+    logTo("bacnet-manager", `Property read failed for ${obj.typeName}:${obj.instance}: ${err}`, "error");
   } finally {
     if (bac.selectedObjectKey === key) {
       bac.propsLoading = false;
@@ -501,7 +585,7 @@ async function bacCovStop() {
 async function bacToggleCov() {
   if (bacCovActive()) {
     await bacCovStop();
-    logTo("bacnet", "Stopped COV subscription.", "info");
+    logTo("bacnet-manager", "Stopped COV subscription.", "info");
     renderAll();
     return;
   }
@@ -521,17 +605,17 @@ async function bacToggleCov() {
       confirmed: false,
     });
     bac.cov = { processId, objectKey: bacObjectKey(obj), busy: false, updates: 0, lastAt: null };
-    logTo("bacnet", `Subscribed to COV on ${obj.typeName}:${obj.instance} (live values).`, "ok");
+    logTo("bacnet-manager", `Subscribed to COV on ${obj.typeName}:${obj.instance} (live values).`, "ok");
   } catch (err) {
     bac.cov.busy = false;
-    logTo("bacnet", `COV subscribe failed for ${obj.typeName}:${obj.instance}: ${err}`, "error");
+    logTo("bacnet-manager", `COV subscribe failed for ${obj.typeName}:${obj.instance}: ${err}`, "error");
   }
   renderAll();
 }
 
 // Patch the property rows a COV notification touched, in place, and flash them.
 function bacApplyCovUpdate(values) {
-  if (currentPluginId() !== "bacnet") return;
+  if (currentPluginId() !== "bacnet-manager") return;
   for (const v of values) {
     const row = bac.props.find((p) => p.id === v.id);
     if (row) { row.display = v.display; row.values = v.values; row.error = v.error; }
@@ -591,12 +675,12 @@ async function bacWrite(relinquish = false) {
   if (!dev || !obj) return;
   const propertyId = parseInt(bac.write.propertyId, 10);
   if (!Number.isInteger(propertyId)) {
-    logTo("bacnet", "Pick a property number to write.", "warn");
+    logTo("bacnet-manager", "Pick a property number to write.", "warn");
     return;
   }
   const priority = bac.write.priority === "" ? null : parseInt(bac.write.priority, 10);
   if (relinquish && priority == null) {
-    logTo("bacnet", "Relinquish needs a priority (the slot to release).", "warn");
+    logTo("bacnet-manager", "Relinquish needs a priority (the slot to release).", "warn");
     return;
   }
   const arrayIndex = bac.write.arrayIndex === "" ? null : parseInt(bac.write.arrayIndex, 10);
@@ -604,7 +688,7 @@ async function bacWrite(relinquish = false) {
   try {
     value = relinquish ? { kind: "null" } : bacBuildWriteValue();
   } catch (err) {
-    logTo("bacnet", `Invalid value: ${err.message}`, "warn");
+    logTo("bacnet-manager", `Invalid value: ${err.message}`, "warn");
     return;
   }
   const what = relinquish
@@ -620,10 +704,10 @@ async function bacWrite(relinquish = false) {
       priority,
       arrayIndex,
     });
-    logTo("bacnet", `OK — ${what} on ${obj.typeName}:${obj.instance}.`, "ok");
+    logTo("bacnet-manager", `OK — ${what} on ${obj.typeName}:${obj.instance}.`, "ok");
     await bacRefreshProps();
   } catch (err) {
-    logTo("bacnet", `Write failed on ${obj.typeName}:${obj.instance}: ${err}`, "error");
+    logTo("bacnet-manager", `Write failed on ${obj.typeName}:${obj.instance}: ${err}`, "error");
   }
 }
 
@@ -641,12 +725,11 @@ function bacScheduleDevicesRender() {
 }
 
 function bacRenderDevicesLive() {
-  const bw = getBuildingWorkspace?.();
-  if (currentPluginId() === "building-workspace" && bw?.renderDeviceInboxLive) {
-    bw.renderDeviceInboxLive();
+  if (currentPluginId() !== "bacnet-manager") return;
+  if (bmPageTab() === "inbox") {
+    inboxUi().patchDeviceInboxLive();
     return;
   }
-  if (currentPluginId() !== "bacnet") return;
   const body = document.getElementById("bac-device-rows");
   if (body) body.replaceChildren(...bacDeviceRows());
   const count = document.getElementById("bac-device-count");
@@ -710,7 +793,7 @@ function bacDeviceCountText() {
 // Re-render just the device rows + count in place (so typing in the filter
 // or clicking a sort header never rebuilds the page and steals input focus).
 function bacApplyDeviceView() {
-  if (currentPluginId() !== "bacnet") return;
+  if (currentPluginId() !== "bacnet-manager") return;
   const tbl = document.getElementById("bac-device-table");
   if (tbl) tbl.replaceWith(bacDeviceTableEl());
   const count = document.getElementById("bac-device-count");
@@ -745,9 +828,9 @@ async function bacCopyDevices() {
   const csv = bacDevicesToCsv();
   try {
     await navigator.clipboard.writeText(csv);
-    logTo("bacnet", `Copied ${bacVisibleDevices().length} devices to clipboard (CSV).`, "ok");
+    logTo("bacnet-manager", `Copied ${bacVisibleDevices().length} devices to clipboard (CSV).`, "ok");
   } catch (err) {
-    logTo("bacnet", `Clipboard copy failed: ${err}`, "error");
+    logTo("bacnet-manager", `Clipboard copy failed: ${err}`, "error");
   }
 }
 
@@ -760,7 +843,7 @@ function bacExportDevices() {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-  logTo("bacnet", `Exported ${bacVisibleDevices().length} devices to CSV.`, "ok");
+  logTo("bacnet-manager", `Exported ${bacVisibleDevices().length} devices to CSV.`, "ok");
 }
 
 function bacTimestamp() {
@@ -795,7 +878,7 @@ function bacFilteredObjects() {
 }
 
 function bacApplyObjectFilter() {
-  if (currentPluginId() !== "bacnet") return;
+  if (currentPluginId() !== "bacnet-manager") return;
   const list = document.getElementById("bac-object-list");
   if (list) list.replaceChildren(...bacObjectRows());
   const count = document.getElementById("bac-object-count");
@@ -918,9 +1001,9 @@ function bacObjectRows() {
       el("span", { class: "bac-object-name" }, o.name || ""),
       el("button", {
         class: "btn-ghost bac-object-action",
-        title: "Import this object into Building Workspace and historize it",
-        onclick: (e) => { e.stopPropagation(); getBuildingWorkspace()?.historizeObject?.(o); },
-      }, "Historize"),
+        title: "Import this object into the building model",
+        onclick: (e) => { e.stopPropagation(); bacImportSingleObject(o); },
+      }, "Import"),
     ));
   }
   return rows;
@@ -992,32 +1075,60 @@ function bacExportObjects() {
 // inferred equipment, create/reuse one equip per group, then upsert all points in a
 // single inventory write (inventory.upsertMany). Reuses the same equip/point helpers
 // as the single-object Historize path.
+function bacImportSingleObject(obj) {
+  const inv = inventoryInstance();
+  const dev = bacSelectedDevice();
+  const floor = bacImportTargetFloor(inv);
+  if (!inv || !dev || !obj) { toast("Select a device and object first.", "warn"); return; }
+  if (!floor) { toast("Select an import target floor in the Inbox tab.", "warn"); return; }
+  const building = inv.getEntity(floor.buildingId || floor.parentId);
+  const site = building ? inv.getEntity(floor.siteId || building.siteId) : null;
+  if (!site || !building) { toast("Import target floor is missing site/building context.", "error"); return; }
+  const equipName = suggestEquipmentName(obj.name || "", `Device ${dev.instance}`);
+  let equip = bacEntityByName(inv, { type: "equip", floorId: floor.id }, equipName)
+    || inv.upsertEntity({
+      type: "equip", siteId: site.id, buildingId: building.id, floorId: floor.id, parentId: floor.id,
+      name: equipName, tags: { equip: true },
+    });
+  equip = inv.applyTemplate(equip.id, bacTemplateForName(equipName));
+  inv.upsertEntity(pointEntityFromBacnet({
+    siteId: site.id, buildingId: building.id, floorId: floor.id, equipId: equip.id,
+    device: dev, object: obj, props: bacObjectKey(obj) === bac.selectedObjectKey ? bac.props : [],
+  }));
+  saveUserState();
+  logTo("bacnet-manager", `Imported ${obj.typeName}:${obj.instance} into ${floor.name}.`, "ok");
+  toast(`Imported into ${floor.name}. Open Building Workspace to model further.`, "ok");
+}
+
 function bacBulkImportSelected() {
   const inv = inventoryInstance();
-  const bw = getBuildingWorkspace?.();
   const dev = bacSelectedDevice();
   const objects = bacSelectedObjectsForBulk();
-  if (!inv || !bw) { toast("Building model is not ready.", "error"); return; }
+  const floor = bacImportTargetFloor(inv);
+  if (!inv) { toast("Building model is not ready.", "error"); return; }
   if (!dev || !objects.length) { toast("Select one or more objects first.", "warn"); return; }
-  const { site, building, floor } = bw.ensureLocation(inv);
+  if (!floor) { toast("Select an import target floor in the Inbox tab.", "warn"); return; }
+  const building = inv.getEntity(floor.buildingId || floor.parentId);
+  const site = building ? inv.getEntity(floor.siteId || building.siteId) : null;
+  if (!site || !building) { toast("Import target floor is missing site/building context.", "error"); return; }
   const plan = bwPlanDeviceObjects({ device: dev, objects, template: bac.objectNameTemplate });
   const equipIdByName = new Map();
   for (const name of plan.equips) {
-    let equip = bw.entityByName(inv, { type: "equip", floorId: floor.id }, name)
+    let equip = bacEntityByName(inv, { type: "equip", floorId: floor.id }, name)
       || inv.upsertEntity({
         type: "equip", siteId: site.id, buildingId: building.id, floorId: floor.id, parentId: floor.id,
         name, tags: { equip: true },
       });
-    equip = inv.applyTemplate(equip.id, bw.templateForName(name));
+    equip = inv.applyTemplate(equip.id, bacTemplateForName(name));
     equipIdByName.set(name, equip.id);
   }
   const points = bwModelObjectsBatch({
     siteId: site.id, buildingId: building.id, floorId: floor.id, device: dev, items: plan.items, equipIdByName,
   });
   const saved = inv.upsertMany(points);
-  bw.saveState();
+  saveUserState();
   bac.objectSelection.clear();
-  logTo("building-workspace", `Imported ${saved.length} point${saved.length === 1 ? "" : "s"} from device ${dev.instance} into ${floor.name}.`, "ok");
+  logTo("bacnet-manager", `Imported ${saved.length} point${saved.length === 1 ? "" : "s"} from device ${dev.instance} into ${floor.name}.`, "ok");
   toast(`Imported ${saved.length} point${saved.length === 1 ? "" : "s"} into ${floor.name}. Open Building Workspace to model further.`, "ok");
   renderAll();
 }
@@ -1181,13 +1292,13 @@ async function bacReadAlarms() {
     bac.alarms.entries = entries;
     bac.alarms.ran = true;
     const active = entries.filter((e) => e.eventState !== "normal").length;
-    logTo("bacnet", `Read ${entries.length} alarm record${entries.length === 1 ? "" : "s"} from ${bacDeviceLabel(dev)} (${active} not normal).`, entries.length ? "ok" : "info");
+    logTo("bacnet-manager", `Read ${entries.length} alarm record${entries.length === 1 ? "" : "s"} from ${bacDeviceLabel(dev)} (${active} not normal).`, entries.length ? "ok" : "info");
   } catch (err) {
     if (bac.selectedDeviceKey !== dev.key) return;
     bac.alarms.entries = [];
     bac.alarms.error = String(err);
     bac.alarms.ran = true;
-    logTo("bacnet", `Alarm read failed for ${bacDeviceLabel(dev)}: ${err}`, "error");
+    logTo("bacnet-manager", `Alarm read failed for ${bacDeviceLabel(dev)}: ${err}`, "error");
   } finally {
     // Clear loading whenever this read still owns the alarms slot, even if the
     // user switched devices mid-read — otherwise the button stays disabled.
@@ -1210,18 +1321,18 @@ async function bacAcknowledgeAlarm(alarm) {
   });
   if (!ok) return;
   // Audit trail: record intent and outcome in the activity log.
-  logTo("bacnet", `ACK requested — ${label} (${alarm.eventState}) on ${bacDeviceLabel(dev)}.`, "warn");
+  logTo("bacnet-manager", `ACK requested — ${label} (${alarm.eventState}) on ${bacDeviceLabel(dev)}.`, "warn");
   try {
     await bacnetRead().acknowledgeAlarm({
       device: bacDeviceRef(dev),
       objectType: alarm.objectType,
       instance: alarm.instance,
     });
-    logTo("bacnet", `ACK accepted by device — ${label}.`, "ok");
+    logTo("bacnet-manager", `ACK accepted by device — ${label}.`, "ok");
     toast(`Acknowledged ${label}`, "ok");
     await bacReadAlarms(); // refresh so the ack state reflects reality
   } catch (err) {
-    logTo("bacnet", `ACK failed — ${label}: ${err}`, "error");
+    logTo("bacnet-manager", `ACK failed — ${label}: ${err}`, "error");
     toast(`Acknowledge failed: ${err}`, "error");
   }
 }
@@ -1315,10 +1426,10 @@ async function bacReadTrend() {
     bac.trend.records = result.records;
     bac.trend.recordCount = result.recordCount;
     bac.trend.truncated = result.truncated;
-    logTo("bacnet", `Read ${result.records.length} trend record${result.records.length === 1 ? "" : "s"} from ${obj.typeName}:${obj.instance}.`, "ok");
+    logTo("bacnet-manager", `Read ${result.records.length} trend record${result.records.length === 1 ? "" : "s"} from ${obj.typeName}:${obj.instance}.`, "ok");
   } catch (err) {
     if (bac.selectedObjectKey !== bacObjectKey(obj)) return;
-    logTo("bacnet", `Trend read failed for ${obj.typeName}:${obj.instance}: ${err}`, "error");
+    logTo("bacnet-manager", `Trend read failed for ${obj.typeName}:${obj.instance}: ${err}`, "error");
   } finally {
     if (bac.selectedObjectKey === bacObjectKey(obj)) {
       bac.trend.loading = false;
@@ -1349,7 +1460,7 @@ function bacExportTrend() {
   a.click();
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-  logTo("bacnet", `Exported ${bac.trend.records.length} trend records to CSV.`, "ok");
+  logTo("bacnet-manager", `Exported ${bac.trend.records.length} trend records to CSV.`, "ok");
 }
 
 function bacTrendPanel() {
@@ -1537,7 +1648,7 @@ function bacTargetChips() {
   return el("div", { class: "bac-chip-row" }, ...chips);
 }
 
-function renderBacnetPage() {
+function renderInspectPage() {
   bacEnsureListeners();
   networkManager.ensureLoaded(); // adapter state feeds the target suggestions
 
@@ -1568,7 +1679,7 @@ function renderBacnetPage() {
 
   // Offered only when the platform kernel resolved BACnet's optional dependency
   // on the netscan capability (i.e. Network Manager is present).
-  const scanBtn = platformHost("bacnet")?.has("netscan.v1")
+  const scanBtn = platformHost("bacnet-manager")?.has("netscan.v1")
     ? el("button", {
         class: "btn btn-ghost",
         disabled: bac.discovering ? "disabled" : undefined,
@@ -1721,6 +1832,33 @@ function renderBacnetPage() {
   );
 }
 
+function renderBacnetManagerPage() {
+  bacEnsureListeners();
+  networkManager.ensureLoaded();
+  inboxUi().restoreState?.();
+  const inv = inventoryInstance();
+  const tab = bmPageTab();
+  const tabs = el("div", { class: "bw-tabs bm-tabs" },
+    el("button", {
+      class: `bw-tab ${tab === "inbox" ? "bw-tab-on" : ""}`,
+      onclick: () => bmSetPageTab("inbox"),
+    }, "Inbox"),
+    el("button", {
+      class: `bw-tab ${tab === "inspect" ? "bw-tab-on" : ""}`,
+      onclick: () => bmSetPageTab("inspect"),
+    }, "Inspect"),
+  );
+  const body = tab === "inbox"
+    ? (inv
+      ? inboxUi().renderDeviceInbox(inv)
+      : el("section", { class: "plugin-section" }, el("p", { class: "muted" }, "Inventory is not ready.")))
+    : renderInspectPage();
+  return el("div", { id: "bm-root", class: "plugin-controls plugin-controls-fill bac-root" },
+    tabs,
+    el("div", { id: "bm-tab-body" }, body),
+  );
+}
+
 // ============================================================================
 
 function flushOnPageHide() {
@@ -1737,7 +1875,7 @@ function flushOnPageHide() {
 
 return {
   renderStatusPill: bacStatusPill,
-  renderPage: renderBacnetPage,
+  renderPage: renderBacnetManagerPage,
   ensureListeners: bacEnsureListeners,
   adapterTarget: bacAdapterTarget,
   discover: bacDiscover,
@@ -1770,5 +1908,7 @@ return {
   getSelectedDevice: bacSelectedDevice,
   bacnetRead,
   flushOnPageHide,
+  renderInboxScope: () => inboxUi().renderInboxScope(),
+  getInboxQueuedCount: () => inboxUi().getInboxQueuedCount(),
 };
 }

@@ -19,7 +19,7 @@ import {
 import { createClipboardTyperUi } from "../tools/ui/clipboardtyper.js";
 import { createHeicMovUi } from "../tools/ui/heicmov.js";
 import { createNetworkManagerUi } from "../tools/ui/networkmanager.js";
-import { createBacnetUi } from "../tools/ui/bacnet.js";
+import { createBacnetManagerUi } from "../tools/ui/bacnetmanager.js";
 import { createObservabilityUi } from "../tools/ui/observability.js";
 import { createBuildingWorkspaceUi } from "../tools/ui/buildingworkspace.js";
 import { createBacnetHistorianUi } from "../tools/ui/bacnethistorian.js";
@@ -40,6 +40,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
   let platform = null;
   let pack = null;
   let packFlushTimer = null;
+  let bacnetManager = null;
   let buildingWorkspace = null;
   let bacnetHistorian = null;
 
@@ -172,30 +173,30 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     invoke, listen, el, logTo, renderAll: () => appUi.renderAll(),
     userState, saveUserState, currentPluginId,
   });
-  const bacnet = createBacnetUi({
-    invoke, listen, el, logTo, renderAll: () => appUi.renderAll(),
-    networkManager, platformHost, userState, saveUserState, currentPluginId,
-    getInventory: () => (platform ? platform.capability("inventory.v1") : null),
-    getBuildingWorkspace: () => buildingWorkspace,
-    getInboxQueuedCount: () => buildingWorkspace?.getInboxQueuedCount?.() ?? 0,
-  });
   const observability = createObservabilityUi({
     invoke, listen, el, logTo, renderAll: () => appUi.renderAll(),
     getPack: () => pack, getTelemetry, currentPluginId,
+  });
+  bacnetManager = createBacnetManagerUi({
+    invoke, listen, el, logTo, renderAll: () => appUi.renderAll(),
+    renderScoped: (scope) => appUi.renderScoped(scope),
+    networkManager, platformHost, userState, saveUserState, currentPluginId,
+    getInventory: () => (platform ? platform.capability("inventory.v1") : null),
+    setView, pluginView,
   });
   bacnetHistorian = createBacnetHistorianUi({
     el, logTo, renderAll: () => appUi.renderAll(),
     userState, saveUserState,
     getPlatform: () => platform,
     getInventory: () => (platform ? platform.capability("inventory.v1") : null),
-    bacnet, getBuildingWorkspace: () => buildingWorkspace, listen,
+    bacnetManager, getBuildingWorkspace: () => buildingWorkspace, listen,
   });
   buildingWorkspace = createBuildingWorkspaceUi({
     invoke, el, logTo,
     renderAll: () => appUi.renderAll(),
     renderScoped: (scope) => appUi.renderScoped(scope),
     userState, saveUserState, getPlatform: () => platform,
-    networkManager, bacnet, setView, pluginView, currentPluginId, listen,
+    networkManager, setView, pluginView, currentPluginId, listen,
     getPack: () => pack, getTelemetry,
     getHistorian: () => bacnetHistorian.getInstance(),
     histSyncFromInventory: () => bacnetHistorian.syncFromInventory(),
@@ -206,7 +207,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     clipboardtyper: { renderStatusPill: clipboardTyper.renderStatusPill, renderPage: clipboardTyper.renderPage },
     heicmov: { renderStatusPill: heicMov.renderStatusPill, renderPage: heicMov.renderPage },
     networkmanager: { renderStatusPill: networkManager.renderStatusPill, renderPage: networkManager.renderPage },
-    bacnet: { renderStatusPill: bacnet.renderStatusPill, renderPage: bacnet.renderPage },
+    "bacnet-manager": { renderStatusPill: bacnetManager.renderStatusPill, renderPage: bacnetManager.renderPage },
     observability: { renderStatusPill: observability.renderStatusPill, renderPage: observability.renderPage },
     "building-workspace": { renderStatusPill: buildingWorkspace.renderStatusPill, renderPage: buildingWorkspace.renderPage },
     "bacnet-historian": { renderStatusPill: bacnetHistorian.renderStatusPill, renderPage: bacnetHistorian.renderPage },
@@ -260,6 +261,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
       plugin: pluginPage,
     },
     getBuildingWorkspace: () => buildingWorkspace,
+    getBacnetManager: () => bacnetManager,
   });
 
   return {
@@ -287,7 +289,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     setPackFlushTimer: (timer) => { packFlushTimer = timer; },
     tools: { clipboardTyper, networkManager, observability, bacnetHistorian },
     get buildingWorkspace() { return buildingWorkspace; },
-    get bacnet() { return bacnet; },
+    get bacnetManager() { return bacnetManager; },
     get networkManager() { return networkManager; },
     get observability() { return observability; },
   };

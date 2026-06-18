@@ -9,12 +9,12 @@
  * @param {() => void} deps.saveUserState
  * @param {() => object|null} deps.getPlatform
  * @param {() => object|null} deps.getInventory
- * @param {ReturnType<typeof import("./bacnet.js").createBacnetUi>} deps.bacnet
+ * @param {ReturnType<typeof import("./bacnetmanager.js").createBacnetManagerUi>} deps.bacnetManager
  * @param {() => object|null} deps.getBuildingWorkspace
  * @param {typeof import("../../platform/tauri.js").listen} [deps.listen]
  */
 export function createBacnetHistorianUi({
-  el, logTo, renderAll, userState, saveUserState, getPlatform, getInventory, bacnet, getBuildingWorkspace, listen,
+  el, logTo, renderAll, userState, saveUserState, getPlatform, getInventory, bacnetManager, getBuildingWorkspace, listen,
 }) {
 
 function historianInstance() {
@@ -135,15 +135,15 @@ function renderHistorianPage() {
   const synced = histSyncFromInventory();
   if (synced) histPersist();
 
-  const devices = bacnet.getDevices();
+  const devices = bacnetManager.getDevices();
   let devIdx = devices.length ? "0" : "";
   const objTypeInput = el("input", { type: "number", class: "nm-input bac-range-input", value: "0", title: "Object type (0=AI, 1=AO, 2=AV, …)" });
   const instInput = el("input", { type: "number", class: "nm-input bac-range-input", value: "0" });
   const labelInput = el("input", { type: "text", class: "nm-input", placeholder: "label (optional)" });
   const devSelect = el("select", { class: "nm-input", onchange: (e) => { devIdx = e.target.value; } },
     ...(devices.length
-      ? devices.map((d, i) => el("option", { value: String(i) }, bacnet.deviceLabel(d)))
-      : [el("option", { value: "" }, "No devices — discover from Building Workspace first")]));
+      ? devices.map((d, i) => el("option", { value: String(i) }, bacnetManager.deviceLabel(d)))
+      : [el("option", { value: "" }, "No devices — discover from BACnet Manager first")]));
 
   const addBtn = el("button", {
     class: "btn",
@@ -152,7 +152,7 @@ function renderHistorianPage() {
       const dev = devices[Number(devIdx)];
       if (!dev) return;
       hist.addPoint({
-        device: { ...bacnet.deviceRef(dev), deviceInstance: dev.instance },
+        device: { ...bacnetManager.deviceRef(dev), deviceInstance: dev.instance },
         objectType: Number(objTypeInput.value),
         instance: Number(instInput.value),
         label: labelInput.value.trim(),

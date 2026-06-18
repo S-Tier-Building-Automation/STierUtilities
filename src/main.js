@@ -36,7 +36,7 @@ registerPagehideHandler({
   getPackFlushTimer: app.getPackFlushTimer,
   setPackFlushTimer: app.setPackFlushTimer,
   flushNetworkManagerSave: () => app.networkManager.flushPendingSave(),
-  flushBacnetOnPageHide: () => app.bacnet.flushOnPageHide(),
+  flushBacnetOnPageHide: () => app.bacnetManager?.flushOnPageHide?.(),
 });
 
 installBootstrap({

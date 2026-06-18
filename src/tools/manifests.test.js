@@ -22,11 +22,11 @@ test("networkmanager provides the network primitives", () => {
   assert.ok(reg.providers.get("netscan").some((p) => p.toolId === "networkmanager"));
 });
 
-test("bacnet resolves its optional netscan dependency to networkmanager", () => {
+test("bacnet-manager resolves its optional netscan dependency to networkmanager", () => {
   const reg = buildRegistry(TOOL_MANIFESTS);
-  const res = reg.resolutions.get("bacnet").find((r) => r.capability === "netscan");
+  const res = reg.resolutions.get("bacnet-manager").find((r) => r.capability === "netscan");
   assert.equal(res.providerId, "networkmanager");
-  assert.ok(reg.initOrder.indexOf("networkmanager") < reg.initOrder.indexOf("bacnet"));
+  assert.ok(reg.initOrder.indexOf("networkmanager") < reg.initOrder.indexOf("bacnet-manager"));
 });
 
 test("bacnet.read is extracted into the headless bacnet-core service", () => {
@@ -34,11 +34,11 @@ test("bacnet.read is extracted into the headless bacnet-core service", () => {
   // The service owns the capability...
   assert.ok(reg.providers.get("bacnet.read").some((p) => p.toolId === "bacnet-core"));
   assert.equal(manifestById("bacnet-core").category, "service");
-  // ...and the Inspector App consumes it rather than providing it.
-  assert.deepEqual(manifestById("bacnet").provides, []);
-  const res = reg.resolutions.get("bacnet").find((r) => r.capability === "bacnet.read");
+  // ...and BACnet Manager consumes it rather than providing it.
+  assert.deepEqual(manifestById("bacnet-manager").provides, []);
+  const res = reg.resolutions.get("bacnet-manager").find((r) => r.capability === "bacnet.read");
   assert.equal(res.providerId, "bacnet-core");
-  assert.ok(reg.initOrder.indexOf("bacnet-core") < reg.initOrder.indexOf("bacnet"));
+  assert.ok(reg.initOrder.indexOf("bacnet-core") < reg.initOrder.indexOf("bacnet-manager"));
 });
 
 test("the observability service provides timeseries, resolving consumers' optional dep", () => {
@@ -91,8 +91,7 @@ test("building-workspace provides inventory and composes the BACnet workflow sta
 });
 
 test("manifestById looks tools up", () => {
-  assert.equal(manifestById("bacnet").name, "Advanced BACnet Inspector");
-  assert.equal(manifestById("bacnet").ui.defaultHidden, true);
+  assert.equal(manifestById("bacnet-manager").name, "BACnet Manager");
   assert.equal(manifestById("nope"), null);
 });
 

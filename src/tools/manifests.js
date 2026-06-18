@@ -133,17 +133,16 @@ export const TOOL_MANIFESTS = [
         "read a point's properties. It owns the BACnet/IP stack on an ephemeral " +
         "UDP port (so it coexists with Niagara or any other BACnet stack) and " +
         "exposes a stable bacnet.read contract any platform app can depend on. " +
-        "The BACnet Inspector and the BACnet Historian both consume it rather " +
+        "BACnet Manager and the BACnet Historian consume it rather " +
         "than reimplementing BACnet. Runs headless — it has no page of its own.",
       repo: REPO,
     },
   },
   {
-    // The advanced BACnet Inspector App — the YABE-style power UI. It no longer provides
-    // bacnet.read; it *consumes* it from bacnet-core (discovery + point reads),
-    // and exists as an advanced field-debugging UI over the shared contract.
-    id: "bacnet",
-    name: "Advanced BACnet Inspector",
+    // BACnet Manager — discovery, inbox/import, browse, COV, alarms, and BBMD.
+    // Replaces the hidden Advanced BACnet Inspector; Building Workspace stays model-only.
+    id: "bacnet-manager",
+    name: "BACnet Manager",
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
@@ -151,20 +150,19 @@ export const TOOL_MANIFESTS = [
     provides: [],
     requires: [
       { capability: "bacnet.read", version: "^1.0" },
+      { capability: "inventory", version: "^1.0" },
       { capability: "netscan", version: "^1.0", optional: true },
     ],
-    permissions: ["fs.appdata"],
+    permissions: ["inventory.read", "inventory.write"],
     ui: {
       emoji: "🏢",
-      tagline: "Advanced raw BACnet/IP inspection, object browsing, writes, COV, and trends.",
+      tagline: "Discover BACnet devices, import into the building model, browse objects, COV, and alarms.",
       description:
-        "An advanced YABE-style BACnet/IP inspector kept as a field-debugging " +
-        "escape hatch. Building Workspace is the normal SI workflow; this view " +
-        "uses the same bacnet-core service for discovery, object lists, reads, " +
-        "writes, COV, and trend-log inspection when raw protocol visibility is " +
-        "needed. Uses an ephemeral UDP port, so it coexists with Niagara or any " +
-        "other BACnet stack running on this machine.",
-      defaultHidden: true,
+        "The SI workflow for BACnet protocol work: subnet discovery and drift tracking, " +
+        "device inbox and import plan, object browse with reads/writes/COV/trends, and alarm " +
+        "acknowledgement. Imports land in the shared inventory for Building Workspace to " +
+        "model, historize, and commission. Uses the headless bacnet-core service on an " +
+        "ephemeral UDP port so it coexists with Niagara or any other BACnet stack.",
       repo: REPO,
     },
   },
@@ -224,7 +222,7 @@ export const TOOL_MANIFESTS = [
         "objects into a lightweight tagged model, apply equipment templates, historize " +
         "points, generate dashboard definitions, run commissioning checks, and export " +
         "Markdown/CSV reports. Local-first and built on the same platform capabilities " +
-        "as the BACnet Inspector, Historian, and Observability Pack.",
+        "as the BACnet Manager, Historian, and Observability Pack.",
       repo: REPO,
     },
   },

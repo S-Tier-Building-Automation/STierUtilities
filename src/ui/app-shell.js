@@ -17,11 +17,12 @@ import { el } from "./dom.js";
  * @param {(on: boolean) => void} deps.setSidebarCollapsed
  * @param {object} deps.pages — { library, settings, account, services, activity, plugin }
  * @param {() => object|null} deps.getBuildingWorkspace
+ * @param {() => object|null} [deps.getBacnetManager]
  */
 export function createAppShell({
   appVersion, getTools, isFavorite, isHidden, setView, pluginView,
   currentView, currentPluginId, applySidebarCollapsed, setSidebarCollapsed,
-  pages, getBuildingWorkspace,
+  pages, getBuildingWorkspace, getBacnetManager = () => null,
 }) {
   let updateInFlight = false;
   let lastRenderedView = "";
@@ -258,8 +259,8 @@ export function createAppShell({
       bw?.renderModelScope?.({ tree: true, details: true, header: true });
       return;
     }
-    if (scope === "building-workspace:inbox") {
-      bw?.renderInboxScope?.();
+    if (scope === "bacnet-manager:inbox") {
+      getBacnetManager()?.renderInboxScope?.();
       return;
     }
     if (scope === "all") {
