@@ -188,14 +188,14 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     userState, saveUserState,
     getPlatform: () => platform,
     getInventory: () => (platform ? platform.capability("inventory.v1") : null),
-    bacnet, getBuildingWorkspace: () => buildingWorkspace,
+    bacnet, getBuildingWorkspace: () => buildingWorkspace, listen,
   });
   buildingWorkspace = createBuildingWorkspaceUi({
     invoke, el, logTo,
     renderAll: () => appUi.renderAll(),
     renderScoped: (scope) => appUi.renderScoped(scope),
     userState, saveUserState, getPlatform: () => platform,
-    networkManager, bacnet, setView, pluginView, currentPluginId,
+    networkManager, bacnet, setView, pluginView, currentPluginId, listen,
     getPack: () => pack, getTelemetry,
     getHistorian: () => bacnetHistorian.getInstance(),
     histSyncFromInventory: () => bacnetHistorian.syncFromInventory(),

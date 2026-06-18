@@ -75,7 +75,8 @@ export function buildFactories(invoke, options = {}) {
     const bacnet = host.use("bacnet.read.v1");
     const scheduler = host.use("scheduler.v1");
     const timeseries = host.tryUse("timeseries.v1");
-    host.provide("bacnet.historian", "1.0", createHistorian({ bacnet, scheduler, timeseries }));
+    const netscan = host.tryUse("netscan.v1");
+    host.provide("bacnet.historian", "1.0", createHistorian({ bacnet, scheduler, timeseries, netscan }));
   });
 
   factories.set("building-workspace", async (host) => {

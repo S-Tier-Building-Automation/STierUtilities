@@ -11,9 +11,10 @@
  * @param {() => object|null} deps.getInventory
  * @param {ReturnType<typeof import("./bacnet.js").createBacnetUi>} deps.bacnet
  * @param {() => object|null} deps.getBuildingWorkspace
+ * @param {typeof import("../../platform/tauri.js").listen} [deps.listen]
  */
 export function createBacnetHistorianUi({
-  el, logTo, renderAll, userState, saveUserState, getPlatform, getInventory, bacnet, getBuildingWorkspace,
+  el, logTo, renderAll, userState, saveUserState, getPlatform, getInventory, bacnet, getBuildingWorkspace, listen,
 }) {
 
 function historianInstance() {
@@ -26,6 +27,17 @@ function inventoryInstance() {
 }
 
 let histIntervalMs = 60000;
+let histUseCov = false;
+let histCovListenerReady = false;
+
+function ensureHistorianCovListener() {
+  if (histCovListenerReady || !listen) return;
+  histCovListenerReady = true;
+  listen("bacnet:cov", (event) => {
+    const hist = historianInstance();
+    if (hist?.handleCovEvent?.(event.payload)) renderAll();
+  }).catch((err) => console.warn("listen bacnet:cov (historian) failed:", err));
+}
 
 function histStatusPill() {
   const hist = historianInstance();
@@ -50,6 +62,7 @@ function histPersist() {
     })),
     running: hist.isRunning(),
     intervalMs: histIntervalMs,
+    useCov: histUseCov,
   };
   saveUserState();
 }
@@ -101,15 +114,18 @@ function histRestore({ replace = false } = {}) {
   if (!saved) return;
   for (const p of saved.points || []) hist.addPoint(p);
   if (saved.intervalMs) histIntervalMs = saved.intervalMs;
+  if (saved.useCov) histUseCov = Boolean(saved.useCov);
+  ensureHistorianCovListener();
   const refreshed = histSyncFromInventory();
   if (refreshed) histPersist();
   if (saved.running && (saved.points || []).length) {
-    hist.start(histIntervalMs);
+    hist.start(histIntervalMs, { cov: histUseCov });
     logTo("bacnet-historian", `Resumed logging ${saved.points.length} point(s).`, "info");
   }
 }
 
 function renderHistorianPage() {
+  ensureHistorianCovListener();
   const hist = historianInstance();
   if (!hist) {
     return el("div", { class: "plugin-controls" },
@@ -160,20 +176,28 @@ function renderHistorianPage() {
   );
 
   const intervalInput = el("input", { type: "number", class: "nm-input bac-range-input", value: String(Math.round(histIntervalMs / 1000) || 60), title: "seconds" });
+  const covToggle = el("label", { class: "nm-field bac-cov-toggle" },
+    el("input", {
+      type: "checkbox",
+      checked: histUseCov ? "checked" : undefined,
+      onchange: (e) => { histUseCov = e.target.checked; histPersist(); },
+    }),
+    el("span", { class: "nm-field-label" }, "Use COV (event-driven updates between polls)"));
   const running = hist.isRunning();
   const controlCard = el("section", { class: "plugin-section" },
     el("div", { class: "section-head" },
       el("h3", {}, "Logging"),
-      el("span", { class: `pill ${running ? "pill-running" : "pill-idle"}` }, running ? "Logging" : "Idle")),
+      el("span", { class: `pill ${running ? "pill-running" : "pill-idle"}` }, running ? (hist.covEnabled?.() ? "Logging · COV" : "Logging") : "Idle")),
     el("p", { class: "muted small" },
-      "Writes present-value to the time-series service. Connect the Observability Pack to chart it in Grafana."),
+      "Writes present-value to the time-series service. Poll interval remains as a fallback; enable COV for faster updates on supported objects. Unreachable devices are skipped when Network Manager is available."),
     el("div", { class: "bac-discover-controls" },
       el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Interval (s)"), intervalInput),
+      covToggle,
       el("button", {
         class: "btn btn-primary",
         onclick: () => {
           histIntervalMs = Math.max(5, Number(intervalInput.value) || 60) * 1000;
-          hist.start(histIntervalMs);
+          hist.start(histIntervalMs, { cov: histUseCov });
           logTo("bacnet-historian", "Started logging.", "ok");
           histPersist();
           renderAll();

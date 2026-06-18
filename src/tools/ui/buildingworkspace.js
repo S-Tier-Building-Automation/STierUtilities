@@ -11,6 +11,8 @@ import {
   bwPlanDeviceObjects,
   bwQueueInboxDevices,
   bwRemoveQueuedDevices,
+  bwResolveDeviceConflict,
+  bwSetQueuedTargetFloor,
   commissioningValueMatches,
   exportCommissioningCsv,
   exportCommissioningMarkdown,
@@ -22,7 +24,7 @@ import {
   runCommissioning,
   suggestEquipmentName,
 } from "../building-workspace.js";
-import { closeModal, openModal } from "../../ui/modal.js";
+import { closeModal, confirmAction, openModal } from "../../ui/modal.js";
 import { toast } from "../../ui/toast.js";
 
 /**
@@ -45,11 +47,12 @@ import { toast } from "../../ui/toast.js";
  * @param {() => object|null} deps.getHistorian
  * @param {() => number} deps.histSyncFromInventory
  * @param {() => void} deps.histPersist
+ * @param {typeof import("../../platform/tauri.js").listen} [deps.listen]
  */
 export function createBuildingWorkspaceUi(deps) {
   const {
     invoke, el, logTo, renderAll, renderScoped, userState, saveUserState, getPlatform, networkManager, bacnet,
-    setView, pluginView, getPack, getTelemetry = () => null, getHistorian, currentPluginId,
+    setView, pluginView, getPack, getTelemetry = () => null, getHistorian, currentPluginId, listen,
     histSyncFromInventory, histPersist,
   } = deps;
 
@@ -117,6 +120,7 @@ function bwStateFromUserState() {
     cxPriority: "8",
     cxVerify: false,
     cxToggle: false,
+    liveUseCov: Boolean(saved.liveUseCov),
   };
 }
 
@@ -138,6 +142,7 @@ function bwSaveState() {
     collapsedNodeIds: bw.collapsedNodeIds,
     lastRunId: bw.lastRunId,
     deviceInbox: bw.deviceInbox,
+    liveUseCov: bw.liveUseCov,
   };
   saveUserState();
 }
@@ -411,7 +416,7 @@ function bwOpenInboxMenu(event, phase, item) {
   if (bw.deviceInbox.phase !== phase || !selected.includes(item.key)) {
     bwSetInboxSelection(phase, [item.key], item.key);
   }
-  bw.inboxMenu = { x: event.clientX, y: event.clientY, phase, key: item.key };
+  bw.inboxMenu = { x: event.clientX, y: event.clientY, phase, key: item.key, item };
   bwSaveState();
   bwSyncInboxSelectionUi();
   bwRenderInboxMenu();
@@ -447,6 +452,79 @@ function bwInboxMenuButton(label, onclick, danger = false) {
   }, label);
 }
 
+function bwListFloors(inv) {
+  const floors = [];
+  for (const site of inv.listEntities({ type: "site" })) {
+    for (const building of inv.listEntities({ type: "building", siteId: site.id })) {
+      for (const floor of inv.listEntities({ type: "floor", buildingId: building.id })) {
+        floors.push({ site, building, floor });
+      }
+    }
+  }
+  return floors;
+}
+
+function bwFloorSelectOptions(inv, selectedId = "") {
+  const options = [el("option", { value: "" }, "Choose floor…")];
+  for (const { site, building, floor } of bwListFloors(inv)) {
+    options.push(el("option", {
+      value: floor.id,
+      selected: floor.id === selectedId ? "selected" : undefined,
+    }, `${site.name} / ${building.name} / ${floor.name}`));
+  }
+  return options;
+}
+
+function bwApplyQueuedTargetFloor(floorId, keys = null) {
+  const inv = inventoryInstance();
+  if (!inv || !floorId) return;
+  const selected = keys || bwInboxSelectionFor("modeling");
+  bw.deviceInbox.candidates = bwSetQueuedTargetFloor(
+    bw.deviceInbox.candidates || {},
+    selected.length ? selected : null,
+    floorId,
+  );
+  const floor = inv.getEntity(floorId);
+  logTo("building-workspace", `Set import target to ${floor?.name || floorId} for ${selected.length || "all queued"} device(s).`, "ok");
+  bwSaveState();
+  bwRenderInboxScope();
+}
+
+function bwUpdateDeviceBinding(item) {
+  const inv = inventoryInstance();
+  if (!inv || !item?.device || !item?.modeledDevice) return;
+  const points = inv.listEntities({ type: "point" }).filter(
+    (p) => Number(p.deviceInstance) === Number(item.modeledDevice.deviceInstance),
+  );
+  const { updated } = bwResolveDeviceConflict({
+    action: "replace",
+    modeledDevice: item.modeledDevice,
+    device: item.device,
+    points,
+  });
+  if (!updated.length) {
+    logTo("building-workspace", "No binding changes were applied.", "warn");
+    return;
+  }
+  for (const entity of updated) inv.upsertEntity(entity);
+  bwSaveState();
+  logTo("building-workspace",
+    `Updated binding for ${item.modeledDevice.name || item.modeledDevice.id} from latest discovery.`,
+    "ok");
+  bwRenderInboxScope();
+}
+
+function bwDriftMissingEl() {
+  const missing = bacnet.getDriftMissing?.() || [];
+  if (!missing.length) return null;
+  const labels = missing.slice(0, 5).map((d) => d.instance ?? d.key).join(", ");
+  const suffix = missing.length > 5 ? ` (+${missing.length - 5} more)` : "";
+  return el("p", {
+    class: "muted small bw-drift-missing",
+    title: "Devices seen in the previous scan but not in the latest discovery",
+  }, `${missing.length} missing since last scan: ${labels}${suffix}`);
+}
+
 function bwInboxContextMenu(inv, floor = null) {
   const menu = bw.inboxMenu;
   if (!menu) return null;
@@ -454,7 +532,13 @@ function bwInboxContextMenu(inv, floor = null) {
   const selectedCount = selected.length || 1;
   const items = [];
   if (menu.phase === "discovery") {
-    items.push(bwInboxMenuButton(`Add ${selectedCount} to Import Plan`, bwQueueSelectedInboxDevices));
+    const item = menu.item;
+    if (item?.status === "changed" && item.modeledDevice) {
+      items.push(bwInboxMenuButton("Update binding from discovery", () => bwUpdateDeviceBinding(item)));
+    }
+    if (item?.queueable !== false) {
+      items.push(bwInboxMenuButton(`Add ${selectedCount} to Import Plan`, bwQueueSelectedInboxDevices));
+    }
     items.push(bwInboxMenuButton(`Ignore ${selectedCount}`, bwIgnoreSelectedInboxDevices, true));
   } else {
     if (floor) items.push(bwInboxMenuButton(selectedCount > 1 ? `Add selected to ${floor.name}` : `Add to ${floor.name}`, () => bwModelQueuedDevicesToFloor(floor.id)));
@@ -777,7 +861,14 @@ function bwSyncInboxSelectionUi() {
   const remove = document.getElementById("bw-inbox-remove-queued");
   if (remove) remove.disabled = phase !== "modeling" || selected.size === 0;
   const add = document.getElementById("bw-inbox-model-selected");
-  if (add) add.disabled = !add.dataset.floorId || Number(add.dataset.queuedCount || 0) === 0;
+  if (add) {
+    const queuedCount = Number(add.dataset.queuedCount || 0);
+    const hasFloor = Boolean(add.dataset.floorId);
+    const hasPerRow = add.dataset.hasPerRowTargets === "1";
+    add.disabled = queuedCount === 0 || (!hasFloor && !hasPerRow) ? "disabled" : undefined;
+  }
+  const updateBinding = document.getElementById("bw-inbox-update-binding");
+  if (updateBinding) updateBinding.disabled = phase !== "discovery" || selected.size === 0 ? "disabled" : undefined;
 }
 
 function bwApplyDeviceInboxFilter() {
@@ -897,11 +988,10 @@ function bwClearDeviceDiscovery() {
 
 function bwModelQueuedDevicesToFloor(floorId, keys = null) {
   const inv = inventoryInstance();
-  const floor = inv && inv.getEntity(floorId);
-  if (!inv || !floor) return;
-  const building = inv.getEntity(floor.buildingId || floor.parentId);
-  const site = inv.getEntity(floor.siteId || building?.siteId);
-  if (!site || !building) return;
+  if (!inv) return;
+  const floor = floorId ? inv.getEntity(floorId) : bwCurrentFloorForInbox(inv);
+  const building = floor ? inv.getEntity(floor.buildingId || floor.parentId) : null;
+  const site = building ? inv.getEntity(floor.siteId || building?.siteId) : null;
   const selectedKeys = Array.isArray(keys)
     ? keys
     : (bw.deviceInbox.phase === "modeling" ? bwInboxSelectionFor("modeling") : []);
@@ -912,9 +1002,9 @@ function bwModelQueuedDevicesToFloor(floorId, keys = null) {
     inventory: inv,
     devices: bacnet.getDevices() || [],
     candidates: bw.deviceInbox.candidates || {},
-    floor,
-    site,
-    building,
+    floor: floor || null,
+    site: site || null,
+    building: building || null,
     makeEntity: bwDeviceEntityFromBacnet,
     keys: modelKeys,
   });
@@ -923,14 +1013,17 @@ function bwModelQueuedDevicesToFloor(floorId, keys = null) {
   if (imported.length) {
     bwSetSelection(imported.map((d) => d.id), imported.at(-1).id);
     bw.selectionAnchorId = imported.at(-1).id;
-    bw.selectedSiteId = site.id;
-    bw.selectedBuildingId = building.id;
-    bw.selectedFloorId = floor.id;
+    const first = imported[0];
+    bw.selectedSiteId = first.siteId || bw.selectedSiteId;
+    bw.selectedBuildingId = first.buildingId || bw.selectedBuildingId;
+    bw.selectedFloorId = first.floorId || bw.selectedFloorId;
   }
   bwSetInboxSelection("modeling", []);
   bwSaveState();
+  const targetNames = [...new Set(imported.map((d) => inv.getEntity(d.floorId)?.name).filter(Boolean))];
+  const where = targetNames.length ? ` on ${targetNames.join(", ")}` : "";
   logTo("building-workspace",
-    `Added ${imported.length} queued device${imported.length === 1 ? "" : "s"} to ${floor.name}.${result.skipped ? ` Skipped ${result.skipped}.` : ""}`,
+    `Added ${imported.length} queued device${imported.length === 1 ? "" : "s"}${where}.${result.skipped ? ` Skipped ${result.skipped}.` : ""}`,
     imported.length ? "ok" : "warn");
   bwRenderInboxScope();
 }
@@ -1882,7 +1975,10 @@ function bwDiscoveredDeviceRows(inv) {
       el("td", { class: "bac-mono", ...dragAttrs }, bacnet.addressText(device)),
       el("td", { ...dragAttrs }, bacnet.vendorText(device) || el("span", { class: "muted" }, "-")),
       el("td", { ...dragAttrs }, device.modelName || el("span", { class: "muted" }, "-")),
-      el("td", { ...dragAttrs }, el("span", { class: `pill ${bwInboxStatusClass(item.status)}` }, bwInboxStatusLabel(inv, item, floor))));
+      el("td", { ...dragAttrs }, el("span", { class: "bw-inbox-status-cell" },
+        el("span", { class: `pill ${bwInboxStatusClass(item.status)}` }, bwInboxStatusLabel(inv, item, floor)),
+        bacnet.deviceDriftBadge?.(device) || null)),
+    );
   });
   return rows.length ? rows : [el("tr", {}, el("td", { class: "muted small", colspan: "6" }, bwDeviceInboxEmptyMessage()))];
 }
@@ -1923,10 +2019,14 @@ function bwInboxPathLabel(inv, entity) {
 function bwDeviceInbox(inv, floor = null) {
   const discovered = bwDeviceInboxCandidateList(inv);
   const queued = bwDeviceInboxQueueList(inv);
-  const discoverySelected = bwInboxSelectionFor("discovery").length;
+  const discoverySelectedKeys = bwInboxSelectionFor("discovery");
+  const discoverySelected = discoverySelectedKeys.length;
   const modelingSelected = bwInboxSelectionFor("modeling").length;
+  const selectedDiscoveryItems = discovered.filter((item) => discoverySelectedKeys.includes(item.key));
+  const canUpdateBinding = selectedDiscoveryItems.some((item) => item.status === "changed" && item.modeledDevice);
   const adapterTarget = bacnet.adapterTarget();
-  const canModel = Boolean(floor && queued.length);
+  const hasPerRowTargets = queued.some((item) => item.candidate?.targetFloorId);
+  const canModel = queued.length > 0 && (floor || hasPerRowTargets);
   return el("div", {
     id: "bw-device-inbox",
     class: "bw-device-inbox",
@@ -1936,7 +2036,10 @@ function bwDeviceInbox(inv, floor = null) {
     el("div", { class: "bw-inbox-stage bw-inbox-stage-discovery" },
       el("div", { class: "section-head bw-inbox-stage-head" },
         el("h4", {}, "BACnet Device Inbox"),
-        el("span", { id: "bw-device-inbox-count", class: "muted small" }, bacnet.isDiscovering() ? "Discovering..." : `${discovered.length} shown · ${queued.length} queued`)),
+        el("span", { id: "bw-device-inbox-count", class: "muted small" },
+          bacnet.isDiscovering() ? "Discovering..." : `${discovered.length} shown · ${queued.length} queued`,
+          bacnet.driftSummaryEl?.() || null)),
+      bwDriftMissingEl(),
       adapterTarget
         ? el("p", { class: "muted small bw-inbox-target" }, `Discovery target: ${adapterTarget.label}`)
         : null,
@@ -1953,6 +2056,16 @@ function bwDeviceInbox(inv, floor = null) {
           disabled: discoverySelected ? undefined : "disabled",
           onclick: bwIgnoreSelectedInboxDevices,
         }, "Ignore"),
+        el("button", {
+          id: "bw-inbox-update-binding",
+          class: "btn-ghost",
+          disabled: canUpdateBinding ? undefined : "disabled",
+          onclick: () => {
+            for (const item of selectedDiscoveryItems) {
+              if (item.status === "changed" && item.modeledDevice) bwUpdateDeviceBinding(item);
+            }
+          },
+        }, "Update binding"),
         el("button", { id: "bw-inbox-clear", class: "btn-ghost", disabled: bacnet.getDevices().length || queued.length ? undefined : "disabled", onclick: bwClearDeviceDiscovery }, "Clear")),
       el("input", {
         class: "nm-input bw-device-filter",
@@ -1973,16 +2086,30 @@ function bwDeviceInbox(inv, floor = null) {
     el("div", { class: "bw-inbox-stage bw-inbox-stage-queue" },
       el("div", { class: "section-head bw-inbox-stage-head" },
         el("h4", {}, "Import Plan"),
-        el("span", { class: "muted small" }, floor ? `Target: ${floor.name}` : "Select a floor in the Model Tree")),
-      el("div", { class: "tool-actions" },
+        el("span", { class: "muted small" }, floor
+          ? `Default target: ${floor.name}${hasPerRowTargets ? " · some rows have custom targets" : ""}`
+          : hasPerRowTargets ? "Using per-row target floors" : "Select a floor or assign targets below")),
+      el("div", { class: "tool-actions bw-import-plan-actions" },
+        el("select", {
+          class: "nm-input bw-import-target-select",
+          onchange: (e) => { bw._importTargetFloorId = e.target.value; },
+        }, ...bwFloorSelectOptions(inv, bw._importTargetFloorId || floor?.id || "")),
+        el("button", {
+          class: "btn-ghost",
+          disabled: modelingSelected ? undefined : "disabled",
+          onclick: () => bwApplyQueuedTargetFloor(bw._importTargetFloorId),
+        }, "Set target for selected"),
         el("button", {
           id: "bw-inbox-model-selected",
           class: "btn-ghost",
           "data-floor-id": floor?.id || "",
           "data-queued-count": String(queued.length),
+          "data-has-per-row-targets": hasPerRowTargets ? "1" : "0",
           disabled: canModel ? undefined : "disabled",
-          onclick: () => bwModelQueuedDevicesToFloor(floor.id),
-        }, floor ? (modelingSelected ? `Add selected to ${floor.name}` : `Add queue to ${floor.name}`) : "Select a floor"),
+          onclick: () => bwModelQueuedDevicesToFloor(floor?.id || null),
+        }, floor
+          ? (modelingSelected ? `Add selected to ${floor.name}` : `Add queue to ${floor.name}`)
+          : (hasPerRowTargets ? "Add queue (per-row targets)" : "Select a floor")),
         el("button", {
           id: "bw-inbox-remove-queued",
           class: "btn-ghost",
@@ -2114,7 +2241,119 @@ function bwDeviceDetails(inv, equip) {
       el("select", { class: "nm-input bw-template-select", onchange: (e) => { bw.template = e.target.value; bwSaveState(); } },
         ...templates.map((t) => el("option", { value: t.id, selected: bw.template === t.id || bw.template === t.id.replace("template:", "") ? "selected" : undefined }, t.name)))),
     bwDeviceLivePanel(inv, equip),
+    bwAlarmsPanel(equip),
   ];
+}
+
+// ---- Device alarms (GetEventInformation / GetAlarmSummary) ----
+
+let bwAlarms = { loading: false, equipId: null, entries: [], error: null, ran: false };
+
+function bwEquipDeviceRef(equip) {
+  return equip.deviceRef || { deviceInstance: equip.deviceInstance };
+}
+
+async function bwReadAlarms(equip) {
+  if (!equip || bwAlarms.loading) return;
+  const device = bwEquipDeviceRef(equip);
+  if (device.deviceInstance == null && device.instance == null) return;
+  bwAlarms.loading = true;
+  bwAlarms.equipId = equip.id;
+  bwAlarms.error = null;
+  bwRenderModelScope({ details: true });
+  try {
+    const entries = await bwBacnetCap().getAlarms(device);
+    if (bwAlarms.equipId !== equip.id) return;
+    bwAlarms.entries = entries;
+    bwAlarms.ran = true;
+    const active = entries.filter((e) => e.eventState !== "normal").length;
+    logTo("building-workspace", `Read ${entries.length} alarm record${entries.length === 1 ? "" : "s"} from ${equip.name || equip.id} (${active} not normal).`, entries.length ? "ok" : "info");
+  } catch (err) {
+    if (bwAlarms.equipId !== equip.id) return;
+    bwAlarms.entries = [];
+    bwAlarms.error = String(err);
+    bwAlarms.ran = true;
+    logTo("building-workspace", `Alarm read failed for ${equip.name || equip.id}: ${err}`, "error");
+  } finally {
+    if (bwAlarms.equipId === equip.id) {
+      bwAlarms.loading = false;
+      bwRenderModelScope({ details: true });
+    }
+  }
+}
+
+async function bwAcknowledgeAlarm(equip, alarm) {
+  const device = bwEquipDeviceRef(equip);
+  const label = `${alarm.typeName}:${alarm.instance}${alarm.name ? ` (${alarm.name})` : ""}`;
+  const ok = await confirmAction({
+    title: "Acknowledge alarm",
+    message: `Acknowledge the "${alarm.eventState}" alarm on ${label} at ${equip.name || equip.id}? This writes to the device.`,
+    confirmLabel: "Acknowledge",
+  });
+  if (!ok) return;
+  logTo("building-workspace", `ACK requested — ${label} (${alarm.eventState}) on ${equip.name || equip.id}.`, "warn");
+  try {
+    await bwBacnetCap().acknowledgeAlarm({ device, objectType: alarm.objectType, instance: alarm.instance });
+    logTo("building-workspace", `ACK accepted — ${label}.`, "ok");
+    toast(`Acknowledged ${label}`, "ok");
+    await bwReadAlarms(equip);
+  } catch (err) {
+    logTo("building-workspace", `ACK failed — ${label}: ${err}`, "error");
+    toast(`Acknowledge failed: ${err}`, "error");
+  }
+}
+
+function bwAlarmRows(equip) {
+  const fresh = bwAlarms.equipId === equip.id;
+  const entries = fresh ? bwAlarms.entries : [];
+  if (!entries.length) return [];
+  return entries.map((a) => {
+    const stateCls = a.eventState === "normal" ? "" : "bac-alarm-active";
+    const action = a.acknowledged
+      ? el("span", { class: "muted small" }, "ack'd")
+      : el("button", {
+          class: "btn-ghost",
+          title: "Acknowledge this alarm on the device (writes)",
+          onclick: () => bwAcknowledgeAlarm(equip, a),
+        }, "Ack");
+    return el("tr", { class: stateCls },
+      el("td", {}, `${a.typeName}:${a.instance}`),
+      el("td", {}, a.name || "—"),
+      el("td", {}, a.eventState),
+      el("td", {}, a.acknowledged ? "yes" : "no"),
+      el("td", {}, action));
+  });
+}
+
+function bwAlarmsPanel(equip) {
+  if (!(equip.deviceInstance != null || equip.deviceRef)) return null;
+  const fresh = bwAlarms.equipId === equip.id;
+  const rows = bwAlarmRows(equip);
+  let status = "";
+  if (bwAlarms.loading && fresh) status = "Reading alarms…";
+  else if (fresh && bwAlarms.error) status = `Error: ${bwAlarms.error}`;
+  else if (fresh && bwAlarms.ran && rows.length === 0) status = "No active or unacknowledged alarms.";
+  return el("div", { class: "bw-alarms" },
+    el("div", { class: "section-head bw-live-head" },
+      el("h4", {}, "Alarms"),
+      el("button", {
+        class: "btn-ghost",
+        disabled: bwAlarms.loading ? "disabled" : undefined,
+        title: "List active and unacknowledged alarms (GetEventInformation / GetAlarmSummary)",
+        onclick: () => bwReadAlarms(equip),
+      }, bwAlarms.loading && fresh ? "…" : "Read alarms")),
+    status ? el("p", { class: "muted small" }, status) : null,
+    rows.length
+      ? el("div", { class: "table-scroll" },
+          el("table", { class: "bac-table" },
+            el("thead", {}, el("tr", {},
+              el("th", {}, "Object"),
+              el("th", {}, "Name"),
+              el("th", {}, "State"),
+              el("th", {}, "Ack"),
+              el("th", {}, ""))),
+            el("tbody", {}, ...rows)))
+      : null);
 }
 
 // ---- Phase 2: live control for a modeled point (present-value, status flags,
@@ -2129,6 +2368,9 @@ let bwLiveTimer = null;
 let bwLivePaused = false;
 let bwLiveBusyWrite = false;
 let bwLiveBusyPoll = false;  // guards against overlapping async ticks
+/** @type {Map<string, { processId: number, device: object, objectType: number, instance: number }>} */
+let bwCovSubs = new Map();
+let bwCovListenerReady = false;
 const BW_POINT_POLL_MS = 4000;
 const BW_DEVICE_POLL_MS = 12000;
 const BW_DEVICE_POLL_CAP = 60; // don't hammer a big device every tick
@@ -2168,6 +2410,107 @@ function bwStopLivePoll() {
   bwLivePoll = null;
   bwLive = null;
   bwDeviceLive = null;
+  void bwUnsubscribeAllCov();
+}
+
+function ensureBwCovListener() {
+  if (bwCovListenerReady || !listen) return;
+  bwCovListenerReady = true;
+  listen("bacnet:cov", (event) => bwHandleCovEvent(event.payload)).catch((err) => {
+    console.warn("listen bacnet:cov (building-workspace) failed:", err);
+  });
+}
+
+async function bwUnsubscribeAllCov() {
+  const cap = bwBacnetCap();
+  const pending = [];
+  for (const [, sub] of bwCovSubs) {
+    if (!cap.unsubscribeCov) continue;
+    pending.push(cap.unsubscribeCov({
+      device: sub.device,
+      objectType: sub.objectType,
+      instance: sub.instance,
+      processId: sub.processId,
+    }).catch(() => {}));
+  }
+  bwCovSubs.clear();
+  await Promise.allSettled(pending);
+}
+
+async function bwSubscribeLiveCov(inv, poll) {
+  await bwUnsubscribeAllCov();
+  if (!bw.liveUseCov || bwLivePaused) return;
+  const cap = bwBacnetCap();
+  if (!cap.subscribeCov) return;
+  if (poll.kind === "point") {
+    const entity = inv.getEntity(poll.id);
+    const ref = bwPointRef(entity);
+    if (!ref) return;
+    const deviceInstance = Number(entity.deviceInstance ?? ref.device.deviceInstance);
+    try {
+      const processId = await cap.subscribeCov({
+        device: ref.device,
+        deviceInstance,
+        objectType: ref.objectType,
+        instance: ref.instance,
+      });
+      bwCovSubs.set(poll.id, { processId, device: ref.device, objectType: ref.objectType, instance: ref.instance });
+    } catch (err) {
+      bwLive = { props: null, error: String(err) };
+    }
+    return;
+  }
+  const equip = inv.getEntity(poll.id);
+  const points = inv.listEntities({ type: "point", equipId: equip.id }).slice(0, BW_DEVICE_POLL_CAP);
+  for (const point of points) {
+    const ref = bwPointRef(point);
+    if (!ref) continue;
+    const deviceInstance = Number(point.deviceInstance ?? ref.device.deviceInstance);
+    try {
+      const processId = await cap.subscribeCov({
+        device: ref.device,
+        deviceInstance,
+        objectType: ref.objectType,
+        instance: ref.instance,
+      });
+      bwCovSubs.set(point.id, { processId, device: ref.device, objectType: ref.objectType, instance: ref.instance });
+    } catch (err) {
+      if (!bwDeviceLive) bwDeviceLive = { values: new Map() };
+      bwDeviceLive.values.set(point.id, { error: String(err) });
+    }
+  }
+}
+
+function bwHandleCovEvent(payload) {
+  if (!payload || !bwLivePoll || bwLivePaused || !bw.liveUseCov) return;
+  const inv = inventoryInstance();
+  if (!inv || currentPluginId() !== "building-workspace" || bw.tab !== "model") return;
+  for (const [pointId, sub] of bwCovSubs) {
+    if (Number(sub.processId) !== Number(payload.processId)) continue;
+    if (Number(payload.objectType) !== Number(sub.objectType) || Number(payload.instance) !== Number(sub.instance)) continue;
+    if (bwLivePoll.kind === "point") {
+      if (bwLivePoll.id !== pointId) return;
+      const entity = inv.getEntity(pointId);
+      if (!entity) return;
+      bwLive = { props: payload.values || [], cov: true };
+      bwUpdateLiveDisplay(entity);
+      return;
+    }
+    const equip = inv.getEntity(bwLivePoll.id);
+    if (!equip) return;
+    const pv = bwLivePresentValue(payload.values || []);
+    if (!bwDeviceLive) bwDeviceLive = { values: new Map() };
+    bwDeviceLive.values.set(pointId, { value: pv.value, display: pv.display, cov: true });
+    bwUpdateDeviceLive(equip);
+    return;
+  }
+}
+
+function bwToggleLiveCov(checked) {
+  bw.liveUseCov = Boolean(checked);
+  bwSaveState();
+  bwStopLivePoll();
+  bwSyncLivePoll();
 }
 
 function bwArmLiveTimer(ms) {
@@ -2178,6 +2521,7 @@ function bwArmLiveTimer(ms) {
 // Start/stop the live poll to match the current single selection on the Model tab.
 // Idempotent: re-selecting the same entity does not restart the timer or drop data.
 function bwSyncLivePoll() {
+  ensureBwCovListener();
   const inv = inventoryInstance();
   if (!inv || currentPluginId() !== "building-workspace" || bw.tab !== "model") { bwStopLivePoll(); return; }
   const sel = bwSelectedEntities(inv);
@@ -2190,6 +2534,10 @@ function bwSyncLivePoll() {
   bwStopLivePoll();
   bwLivePoll = target;
   bwLiveTick(); // immediate first read
+  if (bw.liveUseCov) {
+    void bwSubscribeLiveCov(inv, target);
+    return;
+  }
   bwArmLiveTimer(target.kind === "point" ? BW_POINT_POLL_MS : BW_DEVICE_POLL_MS);
 }
 
@@ -2197,9 +2545,15 @@ function bwToggleLivePause() {
   bwLivePaused = !bwLivePaused;
   if (bwLivePaused) {
     if (bwLiveTimer) { clearInterval(bwLiveTimer); bwLiveTimer = null; }
+    void bwUnsubscribeAllCov();
   } else if (bwLivePoll) {
     bwLiveTick();
-    bwArmLiveTimer(bwLivePoll.kind === "point" ? BW_POINT_POLL_MS : BW_DEVICE_POLL_MS);
+    if (bw.liveUseCov) {
+      const inv = inventoryInstance();
+      if (inv) void bwSubscribeLiveCov(inv, bwLivePoll);
+    } else {
+      bwArmLiveTimer(bwLivePoll.kind === "point" ? BW_POINT_POLL_MS : BW_DEVICE_POLL_MS);
+    }
   }
   const ind = document.getElementById("bw-live-indicator");
   if (ind) ind.replaceWith(bwLiveIndicator());
@@ -2258,9 +2612,12 @@ async function bwLiveTick() {
 }
 
 function bwLiveIndicator() {
+  const mode = bw.liveUseCov ? "COV" : "poll";
   return bwLivePaused
     ? el("span", { id: "bw-live-indicator", class: "muted small bw-live-ind" }, "paused")
-    : el("span", { id: "bw-live-indicator", class: "bw-live-ind" }, el("span", { class: "bw-live-dot", title: "Polling live" }), el("span", { class: "muted small" }, "live"));
+    : el("span", { id: "bw-live-indicator", class: "bw-live-ind" },
+        el("span", { class: "bw-live-dot", title: bw.liveUseCov ? "COV live" : "Polling live" }),
+        el("span", { class: "muted small" }, `live · ${mode}`));
 }
 
 function bwLiveControls() {
@@ -2268,6 +2625,13 @@ function bwLiveControls() {
     el("h4", {}, "Live"),
     el("div", { class: "bw-live-head-right" },
       bwLiveIndicator(),
+      el("label", { class: "bac-cov-toggle small" },
+        el("input", {
+          type: "checkbox",
+          checked: bw.liveUseCov ? "checked" : undefined,
+          onchange: (e) => bwToggleLiveCov(e.target.checked),
+        }),
+        "COV"),
       el("button", { id: "bw-live-pause", class: "btn-ghost", onclick: bwToggleLivePause }, bwLivePaused ? "Resume" : "Pause"),
     ),
   );

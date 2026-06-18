@@ -2,7 +2,8 @@
 // discovery, scheduling, or storage code — each is a declared capability
 // dependency. It periodically reads configured BACnet points via the bacnet.read
 // capability and writes their present-value into the timeseries service on a
-// scheduler cadence. Pure + dependency-injected for unit testing.
+// scheduler cadence. Optional COV subscriptions stream changes between polls.
+// Pure + dependency-injected for unit testing.
 
 /** Coerce a decoded BacnetValue ({kind, value}) to a number, or null if non-numeric. */
 export function numericFromValue(v) {
@@ -34,21 +35,127 @@ function deviceTag(device) {
   return String(device.deviceInstance ?? device.instance ?? device.id ?? "?");
 }
 
+function deviceInstanceOf(device) {
+  const n = Number(device?.deviceInstance ?? device?.instance ?? device?.id);
+  return Number.isFinite(n) ? n : null;
+}
+
+function deviceIp(device) {
+  if (!device || typeof device !== "object") return null;
+  const ip = device.address ?? device.ip;
+  return typeof ip === "string" && ip.trim() ? ip.trim() : null;
+}
+
 function compactTags(tags) {
   return Object.fromEntries(Object.entries(tags).filter(([, v]) => v != null && String(v) !== ""));
 }
 
 const JOB_ID = "bacnet-historian";
 
-export function createHistorian({ bacnet, scheduler, timeseries, now = () => Date.now() }) {
+export function createHistorian({ bacnet, scheduler, timeseries, netscan, now = () => Date.now() }) {
   if (!bacnet) throw new Error("historian requires the bacnet.read capability");
   if (!scheduler) throw new Error("historian requires the scheduler capability");
 
   // points: { device, objectType, instance, label, lastValue, lastError, reads }
   const points = [];
+  /** @type {Map<number, string>} processId -> point key */
+  const covByProcess = new Map();
+  let covActive = false;
+  let reachabilityCheck = true;
 
   function keyOf(p) {
     return `${deviceTag(p.device)}:${p.objectType}:${p.instance}`;
+  }
+
+  function findPoint(key) {
+    return points.find((p) => keyOf(p) === key) || null;
+  }
+
+  async function isDeviceReachable(device) {
+    if (!netscan || !reachabilityCheck) return true;
+    const ip = deviceIp(device);
+    if (!ip) return true;
+    try {
+      const result = await netscan.isReachable(ip);
+      return Boolean(result?.reachable);
+    } catch {
+      return true;
+    }
+  }
+
+  function writePointSample(p, value, ts) {
+    p.reads++;
+    p.lastError = null;
+    if (value == null) return false;
+    p.lastValue = value;
+    if (!timeseries) return false;
+    timeseries.write({
+      measurement: "bacnet_point",
+      tags: compactTags({
+        site: p.site,
+        building: p.building,
+        floor: p.floor,
+        equip: p.equip,
+        point: p.pointId,
+        device: deviceTag(p.device),
+        object: `${p.objectType}:${p.instance}`,
+        label: p.label || "",
+      }),
+      fields: { present_value: value },
+      ts,
+    });
+    return true;
+  }
+
+  async function subscribePointCov(p) {
+    if (!bacnet.subscribeCov) return;
+    const deviceInstance = deviceInstanceOf(p.device);
+    if (deviceInstance == null) throw new Error("COV subscribe requires deviceInstance on the point device ref");
+    const processId = await bacnet.subscribeCov({
+      device: p.device,
+      deviceInstance,
+      objectType: p.objectType,
+      instance: p.instance,
+    });
+    covByProcess.set(Number(processId), keyOf(p));
+  }
+
+  async function unsubscribePointCov(p, processId) {
+    if (!bacnet.unsubscribeCov || processId == null) return;
+    try {
+      await bacnet.unsubscribeCov({
+        device: p.device,
+        objectType: p.objectType,
+        instance: p.instance,
+        processId,
+      });
+    } catch {
+      // Best-effort cleanup when a device drops off the network.
+    }
+  }
+
+  async function unsubscribeCovAll() {
+    const pending = [];
+    for (const [processId, key] of covByProcess) {
+      const p = findPoint(key);
+      if (p) pending.push(unsubscribePointCov(p, processId));
+    }
+    covByProcess.clear();
+    covActive = false;
+    await Promise.allSettled(pending);
+  }
+
+  async function subscribeCovAll() {
+    if (!bacnet.subscribeCov) return;
+    await unsubscribeCovAll();
+    covActive = true;
+    for (const p of points) {
+      try {
+        await subscribePointCov(p);
+      } catch (err) {
+        p.lastError = String(err && err.message ? err.message : err);
+      }
+    }
   }
 
   const api = {
@@ -64,20 +171,32 @@ export function createHistorian({ bacnet, scheduler, timeseries, now = () => Dat
         // Merge configuration fields only; preserve accumulated read state.
         const { lastValue, lastError, reads } = existing;
         Object.assign(existing, point, { lastValue, lastError, reads });
+        if (covActive) void subscribePointCov(existing).catch((err) => { existing.lastError = String(err); });
         return existing;
       }
       const rec = { ...point, lastValue: null, lastError: null, reads: 0 };
       points.push(rec);
+      if (covActive) void subscribePointCov(rec).catch((err) => { rec.lastError = String(err); });
       return rec;
     },
 
     removePoint(point) {
-      const i = points.findIndex((p) => keyOf(p) === keyOf(point));
-      if (i >= 0) points.splice(i, 1);
-      return i >= 0;
+      const key = keyOf(point);
+      const i = points.findIndex((p) => keyOf(p) === key);
+      if (i < 0) return false;
+      const removed = points[i];
+      for (const [processId, mapped] of covByProcess) {
+        if (mapped !== key) continue;
+        covByProcess.delete(processId);
+        void unsubscribePointCov(removed, processId);
+        break;
+      }
+      points.splice(i, 1);
+      return true;
     },
 
     clearPoints() {
+      void unsubscribeCovAll();
       points.splice(0, points.length);
     },
 
@@ -85,52 +204,61 @@ export function createHistorian({ bacnet, scheduler, timeseries, now = () => Dat
       return points.map((p) => ({ ...p }));
     },
 
+    /** Apply a bacnet:cov event payload; returns true when a configured point was updated. */
+    handleCovEvent(payload) {
+      if (!payload || !covActive) return false;
+      const key = covByProcess.get(Number(payload.processId));
+      if (!key) return false;
+      const p = findPoint(key);
+      if (!p) return false;
+      if (Number(payload.objectType) !== Number(p.objectType) || Number(payload.instance) !== Number(p.instance)) {
+        return false;
+      }
+      const value = extractPresentValue(payload.values);
+      writePointSample(p, value, now());
+      return true;
+    },
+
+    covEnabled() {
+      return covActive;
+    },
+
     /** Read every configured point once and write numeric values to timeseries. */
     async pollOnce() {
       let written = 0;
       let errors = 0;
+      let skipped = 0;
       const ts = now();
       for (const p of points) {
         try {
+          if (!(await isDeviceReachable(p.device))) {
+            p.lastError = "device unreachable";
+            errors++;
+            skipped++;
+            continue;
+          }
           const props = await bacnet.readPoint(p.device, p.objectType, p.instance);
           const value = extractPresentValue(props);
-          p.reads++;
-          p.lastError = null;
-          if (value != null) {
-            p.lastValue = value;
-            if (timeseries) {
-              timeseries.write({
-                measurement: "bacnet_point",
-                tags: compactTags({
-                  site: p.site,
-                  building: p.building,
-                  floor: p.floor,
-                  equip: p.equip,
-                  point: p.pointId,
-                  device: deviceTag(p.device),
-                  object: `${p.objectType}:${p.instance}`,
-                  label: p.label || "",
-                }),
-                fields: { present_value: value },
-                ts,
-              });
-              written++;
-            }
-          }
+          if (writePointSample(p, value, ts)) written++;
         } catch (err) {
           p.lastError = String(err && err.message ? err.message : err);
           errors++;
         }
       }
-      return { written, errors, points: points.length };
+      return { written, errors, skipped, points: points.length };
     },
 
-    start(intervalMs = 60000) {
+    start(intervalMs = 60000, opts = {}) {
+      reachabilityCheck = opts.reachabilityCheck !== false;
+      const useCov = Boolean(opts.cov);
+      if (useCov) void subscribeCovAll();
+      else void unsubscribeCovAll();
       scheduler.register(JOB_ID, { intervalMs, run: () => api.pollOnce(), immediate: true });
     },
 
     stop() {
       scheduler.unregister(JOB_ID);
+      void unsubscribeCovAll();
     },
 
     isRunning() {

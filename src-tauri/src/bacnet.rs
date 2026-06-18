@@ -3174,6 +3174,153 @@ mod tests {
         t.join().unwrap();
     }
 
+    fn fake_event_information_ack(invoke_id: u8) -> Vec<u8> {
+        let mut payload = Vec::new();
+        codec::encode_opening_tag(&mut payload, 0);
+        codec::encode_context_object_id(&mut payload, 0, ObjectId::new(0, 5));
+        codec::encode_context_unsigned(&mut payload, 1, 2); // offnormal
+        codec::encode_tag(&mut payload, 2, true, 2);
+        payload.extend_from_slice(&[5, 0x00]); // to-offnormal not acknowledged
+        codec::encode_opening_tag(&mut payload, 3);
+        codec::encode_opening_tag(&mut payload, 2);
+        codec::encode_application_value(
+            &mut payload,
+            &BacnetValue::Date {
+                year: 2026,
+                month: 6,
+                day: 17,
+                weekday: 3,
+            },
+        );
+        codec::encode_application_value(
+            &mut payload,
+            &BacnetValue::Time {
+                hour: 9,
+                minute: 30,
+                second: 0,
+                hundredths: 0,
+            },
+        );
+        codec::encode_closing_tag(&mut payload, 2);
+        codec::encode_closing_tag(&mut payload, 3);
+        codec::encode_context_unsigned(&mut payload, 4, 0);
+        codec::encode_tag(&mut payload, 5, true, 2);
+        payload.extend_from_slice(&[5, 0xE0]);
+        codec::encode_opening_tag(&mut payload, 6);
+        codec::encode_application_value(&mut payload, &BacnetValue::Unsigned { value: 16 });
+        codec::encode_application_value(&mut payload, &BacnetValue::Unsigned { value: 0 });
+        codec::encode_application_value(&mut payload, &BacnetValue::Unsigned { value: 0 });
+        codec::encode_closing_tag(&mut payload, 6);
+        codec::encode_closing_tag(&mut payload, 0);
+        codec::encode_tag(&mut payload, 1, true, 1);
+        payload.push(0);
+        let mut reply = vec![codec::PDU_COMPLEX_ACK, invoke_id, codec::SERVICE_GET_EVENT_INFORMATION];
+        reply.extend_from_slice(&payload);
+        unicast_reply(&reply)
+    }
+
+    #[test]
+    fn get_alarms_via_event_information_over_loopback() {
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            let (frame, src) = recv_frame(&fake);
+            let bvlc = codec::bvlc_decode(&frame).unwrap();
+            let npdu = codec::decode_npdu(&frame[bvlc.payload_offset..]).unwrap();
+            let Apdu::ConfirmedRequest { invoke_id, service, .. } =
+                codec::decode_apdu(&frame[bvlc.payload_offset + npdu.apdu_offset..]).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(service, codec::SERVICE_GET_EVENT_INFORMATION);
+            fake.send_to(&fake_event_information_ack(invoke_id), src).unwrap();
+
+            // Best-effort object-name enrichment issues ReadPropertyMultiple next.
+            let (frame2, src2) = recv_frame(&fake);
+            let bvlc2 = codec::bvlc_decode(&frame2).unwrap();
+            let npdu2 = codec::decode_npdu(&frame2[bvlc2.payload_offset..]).unwrap();
+            let Apdu::ConfirmedRequest { invoke_id: inv2, service: svc2, .. } =
+                codec::decode_apdu(&frame2[bvlc2.payload_offset + npdu2.apdu_offset..]).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(svc2, codec::SERVICE_READ_PROPERTY_MULTIPLE);
+            let mut reply = vec![codec::PDU_COMPLEX_ACK, inv2, codec::SERVICE_READ_PROPERTY_MULTIPLE];
+            codec::encode_context_object_id(&mut reply, 0, ObjectId::new(0, 5));
+            codec::encode_opening_tag(&mut reply, 1);
+            codec::encode_context_unsigned(&mut reply, 2, codec::PROP_OBJECT_NAME as u64);
+            codec::encode_opening_tag(&mut reply, 4);
+            codec::encode_application_value(
+                &mut reply,
+                &BacnetValue::CharacterString {
+                    value: "Zone Temp".into(),
+                },
+            );
+            codec::encode_closing_tag(&mut reply, 4);
+            codec::encode_closing_tag(&mut reply, 1);
+            fake.send_to(&unicast_reply(&reply), src2).unwrap();
+        });
+
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let target = Target {
+            sa: fake_addr,
+            route: None,
+            max_apdu: None,
+            segmentation: None,
+        };
+        let alarms = get_alarms_core(&client, &target).unwrap();
+        t.join().unwrap();
+        assert_eq!(alarms.len(), 1);
+        assert_eq!(alarms[0].object_type, 0);
+        assert_eq!(alarms[0].instance, 5);
+        assert_eq!(alarms[0].event_state, "offnormal");
+        assert!(!alarms[0].acknowledged);
+        assert_eq!(alarms[0].name, "Zone Temp");
+    }
+
+    #[test]
+    fn acknowledge_alarm_over_loopback() {
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            let (frame, src) = recv_frame(&fake);
+            let bvlc = codec::bvlc_decode(&frame).unwrap();
+            let npdu = codec::decode_npdu(&frame[bvlc.payload_offset..]).unwrap();
+            let Apdu::ConfirmedRequest { invoke_id, service, .. } =
+                codec::decode_apdu(&frame[bvlc.payload_offset + npdu.apdu_offset..]).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(service, codec::SERVICE_GET_EVENT_INFORMATION);
+            fake.send_to(&fake_event_information_ack(invoke_id), src).unwrap();
+
+            let (frame2, src2) = recv_frame(&fake);
+            let bvlc2 = codec::bvlc_decode(&frame2).unwrap();
+            let npdu2 = codec::decode_npdu(&frame2[bvlc2.payload_offset..]).unwrap();
+            let Apdu::ConfirmedRequest { invoke_id: inv2, service: svc2, .. } =
+                codec::decode_apdu(&frame2[bvlc2.payload_offset + npdu2.apdu_offset..]).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(svc2, codec::SERVICE_ACKNOWLEDGE_ALARM);
+            fake.send_to(
+                &unicast_reply(&[codec::PDU_SIMPLE_ACK, inv2, codec::SERVICE_ACKNOWLEDGE_ALARM]),
+                src2,
+            )
+            .unwrap();
+        });
+
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let target = Target {
+            sa: fake_addr,
+            route: None,
+            max_apdu: None,
+            segmentation: None,
+        };
+        acknowledge_alarm_core(&client, &target, ObjectId::new(0, 5)).unwrap();
+        t.join().unwrap();
+    }
+
     #[test]
     fn read_trend_over_loopback() {
         // Fake trend log: record-count = 2, then a ReadRange-ACK with 2 records.

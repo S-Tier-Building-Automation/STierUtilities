@@ -2112,7 +2112,23 @@ body.nm-resizing { cursor: col-resize; user-select: none; -webkit-user-select: n
   text-transform: none;
   letter-spacing: 0;
 }
-.bw-inbox-target {
+.bw-inbox-status-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.bw-import-plan-actions {
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.bw-import-target-select {
+  min-width: 220px;
+}
+.bw-drift-missing {
+  margin: 0 0 8px;
+}
   margin: var(--sp-2) 0 var(--sp-3);
 }
 .bw-inbox-grid {

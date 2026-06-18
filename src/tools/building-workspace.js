@@ -90,7 +90,7 @@ export function bwDeviceInboxCandidates({ devices = [], modeledDevices = [], can
       modeledEntityId: modeledDevice?.id || "",
       status,
       conflict,
-      selectable: status === "new" || status === "queued",
+      selectable: status === "new" || status === "queued" || status === "changed",
       queueable: status === "new",
     };
   });
@@ -126,8 +126,22 @@ export function bwRemoveQueuedDevices(candidates = {}, keys = []) {
   return next;
 }
 
+/** Assign a target floor to queued import-plan rows (bulk or selected). */
+export function bwSetQueuedTargetFloor(candidates = {}, keys = [], targetFloorId = "") {
+  const next = { ...candidates };
+  const applyKeys = keys?.length
+    ? keys
+    : Object.values(next).filter((c) => c?.status === "queued").map((c) => c.key);
+  for (const key of applyKeys) {
+    if (next[key]?.status === "queued") {
+      next[key] = { ...next[key], targetFloorId: targetFloorId || "" };
+    }
+  }
+  return next;
+}
+
 export function bwModelQueuedDevices({ inventory, devices = [], candidates = {}, floor, site, building, makeEntity, keys = null } = {}) {
-  if (!inventory || !floor || !site || !building || typeof makeEntity !== "function") {
+  if (!inventory || typeof makeEntity !== "function") {
     return { imported: [], skipped: 0, candidates };
   }
   const next = { ...candidates };
@@ -144,14 +158,32 @@ export function bwModelQueuedDevices({ inventory, devices = [], candidates = {},
       skipped++;
       continue;
     }
+    const candidate = next[key] || {};
+    const targetFloor = inventory.getEntity(candidate.targetFloorId || floor?.id);
+    const targetBuilding = inventory.getEntity(targetFloor?.buildingId || targetFloor?.parentId || building?.id);
+    const targetSite = inventory.getEntity(targetFloor?.siteId || targetBuilding?.siteId || site?.id);
+    if (!targetFloor || !targetBuilding || !targetSite) {
+      skipped++;
+      continue;
+    }
     const existing = bwFindModeledDeviceForBacnet(inventory.listEntities({ type: "equip" }), device);
     if (existing) {
       next[key] = { ...next[key], status: "modeled", modeledEntityId: existing.id };
       skipped++;
       continue;
     }
-    const entity = inventory.upsertEntity(makeEntity({ site, building, floor, device }));
-    next[key] = { ...next[key], status: "modeled", modeledEntityId: entity.id, targetFloorId: floor.id };
+    const entity = inventory.upsertEntity(makeEntity({
+      site: targetSite,
+      building: targetBuilding,
+      floor: targetFloor,
+      device,
+    }));
+    next[key] = {
+      ...next[key],
+      status: "modeled",
+      modeledEntityId: entity.id,
+      targetFloorId: targetFloor.id,
+    };
     imported.push(entity);
   }
   return { imported, skipped, candidates: next };

@@ -72,6 +72,7 @@ let bac = {
   discoveryRan: false,
   lastDiscoveryCount: null,
   driftSummary: null,          // { new, returning, changed, missing } vs the last scan
+  driftMissing: [],            // devices seen previously but absent in the latest scan
   deviceStatusByKey: {},       // device key -> "new" | "returning" | "changed"
 };
 
@@ -365,6 +366,7 @@ function bacRecordDiscoveryDrift(devices) {
     const prev = Array.isArray(userState.bacnetDiscoveryCache) ? userState.bacnetDiscoveryCache : [];
     const drift = bwClassifyDiscovery(prev, devices);
     bac.driftSummary = drift.summary;
+    bac.driftMissing = drift.missing || [];
     bac.deviceStatusByKey = Object.fromEntries(drift.devices.map((d) => [d.key, d.status]));
     userState.bacnetDiscoveryCache = devices.map((d) => ({
       key: d.key, instance: d.instance, address: d.address,
@@ -374,6 +376,7 @@ function bacRecordDiscoveryDrift(devices) {
     saveUserState();
   } catch (_) {
     bac.driftSummary = null;
+    bac.driftMissing = [];
     bac.deviceStatusByKey = {};
   }
 }
@@ -1747,8 +1750,16 @@ return {
     bac.devices = [];
     bac.discoveryRan = false;
     bac.lastDiscoveryCount = null;
+    bac.driftSummary = null;
+    bac.driftMissing = [];
+    bac.deviceStatusByKey = {};
   },
   isDiscovering: () => bac.discovering,
+  getDriftSummary: () => bac.driftSummary,
+  getDriftMissing: () => bac.driftMissing,
+  getDeviceDriftStatus: (key) => bac.deviceStatusByKey[key] || null,
+  driftSummaryEl: bacDriftSummaryEl,
+  deviceDriftBadge: bacDeviceStatusBadge,
   addressText: bacAddressText,
   vendorText: bacVendorText,
   deviceLabel: bacDeviceLabel,

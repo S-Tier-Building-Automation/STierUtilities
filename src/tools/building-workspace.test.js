@@ -9,6 +9,7 @@ import {
   bwPlanDeviceObjects,
   bwQueueInboxDevices,
   bwResolveDeviceConflict,
+  bwSetQueuedTargetFloor,
   commissioningValueMatches,
   exportCommissioningCsv,
   exportCommissioningMarkdown,
@@ -163,6 +164,65 @@ test("device inbox modeling creates equipment and marks queued candidates modele
   assert.equal(result.candidates.d1.status, "modeled");
   assert.equal(result.candidates.d1.modeledEntityId, result.imported[0].id);
   assert.equal(inv.listEntities({ type: "equip", floorId: floor.id })[0].name, "VAV-101");
+});
+
+test("bwSetQueuedTargetFloor assigns floor to queued candidates", () => {
+  const candidates = {
+    d1: { key: "d1", status: "queued" },
+    d2: { key: "d2", status: "queued" },
+    d3: { key: "d3", status: "new" },
+  };
+  const next = bwSetQueuedTargetFloor(candidates, ["d1"], "floor:2");
+  assert.equal(next.d1.targetFloorId, "floor:2");
+  assert.equal(next.d2.targetFloorId, undefined);
+});
+
+test("device inbox modeling respects per-row target floors", () => {
+  const inv = createInventory({ storage: createMemoryInventoryStorage(), now: () => 2 });
+  const site = inv.upsertEntity({ id: "site:main", type: "site", name: "Main" });
+  const building = inv.upsertEntity({ id: "building:main", type: "building", siteId: site.id, parentId: site.id, name: "HQ" });
+  const floorA = inv.upsertEntity({ id: "floor:a", type: "floor", siteId: site.id, buildingId: building.id, parentId: building.id, name: "Level A" });
+  const floorB = inv.upsertEntity({ id: "floor:b", type: "floor", siteId: site.id, buildingId: building.id, parentId: building.id, name: "Level B" });
+  const devices = [
+    { key: "d1", instance: 1001, address: "192.168.1.10", name: "VAV-A" },
+    { key: "d2", instance: 1002, address: "192.168.1.11", name: "VAV-B" },
+  ];
+  const candidates = {
+    d1: { key: "d1", status: "queued", targetFloorId: floorA.id },
+    d2: { key: "d2", status: "queued", targetFloorId: floorB.id },
+  };
+  const result = bwModelQueuedDevices({
+    inventory: inv,
+    devices,
+    candidates,
+    makeEntity: ({ site, building, floor, device }) => ({
+      type: "equip",
+      siteId: site.id,
+      buildingId: building.id,
+      floorId: floor.id,
+      parentId: floor.id,
+      name: device.name,
+      deviceInstance: device.instance,
+      deviceRef: { address: device.address, deviceInstance: device.instance },
+      address: device.address,
+      tags: { equip: true, device: true, bacnet: true },
+    }),
+  });
+  assert.equal(result.imported.length, 2);
+  assert.equal(result.imported[0].floorId, floorA.id);
+  assert.equal(result.imported[1].floorId, floorB.id);
+});
+
+test("changed modeled devices remain selectable for binding updates", () => {
+  const devices = [{ key: "d1", instance: 100, address: "10.0.0.9", vendorId: 2, modelName: "NewModel" }];
+  const modeledDevices = [{
+    id: "equip:1", type: "equip", tags: { device: true }, deviceInstance: 100,
+    address: "10.0.0.5", vendorId: 1, modelName: "OldModel",
+  }];
+  const [candidate] = bwDeviceInboxCandidates({ devices, modeledDevices, candidates: {} });
+  assert.equal(candidate.status, "changed");
+  assert.equal(candidate.selectable, true);
+  assert.equal(candidate.queueable, false);
 });
 
 test("device inbox detects address conflicts", () => {
