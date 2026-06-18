@@ -3581,7 +3581,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
 name = "s_tier_utilities"
-version = "0.5.4"
+version = "0.6.0"
 dependencies = [
  "arboard",
  "getrandom 0.2.17",
