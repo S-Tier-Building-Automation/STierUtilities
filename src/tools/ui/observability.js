@@ -1,5 +1,7 @@
 // Observability Pack service page — install, health, bring-up.
 
+import { openExternal } from "../../ui/dom.js";
+
 /**
  * @param {object} deps
  * @param {typeof import("../../platform/tauri.js").invoke} deps.invoke
@@ -133,7 +135,7 @@ function obsCompactHealthLine() {
 }
 
 async function obsRefreshHealth() {
-  if (!pack) return;
+  if (!getPack()) return;
   obsHealthChecking = true;
   obsHealthMessage = "Checking health and smoke test…";
   renderAll();
@@ -187,7 +189,7 @@ async function obsApplyStartupStatus(status) {
 }
 
 async function obsBringUp() {
-  if (!pack || obsBusy) return;
+  if (!getPack() || obsBusy) return;
   obsBusy = true; obsPhase = OBS_PHASE_LABELS.status; obsProgress = null; renderAll();
   try {
     logTo("observability", "Bringing up the Observability Pack… (first run downloads ~400 MB)", "info");
@@ -209,13 +211,13 @@ async function obsBringUp() {
 }
 
 async function obsStop() {
-  if (!pack) return;
+  if (!getPack()) return;
   try { await getPack().stop(); logTo("observability", "Stopped pack services.", "info"); await obsRefreshHealth(); }
   catch (err) { logTo("observability", `Stop failed: ${err}`, "error"); }
 }
 
 async function obsWriteConfigs() {
-  if (!pack) return;
+  if (!getPack()) return;
   try { const dir = await getPack().writeConfigs(); logTo("observability", `Wrote pack config files to ${dir}.`, "ok"); }
   catch (err) { logTo("observability", `Could not write configs: ${err}`, "error"); }
 }
@@ -225,7 +227,8 @@ function renderObservabilityPage() {
   const ts = getTelemetry();
   const stats = ts ? ts.stats() : null;
   const recent = ts ? ts.recent(15) : [];
-  const cfg = pack ? getPack().getConfig() : null;
+  const pack = getPack();
+  const cfg = pack ? pack.getConfig() : null;
 
   const healthLine = obsHealthChecking
     ? (obsHealthMessage || "Checking health…")

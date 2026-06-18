@@ -3,7 +3,7 @@
 > Status: **Implemented (v0.6 dev)** · Author: architecture review · Target: v0.6 → v1.0
 >
 > **Implementation status:** all seven roadmap phases are built and unit-tested
-> (154 JS tests via `npm test`; Rust tests are run with
+> (166 JS tests via `npm test`; Rust tests are run with
 > `cargo test --manifest-path src-tauri/Cargo.toml`). See
 > [§9 Implementation status](#9--implementation-status) for the phase-by-phase
 > file + test map. The heavy I/O that can't run in CI (downloading the ~400 MB
@@ -27,12 +27,16 @@ The current design (good for v0.5, the constraint for v0.6) is:
 
 | Layer | Today | File |
 | --- | --- | --- |
-| Tool catalog | A hardcoded `TOOLS[]` array; each entry has `renderStatusPill` + `renderPage` | [src/main.js:13](../src/main.js) |
-| Tool logic (native) | One Rust module per tool, `#[tauri::command]`s registered in one big `invoke_handler![]` | [src-tauri/src/lib.rs:53](../src-tauri/src/lib.rs) |
-| External binaries | Bundled as Tauri **sidecars** (FFmpeg/ffprobe) run via `tauri-plugin-shell` `.sidecar()` | [src-tauri/src/heicmov.rs:118](../src-tauri/src/heicmov.rs), [tauri.conf.json:34](../src-tauri/tauri.conf.json) |
-| Persistence | Each tool writes its own JSON under `app_config_dir()` (`clipboardtyper.json`, `networkmanager/profiles.json`); HEIC cache under `app_cache_dir()` | per-module |
+| Tool catalog | Manifest-driven `TOOLS[]` assembled in `createApplication()` | [src/platform/app-tools.js](../src/platform/app-tools.js), [src/tools/manifests.js](../src/tools/manifests.js) |
+| App shell / pages | Shared UI modules (library, settings, plugin chrome, …) | [src/ui/](../src/ui/), [src/platform/bootstrap.js](../src/platform/bootstrap.js) |
+| Tool UI | One module per first-party tool under `src/tools/ui/` | e.g. [buildingworkspace.js](../src/tools/ui/buildingworkspace.js) |
+| Entry | Thin bootstrap wiring invoke, kernel boot, warmup | [src/main.js](../src/main.js) |
+| Tool logic (native) | One Rust module per tool, `#[tauri::command]`s registered in one big `invoke_handler![]` | [src-tauri/src/lib.rs](../src-tauri/src/lib.rs) |
+| External binaries | Bundled as Tauri **sidecars** (FFmpeg/ffprobe) run via `tauri-plugin-shell` `.sidecar()` | [src-tauri/src/heicmov.rs](../src-tauri/src/heicmov.rs), [tauri.conf.json](../src-tauri/tauri.conf.json) |
+| File/folder pickers | Frontend via `tauri-plugin-dialog` | [src/ui/dialogs.js](../src/ui/dialogs.js) |
+| Persistence | Each tool writes its own JSON under `app_config_dir()`; InfluxDB token in OS keychain | per-module, [secrets.rs](../src-tauri/src/secrets.rs) |
 | Live updates | Tools emit Tauri **events** (`netscan:host`, `bacnet:device`, …) the frontend `listen`s to | per-module |
-| Logs | Ephemeral per-tool ring buffer in a JS `Map` (max 100), lost on reload | [src/main.js:191](../src/main.js) |
+| Logs | Per-tool ring buffer via `createActivityLog()` | [src/ui/activity.js](../src/ui/activity.js) |
 
 **What's missing — and is the root cause of all four questions:**
 
@@ -330,7 +334,7 @@ Every phase below is built and verified. Run the suites with `npm test` (JS kern
 | **3 — Observability Pack** | supervisor: free-port pick, config gen (Telegraf/Grafana/InfluxDB), download URLs, line-protocol HTTP write, process start/stop/health; JS Influx transport + pack controller; Observability page; dashboards-as-code | [observability.rs](../src-tauri/src/observability.rs), [services/influx-transport.js](../src/platform/services/influx-transport.js), [services/pack-controller.js](../src/platform/services/pack-controller.js) | observability (Rust) + transport/controller (JS) |
 | **4 — BACnet Historian** | `scheduler.v1` service + historian core (poll → present-value → timeseries); new tool + page | [services/scheduler.js](../src/platform/services/scheduler.js), [src/tools/historian.js](../src/tools/historian.js) | scheduler + historian |
 | **5 — Third-party MCP** | `kind:"mcp"` loader: capability→MCP-tool proxy, install permission approval, grant gating; Niagara example | [src/platform/mcp-loader.js](../src/platform/mcp-loader.js), [src/tools/mcp-examples.js](../src/tools/mcp-examples.js) | mcp-loader + mcp-examples |
-| **6 — Hardening** | secrets store + token generation, heicmov cache eviction, full-platform integration test, clean `cargo check` | [secrets.rs](../src-tauri/src/secrets.rs), [heicmov.rs](../src-tauri/src/heicmov.rs), [src/integration.test.js](../src/integration.test.js) | secrets + prune_cache + integration |
+| **6 — Hardening** | secrets store + OS keychain token, split Tauri capabilities, heicmov cache eviction, full-platform integration test, clean `cargo check` | [secrets.rs](../src-tauri/src/secrets.rs), [capabilities/](../src-tauri/capabilities/), [heicmov.rs](../src-tauri/src/heicmov.rs), [src/integration.test.js](../src/integration.test.js) | secrets + prune_cache + integration |
 
 **Post-audit completion (P0 ship-blockers, now done):** a 48-agent audit found the
 Observability Pack was "green tests, dead in the app." Closed since: `observability_install`
@@ -341,7 +345,7 @@ persistence (stable ports/token across restarts), graceful shutdown on `ExitRequ
 `pack-controller.bringUp()` orchestration, and the Observability page Install/Start/Stop/Health
 UI + Historian point persistence. An adversarial review of those changes caught + fixed the
 InfluxDB Windows download-URL form (`influxdb2-<ver>-windows.zip`). The JS suite currently
-passes with 154 tests; run Rust verification with `cargo test --manifest-path src-tauri/Cargo.toml`.
+passes with 166 tests; run Rust verification with `cargo test --manifest-path src-tauri/Cargo.toml`.
 
 ### 9.1 Release-hardening backlog
 
@@ -350,8 +354,8 @@ These are the remaining documented items before calling the platform release-rea
 | Item | Why it matters | Current pointer |
 | --- | --- | --- |
 | ✅ Pin Observability Pack archive hashes (done) | SHA-256 is now pinned per component (influxd/telegraf/grafana); a missing or mismatched hash is a hard error before extraction, so unverified binaries are never run. | [observability.rs](../src-tauri/src/observability.rs) |
-| Move secrets to OS keychain | The token is now OS-CSPRNG-generated and localhost-only; Windows Credential Manager remains the right storage target for same-user isolation. | [secrets.rs](../src-tauri/src/secrets.rs) |
-| Live Observability smoke test | Verify in a real app run: `pnpm tauri dev` → Install → Start → write a metric → InfluxDB receives it → Grafana renders it. | Observability page |
+| ✅ Move secrets to OS keychain (done) | InfluxDB write token is stored in Windows Credential Manager via `keyring`, with one-time migration from legacy `secrets.json`. | [secrets.rs](../src-tauri/src/secrets.rs) |
+| Live Observability smoke test | Verify in a real app run: `npm run tauri dev` → Install → Start → write a metric → InfluxDB receives it → Grafana renders it. | Observability page |
 | MCP third-party install UX | The proxy/permission path is tested, but a polished live install/manage flow still needs product work. | Settings MCP install + `mcp-loader` |
 | Sign third-party manifests | Needed before any broader plugin/tool distribution story. | Future manifest trust layer |
 | Niagara population of inventory | Source-ref shape reserves Niagara, but BACnet remains the first implemented population path. | Building Workspace / future `niagara.points.v1` |

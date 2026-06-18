@@ -194,7 +194,10 @@ export async function runBootstrap({
   }
 
   await tools.networkManager.loadProfiles();
-  hydrateFromStartupWarmup().catch((err) => console.warn("[startup] warmup hydrate failed:", err));
+  hydrateFromStartupWarmup().catch((err) => {
+    const detail = err instanceof Error ? err.message : (typeof err === "string" ? err : JSON.stringify(err));
+    console.warn("[startup] warmup hydrate failed:", detail || err);
+  });
 
   renderAll();
   setTimeout(() => { checkForUpdates({ silent: true }).catch(() => {}); }, 2500);
