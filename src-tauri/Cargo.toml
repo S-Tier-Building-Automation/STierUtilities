@@ -18,6 +18,7 @@ tauri-plugin-opener = "2"
 tauri-plugin-updater = "2"
 tauri-plugin-process = "2"
 tauri-plugin-shell = "2"
+tauri-plugin-dialog = "2"
 # Dev-only WebSocket bridge that lets the Tauri MCP server drive the app's
 # webview/IPC. Compiled into debug builds only (see lib.rs cfg(debug_assertions)).
 tauri-plugin-mcp-bridge = "0.11"
@@ -29,9 +30,9 @@ socket2 = "0.5"
 # OS CSPRNG for the InfluxDB token and local record ids (replaces the old
 # time/heap-address seeded xorshift). Pinned to the 0.2 line already in the tree.
 getrandom = "0.2"
+keyring = { version = "4.1.1", features = ["windows-native-keyring-store"] }
 
 [target.'cfg(windows)'.dependencies]
-rfd = "0.15"
 windows = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",

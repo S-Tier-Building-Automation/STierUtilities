@@ -8,11 +8,6 @@ use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_shell::process::Output;
 use tauri_plugin_shell::ShellExt;
 
-const MEDIA_FILTER: &[&str] = &["heic", "heif", "mov"];
-
-/// Byte budget for the preview cache. Previews are keyed by path+mtime and never
-/// self-expire, so `prune_cache` evicts oldest entries past this to keep the
-/// on-disk cache bounded.
 const PREVIEW_CACHE_BUDGET_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -209,30 +204,6 @@ fn output_path_for(input: &Path, output_dir: Option<&Path>, image_format: ImageF
     };
     let dir = output_dir.unwrap_or_else(|| input.parent().unwrap_or(Path::new(".")));
     dir.join(format!("{stem}.{ext}"))
-}
-
-#[tauri::command]
-pub fn heicmov_pick_files() -> Option<Vec<String>> {
-    let picked = rfd::FileDialog::new()
-        .add_filter("HEIC, HEIF & MOV", MEDIA_FILTER)
-        .pick_files()?;
-    let paths: Vec<String> = picked
-        .into_iter()
-        .filter(|p| is_supported_media(p))
-        .map(|p| p.to_string_lossy().into_owned())
-        .collect();
-    if paths.is_empty() {
-        None
-    } else {
-        Some(paths)
-    }
-}
-
-#[tauri::command]
-pub fn heicmov_pick_output_dir() -> Option<String> {
-    rfd::FileDialog::new()
-        .pick_folder()
-        .map(|p| p.to_string_lossy().into_owned())
 }
 
 #[tauri::command]

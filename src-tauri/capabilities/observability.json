@@ -1,0 +1,48 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "observability",
+  "description": "Observability Pack processes (InfluxDB, Telegraf, Grafana) under app config",
+  "windows": ["main"],
+  "permissions": [
+    {
+      "identifier": "shell:allow-spawn",
+      "allow": [
+        {
+          "name": "observability-influxd",
+          "cmd": "$APPCONFIG/observability/bin/influxd.exe",
+          "args": true
+        },
+        {
+          "name": "observability-telegraf",
+          "cmd": "$APPCONFIG/observability/bin/telegraf.exe",
+          "args": true
+        },
+        {
+          "name": "observability-grafana",
+          "cmd": "$APPCONFIG/observability/bin/grafana.exe",
+          "args": true
+        }
+      ]
+    },
+    {
+      "identifier": "shell:allow-kill",
+      "allow": [
+        {
+          "name": "observability-influxd",
+          "cmd": "$APPCONFIG/observability/bin/influxd.exe",
+          "args": true
+        },
+        {
+          "name": "observability-telegraf",
+          "cmd": "$APPCONFIG/observability/bin/telegraf.exe",
+          "args": true
+        },
+        {
+          "name": "observability-grafana",
+          "cmd": "$APPCONFIG/observability/bin/grafana.exe",
+          "args": true
+        }
+      ]
+    }
+  ]
+}

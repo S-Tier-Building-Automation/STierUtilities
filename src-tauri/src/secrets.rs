@@ -1,18 +1,17 @@
 //! Local secrets store for the platform — currently the InfluxDB write token used
-//! by the Observability Pack. Stored as JSON under the app config dir.
-//!
-//! NOTE: this is a localhost-only store. The token authenticates writes to an
-//! InfluxDB bound to 127.0.0.1, so the threat model is a co-resident local
-//! process. The file lives under the per-user app config dir, whose profile ACL
-//! already blocks *other* users; isolating it from a *same-user* process is the
-//! job of the OS keychain (Credential Manager), which remains the planned next
-//! step — see the design doc. The token itself is now generated from the OS
-//! CSPRNG (was a time/heap-address seeded xorshift, which was predictable).
+//! by the Observability Pack. Stored in the OS credential store (Windows Credential
+//! Manager) via the `keyring` crate. A legacy `secrets.json` under the app config
+//! dir is migrated on first read, then cleared.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use keyring::Entry;
 use serde::{Deserialize, Serialize};
+
+/// Tauri bundle identifier — stable service name in Credential Manager.
+const KEYRING_SERVICE: &str = "com.stierbuildings.utilities";
+const INFLUX_TOKEN_ACCOUNT: &str = "influx-token";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -33,8 +32,6 @@ pub fn save(path: &Path, secrets: &Secrets) -> Result<(), String> {
         std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
     let json = serde_json::to_string_pretty(secrets).map_err(|e| e.to_string())?;
-    // Atomic-ish write via a temp file + rename. The temp name is unique per
-    // process + call so two concurrent saves can't clobber each other's temp.
     static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
     let tmp = path.with_extension(format!(
         "json.tmp.{}.{}",
@@ -44,10 +41,39 @@ pub fn save(path: &Path, secrets: &Secrets) -> Result<(), String> {
     std::fs::write(&tmp, json).map_err(|e| e.to_string())?;
     let res = std::fs::rename(&tmp, path).map_err(|e| e.to_string());
     if res.is_err() {
-        // Don't leak the temp file in the config dir if the rename failed.
         let _ = std::fs::remove_file(&tmp);
     }
     res
+}
+
+fn keyring_entry() -> Result<Entry, String> {
+    Entry::new(KEYRING_SERVICE, INFLUX_TOKEN_ACCOUNT).map_err(|e| e.to_string())
+}
+
+fn read_keyring_token() -> Result<Option<String>, String> {
+    match keyring_entry()?.get_password() {
+        Ok(token) if !token.is_empty() => Ok(Some(token)),
+        Ok(_) => Ok(None),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+fn write_keyring_token(token: &str) -> Result<(), String> {
+    keyring_entry()?
+        .set_password(token)
+        .map_err(|e| e.to_string())
+}
+
+/// Move a token from legacy JSON into the keyring and clear the file field.
+fn migrate_legacy_json(path: &Path) -> Result<Option<String>, String> {
+    let secrets = load(path);
+    if secrets.influx_token.is_empty() {
+        return Ok(None);
+    }
+    write_keyring_token(&secrets.influx_token)?;
+    save(path, &Secrets::default())?;
+    Ok(Some(secrets.influx_token))
 }
 
 /// Generate a 128-hex-char token from the OS CSPRNG (getrandom: BCryptGenRandom
@@ -63,14 +89,18 @@ pub fn generate_token() -> String {
     out
 }
 
-/// Return the stored InfluxDB token, generating and persisting one on first use.
-pub fn get_or_create_token(path: &Path) -> Result<String, String> {
-    let mut secrets = load(path);
-    if secrets.influx_token.is_empty() {
-        secrets.influx_token = generate_token();
-        save(path, &secrets)?;
+/// Return the stored InfluxDB token, migrating legacy JSON if needed, generating
+/// and persisting one on first use.
+pub fn get_or_create_token(legacy_path: &Path) -> Result<String, String> {
+    if let Some(token) = read_keyring_token()? {
+        return Ok(token);
     }
-    Ok(secrets.influx_token)
+    if let Some(token) = migrate_legacy_json(legacy_path)? {
+        return Ok(token);
+    }
+    let token = generate_token();
+    write_keyring_token(&token)?;
+    Ok(token)
 }
 
 /// Resolve the InfluxDB token from the app config dir, creating it if needed.
@@ -93,6 +123,35 @@ mod tests {
         std::env::temp_dir().join(format!("stier_secrets_{}_{}.json", std::process::id(), tag))
     }
 
+    fn test_account(tag: &str) -> String {
+        format!("influx-token-test-{}-{}", std::process::id(), tag)
+    }
+
+    fn write_test_token(account: &str, token: &str) -> Result<(), String> {
+        Entry::new(KEYRING_SERVICE, account)
+            .map_err(|e| e.to_string())?
+            .set_password(token)
+            .map_err(|e| e.to_string())
+    }
+
+    fn read_test_token(account: &str) -> Result<Option<String>, String> {
+        match Entry::new(KEYRING_SERVICE, account)
+            .map_err(|e| e.to_string())?
+            .get_password()
+        {
+            Ok(token) if !token.is_empty() => Ok(Some(token)),
+            Ok(_) => Ok(None),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(e.to_string()),
+        }
+    }
+
+    fn delete_test_token(account: &str) {
+        let _ = Entry::new(KEYRING_SERVICE, account)
+            .ok()
+            .and_then(|e| e.delete_credential().ok());
+    }
+
     #[test]
     fn token_is_long_hex_and_varies() {
         let a = generate_token();
@@ -103,13 +162,28 @@ mod tests {
     }
 
     #[test]
-    fn get_or_create_is_stable_across_calls() {
-        let path = temp_path("stable");
+    fn keyring_roundtrip_and_stable_reads() {
+        let account = test_account("stable");
+        delete_test_token(&account);
+        write_test_token(&account, "abc").unwrap();
+        assert_eq!(read_test_token(&account).unwrap().as_deref(), Some("abc"));
+        assert_eq!(read_test_token(&account).unwrap().as_deref(), Some("abc"));
+        delete_test_token(&account);
+    }
+
+    #[test]
+    fn migrate_legacy_json_moves_token_to_keyring() {
+        let path = temp_path("migrate");
         let _ = std::fs::remove_file(&path);
-        let first = get_or_create_token(&path).unwrap();
-        assert!(!first.is_empty());
-        let second = get_or_create_token(&path).unwrap();
-        assert_eq!(first, second, "token must persist between calls");
+        let _ = keyring_entry().and_then(|e| e.delete_credential().map_err(|err| err.to_string()));
+
+        save(&path, &Secrets { influx_token: "legacy-token".into() }).unwrap();
+        let token = migrate_legacy_json(&path).unwrap();
+        assert_eq!(token.as_deref(), Some("legacy-token"));
+        assert!(load(&path).influx_token.is_empty());
+        assert_eq!(read_keyring_token().unwrap().as_deref(), Some("legacy-token"));
+
+        let _ = keyring_entry().and_then(|e| e.delete_credential().map_err(|err| err.to_string()));
         let _ = std::fs::remove_file(&path);
     }
 

@@ -1,10 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
-  "identifier": "default",
-  "description": "Capability for the main window",
-  "windows": [
-    "main"
-  ],
+  "identifier": "base",
+  "description": "Core window controls, navigation, updates, and native dialogs",
+  "windows": ["main"],
   "permissions": [
     "core:default",
     "core:window:allow-minimize",
@@ -16,23 +14,9 @@
     "core:window:allow-start-dragging",
     "core:window:allow-is-maximized",
     "opener:default",
+    "dialog:default",
     "updater:default",
     "process:default",
-    "mcp-bridge:default",
-    {
-      "identifier": "shell:allow-execute",
-      "allow": [
-        {
-          "name": "binaries/ffmpeg",
-          "sidecar": true,
-          "args": true
-        },
-        {
-          "name": "binaries/ffprobe",
-          "sidecar": true,
-          "args": true
-        }
-      ]
-    }
+    "mcp-bridge:default"
   ]
 }
