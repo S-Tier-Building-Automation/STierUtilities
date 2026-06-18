@@ -58,6 +58,7 @@ pub fn run() {
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_shell::init());
@@ -82,7 +83,7 @@ pub fn run() {
         auth::auth_load_user_state,
         auth::auth_save_user_state,
         auth::auth_export_snapshot,
-        auth::auth_pick_sync_folder,
+        auth::auth_set_sync_folder,
         auth::auth_clear_sync_folder,
         auth::auth_sync_now,
         clipboardtyper::clipboardtyper_start,
@@ -90,8 +91,6 @@ pub fn run() {
         clipboardtyper::clipboardtyper_set_armed,
         clipboardtyper::clipboardtyper_set_settings,
         clipboardtyper::clipboardtyper_get_state,
-        heicmov::heicmov_pick_files,
-        heicmov::heicmov_pick_output_dir,
         heicmov::heicmov_probe,
         heicmov::heicmov_make_preview,
         heicmov::heicmov_convert,

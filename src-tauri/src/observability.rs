@@ -702,13 +702,26 @@ pub async fn timeseries_write(config: PackConfig, points: Vec<PointDto>) -> Resu
 // Process supervision (integration — requires the downloaded binaries)
 // ---------------------------------------------------------------------------
 
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
+use tauri::AppHandle;
+use tauri_plugin_shell::process::CommandChild;
+use tauri_plugin_shell::ShellExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// Shell scope names for the downloaded pack binaries (see capabilities/observability.json).
+fn pack_scope_name(bin: &str) -> Option<&'static str> {
+    match bin {
+        "influxd" => Some("observability-influxd"),
+        "telegraf" => Some("observability-telegraf"),
+        "grafana" => Some("observability-grafana"),
+        _ => None,
+    }
+}
 
 /// Default pinned versions for the on-demand download. Bumped deliberately.
 pub const INFLUXDB_VERSION: &str = "2.7.5";
@@ -717,14 +730,19 @@ pub const GRAFANA_VERSION: &str = "11.1.0";
 
 #[derive(Default)]
 struct Supervisor {
-    influx: Option<Child>,
-    grafana: Option<Child>,
-    telegraf: Option<Child>,
+    influx: Option<CommandChild>,
+    grafana: Option<CommandChild>,
+    telegraf: Option<CommandChild>,
 }
 
 static SUPERVISOR: Lazy<Mutex<Supervisor>> = Lazy::new(|| Mutex::new(Supervisor::default()));
 
-fn spawn_component(paths: &PackPaths, bin: &str, args: &[String]) -> Result<Child, String> {
+fn spawn_component(
+    app: &AppHandle,
+    paths: &PackPaths,
+    bin: &str,
+    args: &[String],
+) -> Result<CommandChild, String> {
     let exe = paths.binary(bin);
     if !exe.exists() {
         return Err(format!(
@@ -732,14 +750,13 @@ fn spawn_component(paths: &PackPaths, bin: &str, args: &[String]) -> Result<Chil
             exe.display()
         ));
     }
-    let mut cmd = Command::new(&exe);
-    cmd.args(args).current_dir(&paths.root);
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-    cmd.spawn()
+    let scope = pack_scope_name(bin).ok_or_else(|| format!("unknown pack binary {bin}"))?;
+    app.shell()
+        .command(scope)
+        .args(args)
+        .current_dir(&paths.root)
+        .spawn()
+        .map(|(_rx, child)| child)
         .map_err(|e| format!("failed to start {bin}: {e}"))
 }
 
@@ -973,13 +990,6 @@ pub fn observability_download_urls() -> Result<Vec<DownloadAsset>, String> {
 #[cfg(windows)]
 #[tauri::command]
 pub async fn observability_start(app: tauri::AppHandle, config: PackConfig) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || start_blocking(app, config))
-        .await
-        .map_err(|e| format!("start task panicked: {e}"))?
-}
-
-#[cfg(windows)]
-fn start_blocking(app: tauri::AppHandle, config: PackConfig) -> Result<(), String> {
     use tauri::Manager;
     let dir = app
         .path()
@@ -991,14 +1001,9 @@ fn start_blocking(app: tauri::AppHandle, config: PackConfig) -> Result<(), Strin
 
     let mut sup = SUPERVISOR.lock().map_err(|_| "supervisor lock poisoned")?;
 
-    // Each spawn is guarded by both the in-memory handle AND a live port check.
-    // The handle is per-process, so after a non-graceful exit (crash / force-kill
-    // during dev) the previous run's children are orphaned and still hold their
-    // (persisted) ports. Without the port check we'd re-spawn a duplicate that
-    // collides on bind ("Only one usage of each socket address"); instead we treat
-    // an already-serving port as the running instance and reuse it.
     if sup.influx.is_none() && !port_open(config.influx_port) {
         sup.influx = Some(spawn_component(
+            &app,
             &paths,
             "influxd",
             &influxd_args(&config, &paths.data_dir()),
@@ -1011,13 +1016,13 @@ fn start_blocking(app: tauri::AppHandle, config: PackConfig) -> Result<(), Strin
             .to_string_lossy()
             .into_owned();
         sup.telegraf = Some(spawn_component(
+            &app,
             &paths,
             "telegraf",
             &["--config".into(), conf],
         )?);
     }
     if sup.grafana.is_none() && !port_open(config.grafana_port) {
-        // grafana 10+: `grafana server --config <ini> --homepath <install dir>`.
         let ini = paths
             .config_dir()
             .join("grafana.ini")
@@ -1029,6 +1034,7 @@ fn start_blocking(app: tauri::AppHandle, config: PackConfig) -> Result<(), Strin
             .to_string_lossy()
             .into_owned();
         sup.grafana = Some(spawn_component(
+            &app,
             &paths,
             "grafana",
             &[
@@ -1043,16 +1049,15 @@ fn start_blocking(app: tauri::AppHandle, config: PackConfig) -> Result<(), Strin
     Ok(())
 }
 
-/// Drain + reap all supervised pack children. Used by the stop command and before
+/// Drain + reap all supervised pack children.
 /// an install/update that may need to replace a running binary.
 fn stop_services() {
     if let Ok(mut sup) = SUPERVISOR.lock() {
-        for mut c in [sup.influx.take(), sup.telegraf.take(), sup.grafana.take()]
+        for c in [sup.influx.take(), sup.telegraf.take(), sup.grafana.take()]
             .into_iter()
             .flatten()
         {
             let _ = c.kill();
-            let _ = c.wait();
         }
     }
 }

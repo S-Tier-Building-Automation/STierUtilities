@@ -21,6 +21,8 @@ src-tauri/binaries/ffprobe-*
 
 # Dev screenshots (UI verification artifacts)
 /scan-tab-*.png
+.cursor/*.jpg
+.cursor/*.png
 
 # Editor directories and files
 .vscode/*

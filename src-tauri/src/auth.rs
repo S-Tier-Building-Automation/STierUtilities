@@ -686,11 +686,8 @@ pub fn auth_export_snapshot(app: tauri::AppHandle) -> Result<Value, String> {
 
 #[cfg(windows)]
 #[tauri::command]
-pub fn auth_pick_sync_folder(app: tauri::AppHandle) -> Result<Option<AuthState>, String> {
-    let Some(folder) = rfd::FileDialog::new().pick_folder() else {
-        return Ok(None);
-    };
-    set_sync_folder(&auth_file(&app)?, &folder).map(Some)
+pub fn auth_set_sync_folder(app: tauri::AppHandle, folder: String) -> Result<AuthState, String> {
+    set_sync_folder(&auth_file(&app)?, Path::new(&folder))
 }
 
 #[cfg(windows)]
