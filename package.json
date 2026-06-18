@@ -1,11 +1,12 @@
 {
   "name": "s-tier-utilities",
   "private": true,
-  "version": "0.5.4",
+  "version": "0.6.0",
   "type": "module",
   "scripts": {
     "tauri": "tauri",
     "test": "node --test \"src/**/*.test.js\"",
+    "smoke:observability": "powershell -ExecutionPolicy Bypass -File scripts/observability-smoke.ps1",
     "docs:gen": "node scripts/gen-utilities-docs.mjs"
   },
   "devDependencies": {

@@ -702,26 +702,13 @@ pub async fn timeseries_write(config: PackConfig, points: Vec<PointDto>) -> Resu
 // Process supervision (integration — requires the downloaded binaries)
 // ---------------------------------------------------------------------------
 
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::Mutex;
 
 use once_cell::sync::Lazy;
-use tauri::AppHandle;
-use tauri_plugin_shell::process::CommandChild;
-use tauri_plugin_shell::ShellExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-/// Shell scope names for the downloaded pack binaries (see capabilities/observability.json).
-fn pack_scope_name(bin: &str) -> Option<&'static str> {
-    match bin {
-        "influxd" => Some("observability-influxd"),
-        "telegraf" => Some("observability-telegraf"),
-        "grafana" => Some("observability-grafana"),
-        _ => None,
-    }
-}
 
 /// Default pinned versions for the on-demand download. Bumped deliberately.
 pub const INFLUXDB_VERSION: &str = "2.7.5";
@@ -730,19 +717,20 @@ pub const GRAFANA_VERSION: &str = "11.1.0";
 
 #[derive(Default)]
 struct Supervisor {
-    influx: Option<CommandChild>,
-    grafana: Option<CommandChild>,
-    telegraf: Option<CommandChild>,
+    influx: Option<Child>,
+    grafana: Option<Child>,
+    telegraf: Option<Child>,
 }
 
 static SUPERVISOR: Lazy<Mutex<Supervisor>> = Lazy::new(|| Mutex::new(Supervisor::default()));
 
+/// Spawn a pack binary from the app config dir. Backend-only — paths are validated
+/// before launch, so this does not go through the webview shell capability scope.
 fn spawn_component(
-    app: &AppHandle,
     paths: &PackPaths,
     bin: &str,
     args: &[String],
-) -> Result<CommandChild, String> {
+) -> Result<Child, String> {
     let exe = paths.binary(bin);
     if !exe.exists() {
         return Err(format!(
@@ -750,13 +738,18 @@ fn spawn_component(
             exe.display()
         ));
     }
-    let scope = pack_scope_name(bin).ok_or_else(|| format!("unknown pack binary {bin}"))?;
-    app.shell()
-        .command(scope)
-        .args(args)
+    let mut cmd = Command::new(&exe);
+    cmd.args(args)
         .current_dir(&paths.root)
-        .spawn()
-        .map(|(_rx, child)| child)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.spawn()
         .map_err(|e| format!("failed to start {bin}: {e}"))
 }
 
@@ -804,6 +797,68 @@ impl PackSmokeHealth {
             error: Some(reason.to_string()),
         }
     }
+}
+
+/// True when the end-to-end health smoke (direct + Telegraf write/query) succeeded.
+pub fn smoke_passed(smoke: &PackSmokeHealth) -> bool {
+    smoke.attempted
+        && smoke.direct_write
+        && smoke.direct_query
+        && smoke.telegraf_write
+        && smoke.telegraf_query
+}
+
+/// Full Observability Pack bring-up for release validation: install (if needed),
+/// write configs, start services, onboard InfluxDB, then run the health smoke test.
+#[cfg(windows)]
+pub async fn run_smoke_test(app: tauri::AppHandle) -> Result<PackHealth, String> {
+    use crate::secrets;
+    use tauri::Manager;
+
+    async fn async_sleep(d: Duration) {
+        let _ = tauri::async_runtime::spawn_blocking(move || std::thread::sleep(d)).await;
+    }
+
+    observability_install(app.clone()).await?;
+
+    let mut config = match observability_load_config(app.clone())? {
+        Some(config) => config,
+        None => observability_pick_ports()?,
+    };
+    if config.token.is_empty() {
+        let dir = app
+            .path()
+            .app_config_dir()
+            .map_err(|e| format!("could not resolve app data dir: {e}"))?;
+        config.token = secrets::get_or_create_token(&dir.join("secrets.json"))?;
+    }
+    observability_save_config(app.clone(), config.clone())?;
+    observability_write_configs(app.clone(), config.clone())?;
+    observability_start(app.clone(), config.clone()).await?;
+
+    let mut influx_up = false;
+    for _ in 0..60 {
+        if port_open(config.influx_port) {
+            influx_up = true;
+            break;
+        }
+        async_sleep(Duration::from_secs(1)).await;
+    }
+    if !influx_up {
+        return Err("InfluxDB did not become reachable within 60s".into());
+    }
+
+    observability_onboard(config.clone()).await?;
+
+    for _ in 0..30 {
+        let health = observability_health(config.clone()).await;
+        if health.influx_ready && health.smoke.attempted {
+            return Ok(health);
+        }
+        async_sleep(Duration::from_secs(2)).await;
+    }
+
+    Ok(observability_health(config).await)
 }
 
 fn smoke_run_id(prefix: &str) -> String {
@@ -1003,7 +1058,6 @@ pub async fn observability_start(app: tauri::AppHandle, config: PackConfig) -> R
 
     if sup.influx.is_none() && !port_open(config.influx_port) {
         sup.influx = Some(spawn_component(
-            &app,
             &paths,
             "influxd",
             &influxd_args(&config, &paths.data_dir()),
@@ -1016,7 +1070,6 @@ pub async fn observability_start(app: tauri::AppHandle, config: PackConfig) -> R
             .to_string_lossy()
             .into_owned();
         sup.telegraf = Some(spawn_component(
-            &app,
             &paths,
             "telegraf",
             &["--config".into(), conf],
@@ -1034,7 +1087,6 @@ pub async fn observability_start(app: tauri::AppHandle, config: PackConfig) -> R
             .to_string_lossy()
             .into_owned();
         sup.grafana = Some(spawn_component(
-            &app,
             &paths,
             "grafana",
             &[
@@ -1053,7 +1105,7 @@ pub async fn observability_start(app: tauri::AppHandle, config: PackConfig) -> R
 /// an install/update that may need to replace a running binary.
 fn stop_services() {
     if let Ok(mut sup) = SUPERVISOR.lock() {
-        for c in [sup.influx.take(), sup.telegraf.take(), sup.grafana.take()]
+        for mut c in [sup.influx.take(), sup.telegraf.take(), sup.grafana.take()]
             .into_iter()
             .flatten()
         {
@@ -1619,6 +1671,26 @@ mod tests {
             bucket: "utilities".into(),
             token: "secret-token".into(),
         }
+    }
+
+    #[test]
+    fn smoke_passed_requires_all_four_checks() {
+        assert!(smoke_passed(&PackSmokeHealth {
+            attempted: true,
+            direct_write: true,
+            direct_query: true,
+            telegraf_write: true,
+            telegraf_query: true,
+            error: None,
+        }));
+        assert!(!smoke_passed(&PackSmokeHealth {
+            attempted: true,
+            direct_write: true,
+            direct_query: true,
+            telegraf_write: false,
+            telegraf_query: false,
+            error: None,
+        }));
     }
 
     #[test]

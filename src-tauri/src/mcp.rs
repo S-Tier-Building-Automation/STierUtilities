@@ -340,7 +340,7 @@ fn mcp_start_blocking(
     let init = json!({
         "protocolVersion": PROTOCOL_VERSION,
         "capabilities": {},
-        "clientInfo": { "name": "s-tier-utilities", "version": "0.5.4" },
+        "clientInfo": { "name": "s-tier-utilities", "version": "0.6.0" },
     });
     if let Err(e) = request(&handle, "initialize", init) {
         kill_and_reap(&handle);

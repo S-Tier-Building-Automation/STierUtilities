@@ -138,6 +138,50 @@ pub fn run() {
 
     #[cfg(windows)]
     let builder = builder.setup(|app| {
+        let smoke_mode = std::env::args().any(|a| a == "--observability-smoke");
+        if smoke_mode {
+            use tauri::Manager;
+            let handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let outcome = observability::run_smoke_test(handle.clone()).await;
+                let (health, ok, message) = match outcome {
+                    Ok(health) => {
+                        let ok = observability::smoke_passed(&health.smoke);
+                        let message = if ok {
+                            "Observability smoke test passed".to_string()
+                        } else {
+                            format!(
+                                "Observability smoke test failed: {:?}",
+                                health.smoke.error
+                            )
+                        };
+                        (Some(health), ok, message)
+                    }
+                    Err(err) => (None, false, format!("Observability smoke test error: {err}")),
+                };
+                let mut report = serde_json::json!({
+                    "ok": ok,
+                    "message": message,
+                });
+                if let Some(health) = health {
+                    if let Ok(value) = serde_json::to_value(health) {
+                        report["health"] = value;
+                    }
+                }
+                if let Ok(dir) = handle.path().app_config_dir() {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let path = dir.join("observability-smoke-result.json");
+                    if let Ok(json) = serde_json::to_string_pretty(&report) {
+                        let _ = std::fs::write(&path, json);
+                    }
+                    eprintln!("[observability-smoke] wrote {}", path.display());
+                }
+                eprintln!("[observability-smoke] {message}");
+                let _ = observability::observability_stop();
+                std::process::exit(if ok { 0 } else { 1 });
+            });
+            return Ok(());
+        }
         startup::start_startup_warmup(app.handle().clone());
         Ok(())
     });

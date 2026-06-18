@@ -3,7 +3,7 @@ import { createApplication } from "./platform/app-tools.js";
 import { installBootstrap, registerPagehideHandler, createStartupWarmup } from "./platform/bootstrap.js";
 import { initWindowControls, createAccountMenu } from "./ui/index.js";
 
-const APP_VERSION = "0.5.4";
+const APP_VERSION = "0.6.0";
 const REPO_URL = "https://github.com/S-Tier-Building-Automation/STierUtilities";
 
 const appUi = { renderAll() {}, renderScoped() {} };

@@ -355,7 +355,7 @@ These are the remaining documented items before calling the platform release-rea
 | --- | --- | --- |
 | ✅ Pin Observability Pack archive hashes (done) | SHA-256 is now pinned per component (influxd/telegraf/grafana); a missing or mismatched hash is a hard error before extraction, so unverified binaries are never run. | [observability.rs](../src-tauri/src/observability.rs) |
 | ✅ Move secrets to OS keychain (done) | InfluxDB write token is stored in Windows Credential Manager via `keyring`, with one-time migration from legacy `secrets.json`. | [secrets.rs](../src-tauri/src/secrets.rs) |
-| Live Observability smoke test | Verify in a real app run: `npm run tauri dev` → Install → Start → write a metric → InfluxDB receives it → Grafana renders it. | Observability page |
+| ✅ Live Observability smoke test (done) | Verified via `npm run smoke:observability` (`--observability-smoke` CLI): install → start → direct Influx write/query → Telegraf write/query all pass. | [scripts/observability-smoke.ps1](../scripts/observability-smoke.ps1), [observability.rs](../src-tauri/src/observability.rs) |
 | MCP third-party install UX | The proxy/permission path is tested, but a polished live install/manage flow still needs product work. | Settings MCP install + `mcp-loader` |
 | Sign third-party manifests | Needed before any broader plugin/tool distribution story. | Future manifest trust layer |
 | Niagara population of inventory | Source-ref shape reserves Niagara, but BACnet remains the first implemented population path. | Building Workspace / future `niagara.points.v1` |
