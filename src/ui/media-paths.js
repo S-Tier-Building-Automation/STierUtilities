@@ -1,7 +1,10 @@
 export const HEICMOV_EXTENSIONS = ["heic", "heif", "mov"];
 
 export function isSupportedMediaPath(path) {
-  const ext = path.split(/[/\\]/).pop()?.split(".").pop()?.toLowerCase();
+  const base = path.split(/[/\\]/).pop() ?? "";
+  const dot = base.lastIndexOf(".");
+  if (dot <= 0) return false;
+  const ext = base.slice(dot + 1).toLowerCase();
   return HEICMOV_EXTENSIONS.includes(ext);
 }
 

@@ -17,12 +17,14 @@
  * @param {() => void|Promise<void>} deps.authPickSyncFolder
  * @param {() => void|Promise<void>} deps.authClearSyncFolder
  * @param {(opts?: { quiet?: boolean }) => void|Promise<void>} deps.authSyncNow
+ * @param {() => void} deps.renderAll
  */
 export function createAccountPageUi({
   el, getAuthState, activeAuthUser, activeAuthOrg, authDraft,
   getAuthSyncBusy, getAuthSyncMessage,
   authCreateLocalAccount, authSwitchOrg, authCreateOrg, authSignOut,
   authExportSnapshot, authPickSyncFolder, authClearSyncFolder, authSyncNow,
+  renderAll,
 }) {
   function renderPage() {
     const root = document.getElementById("view-root");
@@ -72,7 +74,7 @@ export function createAccountPageUi({
                 class: "nm-input",
                 value: authDraft.newOrgName,
                 placeholder: "New organization",
-                oninput: (e) => { authDraft.newOrgName = e.target.value; },
+                oninput: (e) => { authDraft.newOrgName = e.target.value; renderAll(); },
                 onkeydown: (e) => { if (e.key === "Enter") authCreateOrg(); },
               }),
               el("button", {

@@ -58,7 +58,11 @@ export function createSettingsPageUi({
   async function mcpRemove(id) {
     const userState = getUserState();
     if (!confirm("Remove this MCP tool?")) return;
-    try { await invoke("mcp_stop", { id }); } catch (_) {}
+    try { await invoke("mcp_stop", { id }); }
+    catch (err) {
+      console.warn(`mcp_stop(${id}) failed:`, err);
+      if (!confirm(`Could not stop the MCP server (${err}). Remove it from the installed list anyway?`)) return;
+    }
     userState.installedTools = (userState.installedTools || []).filter((t) => t.id !== id);
     const grants = { ...(userState.installedGrants || {}) };
     delete grants[id];

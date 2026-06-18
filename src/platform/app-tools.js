@@ -243,6 +243,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     getAuthSyncBusy, getAuthSyncMessage,
     authCreateLocalAccount, authSwitchOrg, authCreateOrg, authSignOut,
     authExportSnapshot, authPickSyncFolder, authClearSyncFolder, authSyncNow,
+    renderAll: () => appUi.renderAll(),
   });
 
   const appShell = createAppShell({

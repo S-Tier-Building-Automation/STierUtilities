@@ -15,4 +15,5 @@ test("filterMediaPaths keeps HEIC/HEIF/MOV and drops other extensions", () => {
     "C:\\Photos\\b.mov",
     "D:\\d.HEIF",
   ]);
+  assert.deepEqual(filterMediaPaths(["/tmp/noext", "readme.heic"]), ["readme.heic"]);
 });

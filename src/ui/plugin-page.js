@@ -54,7 +54,7 @@ export function createPluginPageUi({
             : "Not connected — the MCP server failed to start (check the command is installed)."),
         el("p", { class: "muted small" }, `Provides: ${caps.length ? caps.join(", ") : "—"}`),
         el("p", { class: "muted small" }, `Permissions: ${(m.permissions || []).join(", ") || "none"}`),
-        el("p", { class: "muted small" }, `Command: ${entry.command || "?"} ${(entry.args || []).join(" ")}`),
+        el("p", { class: "muted small" }, `Command: ${entry.command || "?"} ${(Array.isArray(entry.args) ? entry.args : []).join(" ")}`),
         el("div", { class: "tool-actions" },
           el("button", { class: "btn-ghost", onclick: () => mcpRemove(m.id) }, "Remove tool"),
         ),

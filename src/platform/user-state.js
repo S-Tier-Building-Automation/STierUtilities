@@ -277,7 +277,8 @@ export function createUserStateManager({
         await invoke("auth_save_user_state", { userId: null, orgId: null, state: userState });
       }
       const result = await invoke("auth_sync_now");
-      authState = result.state;
+      if (!result || typeof result !== "object") throw new Error("Sync returned no result");
+      authState = result.state ?? authState;
       authSyncMessage = result.message || "Sync complete.";
       await authLoadActiveUserState({ migrateIfEmpty: true, preferNative: true });
     } catch (err) {

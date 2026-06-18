@@ -8,14 +8,17 @@ export function closeModal() {
   if (!activeModal) return;
   document.removeEventListener("keydown", activeModal.onKey);
   activeModal.overlay.remove();
+  const onClose = activeModal.onClose;
   activeModal = null;
+  onClose?.();
 }
 
 /** One modal at a time: backdrop + centered card. Closes on ×, backdrop click, or Escape. */
-export function openModal({ title, body = [] } = {}) {
+export function openModal({ title, body = [], onClose = null } = {}) {
   closeModal();
+  const dismiss = () => closeModal();
   const closeBtn = el("button", {
-    class: "modal-close", title: "Close", "aria-label": "Close", onclick: closeModal,
+    class: "modal-close", title: "Close", "aria-label": "Close", onclick: dismiss,
   }, "×");
   const card = el("div",
     { class: "modal-card", role: "dialog", "aria-modal": "true", "aria-label": title || "Dialog" },
@@ -27,12 +30,12 @@ export function openModal({ title, body = [] } = {}) {
   );
   const overlay = el("div", {
     class: "modal-overlay",
-    onclick: (e) => { if (e.target === e.currentTarget) closeModal(); },
+    onclick: (e) => { if (e.target === e.currentTarget) dismiss(); },
   }, card);
-  const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); closeModal(); } };
+  const onKey = (e) => { if (e.key === "Escape") { e.preventDefault(); dismiss(); } };
   document.addEventListener("keydown", onKey);
   document.body.appendChild(overlay);
-  activeModal = { overlay, onKey };
+  activeModal = { overlay, onKey, onClose };
   closeBtn.focus();
 }
 
@@ -50,7 +53,7 @@ export function confirmAction({ title = "Confirm", message = "", confirmLabel = 
       el("p", {}, message),
       el("div", { class: "confirm-actions" }, cancelBtn, confirmBtn),
     );
-    openModal({ title, body: [body] });
+    openModal({ title, body: [body], onClose: () => done(false) });
     cancelBtn.focus();
   });
 }
