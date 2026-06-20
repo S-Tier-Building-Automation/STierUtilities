@@ -321,7 +321,7 @@ export function formatModeledValue(point, raw) {
 // the device equip if it's missing) and remove the now-empty inferred shells.
 // Returns { reparented, removed }. Operates on an inventory instance.
 export function bwRegroupPointsUnderDevices(inventory) {
-  if (!inventory) return { reparented: 0, removed: 0 };
+  if (!inventory) return { reparented: 0, removed: 0, removedDeviceObjects: 0 };
   const deviceEquipByInstance = new Map();
   for (const e of inventory.listEntities({ type: "equip" })) {
     const inst = Number(e.deviceInstance);

@@ -32,11 +32,14 @@ let histCovListenerReady = false;
 
 function ensureHistorianCovListener() {
   if (histCovListenerReady || !listen) return;
-  histCovListenerReady = true;
   listen("bacnet:cov", (event) => {
     const hist = historianInstance();
     if (hist?.handleCovEvent?.(event.payload)) renderAll();
-  }).catch((err) => console.warn("listen bacnet:cov (historian) failed:", err));
+  })
+    .then(() => {
+      histCovListenerReady = true;
+    })
+    .catch((err) => console.warn("listen bacnet:cov (historian) failed:", err));
 }
 
 function histStatusPill() {

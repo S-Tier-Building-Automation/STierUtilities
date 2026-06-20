@@ -6,7 +6,7 @@ test("niceExtent pads flat lines symmetrically", () => {
   const e = niceExtent([42, 42, 42]);
   assert.ok(e.min < 42);
   assert.ok(e.max > 42);
-  assert.equal(e.max - e.min, e.max - 42 + (42 - e.min));
+  assert.equal(e.max - 42, 42 - e.min);
 });
 
 test("niceExtent adds margin on varying values", () => {

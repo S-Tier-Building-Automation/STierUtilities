@@ -1450,7 +1450,7 @@ fn first_string(values: &[BacnetValue]) -> Option<String> {
 }
 
 fn non_empty_label(s: Option<String>) -> Option<String> {
-    s.filter(|v| !v.trim().is_empty())
+    s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
 }
 
 /// Prefer BACnet object-name; fall back to description. JCI MP-V / Metasys
@@ -1637,7 +1637,16 @@ fn enrich_object_names_core(
             }
             Err(e) if e.starts_with("no response") => {
                 timeouts += 1;
-                if timeouts >= NAME_MAX_CONSECUTIVE_TIMEOUTS {
+                // Some devices silently drop oversized/unsupported RPM batches.
+                // Shrink the chunk (then fall back to single-object RP) before
+                // burning the whole timeout budget on the same failing batch.
+                if chunk_size > 2 {
+                    chunk_size = (chunk_size / 2).max(2);
+                    timeouts = 0;
+                } else if chunk.len() > 1 {
+                    rp_mode = true;
+                    timeouts = 0;
+                } else if timeouts >= NAME_MAX_CONSECUTIVE_TIMEOUTS {
                     return;
                 }
             }

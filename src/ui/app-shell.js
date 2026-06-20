@@ -41,7 +41,7 @@ export function initSidebarSplitter({ userState, saveUserState, applySidebarColl
     setWidth: setSidebarWidth,
     persist: saveUserState,
   });
-  splitter.addEventListener("keydown", paneSplitterKeyHandler(sidebarWidthPx, (px) => setSidebarWidth(px, true), saveUserState));
+  splitter.addEventListener("keydown", paneSplitterKeyHandler(sidebarWidthPx, (px) => setSidebarWidth(px, true)));
   splitter.addEventListener("dblclick", () => setSidebarWidth(SIDEBAR_DEFAULT, true));
 }
 
@@ -57,14 +57,22 @@ export function initSidebarSplitter({ userState, saveUserState, applySidebarColl
  * @param {() => string|null} deps.currentPluginId
  * @param {() => void} deps.applySidebarCollapsed
  * @param {(on: boolean) => void} deps.setSidebarCollapsed
- * @param {object} deps.pages — { library, settings, account, services, activity, plugin }
+ * @param {object} deps.pages — { home, library, settings, account, services, activity, plugin }
  * @param {() => object|null} deps.getBuildingWorkspace
  * @param {() => object|null} [deps.getBacnetManager]
+ * @param {() => object} [deps.getActivitySummary]
+ * @param {() => object} [deps.getSystemStatus]
+ * @param {() => string[]} [deps.getRecentTools]
+ * @param {(id: string) => object|undefined} [deps.toolById]
  */
 export function createAppShell({
   appVersion, getTools, isFavorite, isHidden, setView, pluginView,
   currentView, currentPluginId, applySidebarCollapsed, setSidebarCollapsed,
   pages, getBuildingWorkspace, getBacnetManager = () => null,
+  getActivitySummary = () => ({ errors: 0, warns: 0 }),
+  getSystemStatus = () => ({}),
+  getRecentTools = () => [],
+  toolById = () => null,
 }) {
   let updateInFlight = false;
   let lastRenderedView = "";
@@ -138,6 +146,71 @@ export function createAppShell({
     }
   }
 
+  function renderActivityBadge() {
+    const btn = document.getElementById("header-nav-activity");
+    if (!btn) return;
+    const summary = getActivitySummary();
+    const count = summary.errors + summary.warns;
+    let badge = btn.querySelector(".header-nav-badge");
+    if (count > 0) {
+      if (!badge) {
+        badge = el("span", { class: "header-nav-badge" });
+        btn.appendChild(badge);
+      }
+      badge.textContent = count > 99 ? "99+" : String(count);
+      badge.classList.toggle("header-nav-badge-warn", summary.errors === 0);
+      badge.classList.toggle("header-nav-badge-error", summary.errors > 0);
+    } else if (badge) {
+      badge.remove();
+    }
+  }
+
+  function renderSidebarNav() {
+    const view = currentView();
+    for (const btn of document.querySelectorAll(".sidebar-nav-item, .header-nav-item")) {
+      const target = btn.dataset.view;
+      if (!target) continue;
+      const active = target === "library"
+        ? (view === "library" || view.startsWith("plugin:"))
+        : btn.dataset.view === view;
+      btn.classList.toggle("active", active);
+    }
+  }
+
+  function renderSidebarRecent() {
+    const list = document.getElementById("sidebar-recent");
+    if (!list) return;
+    list.replaceChildren();
+    const recent = getRecentTools()
+      .map((id) => toolById(id))
+      .filter((t) => t && !isHidden(t.id));
+    if (recent.length === 0) {
+      list.appendChild(el("li", { class: "sidebar-empty" }, "Open a tool to see it here."));
+      return;
+    }
+    for (const tool of recent) {
+      const active = currentPluginId() === tool.id;
+      list.appendChild(el("li", {
+        class: `sidebar-fav ${active ? "active" : ""}`,
+        onclick: () => setView(pluginView(tool.id)),
+        title: tool.name,
+      },
+        el("span", { class: "sidebar-fav-icon" }, tool.emoji),
+        el("span", { class: "sidebar-fav-name" }, tool.name),
+      ));
+    }
+  }
+
+  function renderSidebarFooter() {
+    const footer = document.getElementById("sidebar-footer-status");
+    if (!footer) return;
+    const status = getSystemStatus();
+    footer.replaceChildren(
+      el("span", { class: `pill pill-sm ${status.observability?.cls || "pill-muted"}` }, status.observability?.label || "Observability"),
+      el("span", { class: "sidebar-footer-version" }, `v${appVersion}`),
+    );
+  }
+
   function renderSidebar() {
     const favList = document.getElementById("sidebar-favorites");
     favList.replaceChildren();
@@ -160,15 +233,10 @@ export function createAppShell({
       }
     }
 
-    const view = currentView();
-    for (const btn of document.querySelectorAll(".header-nav-item")) {
-      btn.classList.toggle(
-        "active",
-        btn.dataset.view === "library"
-          ? (view === "library" || view.startsWith("plugin:"))
-          : btn.dataset.view === view,
-      );
-    }
+    renderSidebarNav();
+    renderSidebarRecent();
+    renderSidebarFooter();
+    renderActivityBadge();
   }
 
   function renderScrollTargets() {
@@ -241,7 +309,9 @@ export function createAppShell({
     if (!bc) return;
     bc.replaceChildren();
     const view = currentView();
-    if (view === "settings") {
+    if (view === "home") {
+      bc.appendChild(el("span", { class: "crumb-current" }, "Home"));
+    } else if (view === "settings") {
       bc.appendChild(el("span", { class: "crumb-current" }, "Settings"));
     } else if (view === "account") {
       bc.appendChild(el("span", { class: "crumb-current" }, "Account"));
@@ -259,8 +329,10 @@ export function createAppShell({
       bc.appendChild(el("span", { class: "crumb-sep" }, "›"));
       bc.appendChild(el("span", { class: "crumb-current" },
         tool ? `${tool.emoji} ${tool.name}` : id));
-    } else {
+    } else if (view === "library") {
       bc.appendChild(el("span", { class: "crumb-current" }, "Library"));
+    } else {
+      bc.appendChild(el("span", { class: "crumb-current" }, "Home"));
     }
   }
 
@@ -276,7 +348,8 @@ export function createAppShell({
 
   function renderCurrentPage() {
     const view = currentView();
-    if (view === "settings") pages.settings.renderPage();
+    if (view === "home") pages.home.renderPage();
+    else if (view === "settings") pages.settings.renderPage();
     else if (view === "account") pages.account.renderPage();
     else if (view === "services") pages.services.renderPage();
     else if (view === "activity") pages.activity.renderPage();
@@ -302,8 +375,12 @@ export function createAppShell({
       bw?.renderModelScope?.({ tree: true, details: true, header: true });
       return;
     }
-    if (scope === "bacnet-manager:devices" || scope === "bacnet-manager:inbox") {
-      getBacnetManager()?.renderDevicesScope?.() || getBacnetManager()?.renderInboxScope?.();
+    if (scope === "bacnet-manager:devices") {
+      getBacnetManager()?.renderDevicesScope?.();
+      return;
+    }
+    if (scope === "bacnet-manager:inbox") {
+      getBacnetManager()?.renderInboxScope?.();
       return;
     }
     if (scope === "all") {

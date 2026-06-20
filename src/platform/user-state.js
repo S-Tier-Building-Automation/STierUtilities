@@ -17,9 +17,11 @@ export function normalizeUserState(stored = {}) {
     hidden: stored.hidden || {},
     showHidden: Boolean(stored.showHidden),
     libraryView: stored.libraryView === "list" ? "list" : "grid",
+    librarySearch: typeof stored.librarySearch === "string" ? stored.librarySearch : "",
+    recentTools: Array.isArray(stored.recentTools) ? stored.recentTools.filter((id) => typeof id === "string") : [],
     nmRailWidth: Number.isFinite(stored.nmRailWidth) ? stored.nmRailWidth : 240,
     sidebarWidth: Number.isFinite(stored.sidebarWidth) ? stored.sidebarWidth : 200,
-    view: typeof stored.view === "string" ? stored.view : "library",
+    view: typeof stored.view === "string" ? stored.view : "home",
     sidebarCollapsed: Boolean(stored.sidebarCollapsed),
     activityToolFilter: typeof stored.activityToolFilter === "string" ? stored.activityToolFilter : "all",
     activityKindFilter: typeof stored.activityKindFilter === "string" ? stored.activityKindFilter : "all",
@@ -118,7 +120,11 @@ export function createUserStateManager({
   }
 
   function flushUserStatePersistence() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(userState));
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(userState));
+    } catch (err) {
+      console.warn("[user-state] could not persist to localStorage during flush:", err);
+    }
     if (authUserStateSaveTimer) {
       clearTimeout(authUserStateSaveTimer);
       authUserStateSaveTimer = null;
@@ -314,7 +320,9 @@ export function createUserStateManager({
     userState.hidden = {};
     userState.showHidden = false;
     userState.libraryView = "grid";
-    userState.view = "library";
+    userState.librarySearch = "";
+    userState.recentTools = [];
+    userState.view = "home";
     userState.sidebarCollapsed = false;
     userState.sidebarWidth = 200;
     try {
@@ -361,8 +369,21 @@ export function createUserStateManager({
     renderAll();
   }
 
+  function touchRecentTool(id) {
+    if (!id) return;
+    const prev = (userState.recentTools || []).filter((x) => x !== id);
+    userState.recentTools = [id, ...prev].slice(0, 8);
+  }
+
+  function getRecentTools() {
+    return userState.recentTools || [];
+  }
+
   function setView(view) {
     onBeforeViewChange();
+    if (typeof view === "string" && view.startsWith("plugin:")) {
+      touchRecentTool(view.slice("plugin:".length));
+    }
     userState.view = view;
     saveUserState();
     renderAll();
@@ -396,13 +417,13 @@ export function createUserStateManager({
   }
 
   function currentView() {
-    if (userState.view === "library" || userState.view === "settings" || userState.view === "services" || userState.view === "activity" || userState.view === "account") {
+    if (userState.view === "home" || userState.view === "library" || userState.view === "settings" || userState.view === "services" || userState.view === "activity" || userState.view === "account") {
       return userState.view;
     }
     if (typeof userState.view === "string" && userState.view.startsWith("plugin:")) {
       return userState.view;
     }
-    return "library";
+    return "home";
   }
 
   function currentPluginId() {
@@ -443,5 +464,7 @@ export function createUserStateManager({
     currentView,
     currentPluginId,
     pluginView,
+    getRecentTools,
+    touchRecentTool,
   };
 }
