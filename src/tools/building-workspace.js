@@ -260,7 +260,7 @@ export function pointEntityFromBacnet({ siteId, buildingId, floorId, equipId, de
   const unit = config.unit != null && String(config.unit).trim() !== "" ? String(config.unit).trim() : importedUnit;
   const sourceRef = bacnetSourceRef(deviceInstance, objectType, instance);
   const num = (v) => (v != null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : null);
-  const precision = config.precision != null && config.precision !== "" && Number.isInteger(Number(config.precision))
+  const precision = config.precision != null && config.precision !== "" && /^\d+$/.test(String(config.precision))
     ? Math.max(0, Math.min(10, Number(config.precision))) : null;
   const min = num(config.min);
   const max = num(config.max);

@@ -43,7 +43,11 @@ function deviceInstanceOf(device) {
 function deviceIp(device) {
   if (!device || typeof device !== "object") return null;
   const ip = device.address ?? device.ip;
-  return typeof ip === "string" && ip.trim() ? ip.trim() : null;
+  if (typeof ip !== "string") return null;
+  // BACnet addresses often carry a port suffix (e.g. "192.168.1.10:47808")
+  // that the reachability check can't parse — strip it to the bare host.
+  const host = ip.split(":")[0].trim();
+  return host || null;
 }
 
 function compactTags(tags) {

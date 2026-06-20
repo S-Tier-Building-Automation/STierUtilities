@@ -92,7 +92,7 @@ export function createBacnetInboxUi(deps) {
   }
 
   function bmInboxPathLabel(inv, entity) {
-    return entity ? breadcrumbItems(inv, entity).map((item) => item.name || item.id).join(" > ") : "";
+    return inv && entity ? breadcrumbItems(inv, entity).map((item) => item.name || item.id).join(" > ") : "";
   }
 
   function bmBacnetDeviceInstance(device) {
@@ -285,11 +285,15 @@ export function createBacnetInboxUi(deps) {
   function bmClampInboxMenu() {
     setTimeout(() => {
       const menu = document.querySelector(".bw-inbox-menu");
-      if (!menu) return;
+      if (!menu || !bm.inboxMenu) return;
       const margin = 8;
       const rect = menu.getBoundingClientRect();
-      menu.style.left = `${Math.max(margin, Math.min(rect.left, window.innerWidth - rect.width - margin))}px`;
-      menu.style.top = `${Math.max(margin, Math.min(rect.top, window.innerHeight - rect.height - margin))}px`;
+      // Clamp from the stored viewport coords; rect.left/top can double-offset
+      // under a non-viewport offset parent or when the page is scrolled.
+      const x = Math.max(margin, Math.min(bm.inboxMenu.x, window.innerWidth - rect.width - margin));
+      const y = Math.max(margin, Math.min(bm.inboxMenu.y, window.innerHeight - rect.height - margin));
+      menu.style.left = `${x}px`;
+      menu.style.top = `${y}px`;
     }, 0);
   }
 
@@ -307,6 +311,7 @@ export function createBacnetInboxUi(deps) {
 
   function bmListFloors(inv) {
     const floors = [];
+    if (!inv) return floors;
     for (const site of inv.listEntities({ type: "site" })) {
       for (const building of inv.listEntities({ type: "building", siteId: site.id })) {
         for (const floor of inv.listEntities({ type: "floor", buildingId: building.id })) {
@@ -574,7 +579,7 @@ export function createBacnetInboxUi(deps) {
     if (item.status === "changed") return "Changed";
     if (item.status === "conflict") return item.conflict || "Conflict";
     if (existing) {
-      const existingFloor = inv.getEntity(existing.floorId || existing.parentId);
+      const existingFloor = inv ? inv.getEntity(existing.floorId || existing.parentId) : null;
       return existing.floorId === floor?.id ? "Here" : (existingFloor?.name ? `On ${existingFloor.name}` : "Modeled");
     }
     return "New";
