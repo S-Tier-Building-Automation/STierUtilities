@@ -8,6 +8,8 @@ export { toast } from "./toast.js";
 export { filterMediaPaths } from "./media-paths.js";
 export { createAccountMenu } from "./account-menu.js";
 export { createActivityLog } from "./activity.js";
+export { createHomeUi } from "./home.js";
+export { initHeaderSearch } from "./header-search.js";
 export { createLibraryUi } from "./library.js";
 export { createServicesPageUi } from "./services-page.js";
 export { createAccountPageUi } from "./account-page.js";

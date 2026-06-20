@@ -147,19 +147,19 @@ export function createAppShell({
   }
 
   function renderActivityBadge() {
-    const btn = document.getElementById("header-nav-activity");
+    const btn = document.getElementById("sidebar-nav-activity");
     if (!btn) return;
     const summary = getActivitySummary();
     const count = summary.errors + summary.warns;
-    let badge = btn.querySelector(".header-nav-badge");
+    let badge = btn.querySelector(".sidebar-nav-badge");
     if (count > 0) {
       if (!badge) {
-        badge = el("span", { class: "header-nav-badge" });
+        badge = el("span", { class: "sidebar-nav-badge" });
         btn.appendChild(badge);
       }
       badge.textContent = count > 99 ? "99+" : String(count);
-      badge.classList.toggle("header-nav-badge-warn", summary.errors === 0);
-      badge.classList.toggle("header-nav-badge-error", summary.errors > 0);
+      badge.classList.toggle("sidebar-nav-badge-warn", summary.errors === 0);
+      badge.classList.toggle("sidebar-nav-badge-error", summary.errors > 0);
     } else if (badge) {
       badge.remove();
     }
@@ -167,7 +167,7 @@ export function createAppShell({
 
   function renderSidebarNav() {
     const view = currentView();
-    for (const btn of document.querySelectorAll(".sidebar-nav-item, .header-nav-item")) {
+    for (const btn of document.querySelectorAll(".sidebar-nav-item")) {
       const target = btn.dataset.view;
       if (!target) continue;
       const active = target === "library"

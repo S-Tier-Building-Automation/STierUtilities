@@ -70,4 +70,7 @@ installBootstrap({
   authSignOut: app.authSignOut,
   initWindowControls,
   hydrateFromStartupWarmup,
+  getTools: app.getTools,
+  isHidden: app.isHidden,
+  pluginView: app.pluginView || ((id) => `plugin:${id}`),
 });

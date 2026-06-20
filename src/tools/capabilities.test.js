@@ -212,9 +212,10 @@ test("bacnet-historian is wired and polls through bacnet.read into timeseries", 
   assert.deepEqual(pt.tags, { device: "555", object: "0:4", label: "RAT" });
 });
 
-test("building-workspace registers inventory", async () => {
+test("building-model registers inventory", async () => {
   const kernel = await bootKernel(mockInvoke(), { inventoryStorage: createMemoryInventoryStorage() });
   const inventory = kernel._peek("inventory.v1").impl;
+  assert.equal(kernel._peek("inventory.v1").providerId, "building-model");
   const site = inventory.upsertEntity({ id: "site:test", type: "site", name: "Test" });
   assert.equal(site.name, "Test");
   assert.equal(inventory.listEntities({ type: "site" }).some((e) => e.id === "site:test"), true);

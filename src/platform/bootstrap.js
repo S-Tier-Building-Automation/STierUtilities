@@ -7,6 +7,7 @@ import { buildMcpFactories } from "./services/mcp-client.js";
 import { createTimeseries } from "./services/timeseries.js";
 import { createScheduler } from "./services/scheduler.js";
 import { createPackController } from "./services/pack-controller.js";
+import { initHeaderSearch } from "../ui/header-search.js";
 
 /**
  * @param {object} deps
@@ -113,6 +114,9 @@ export function createStartupWarmup({ invoke, networkManager, observability, get
  * @param {object} deps.accountMenu — { mount() }
  * @param {() => void} deps.initWindowControls
  * @param {() => Promise<void>} deps.hydrateFromStartupWarmup
+ * @param {() => Array<object>} [deps.getTools]
+ * @param {(id: string) => boolean} [deps.isHidden]
+ * @param {(id: string) => string} [deps.pluginView]
  */
 export async function runBootstrap({
   invoke,
@@ -140,10 +144,15 @@ export async function runBootstrap({
   accountMenu,
   initWindowControls,
   hydrateFromStartupWarmup,
+  getTools = () => [],
+  isHidden = () => false,
+  pluginView = (id) => `plugin:${id}`,
 }) {
-  for (const btn of document.querySelectorAll(".header-nav-item")) {
+  for (const btn of document.querySelectorAll(".sidebar-nav-item")) {
     btn.addEventListener("click", () => setView(btn.dataset.view));
   }
+
+  initHeaderSearch({ getTools, isHidden, setView, pluginView });
 
   document
     .getElementById("sidebar-toggle")

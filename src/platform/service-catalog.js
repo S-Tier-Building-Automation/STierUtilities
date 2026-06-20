@@ -168,6 +168,64 @@ export const CAPABILITY_DOCS = {
         desc: "Export the full local model for dashboards, reports, or backups." },
     ],
   },
+
+  rules: {
+    summary:
+      "The analytics engine: evaluate modeled equipment against rule packs " +
+      "(missing sensors, out-of-range values, low airflow) with optional live " +
+      "BACnet reads. Owned by the headless building-rules service.",
+    methods: [
+      { name: "listRulePacks", sig: "listRulePacks()", returns: "{ id, name, rules }[]",
+        desc: "The built-in rule packs available to evaluate." },
+      { name: "listRules", sig: "listRules(packId = \"vav\")", returns: "RuleDefinition[]",
+        desc: "The flat list of rules for a pack." },
+      { name: "run", sig: "run({ scope?, rules?, options?, useLive? })", returns: "Promise<RuleRun>",
+        desc: "Evaluate rules against equipment in scope; returns the run (callers persist via inventory.recordRuleRun)." },
+      { name: "exportMarkdown", sig: "exportMarkdown(snapshot, run)", returns: "string",
+        desc: "Render a rule run as a Markdown report." },
+      { name: "exportCsv", sig: "exportCsv(run)", returns: "string",
+        desc: "Render a rule run's findings as CSV." },
+    ],
+  },
+
+  graphics: {
+    summary:
+      "Device-graphics engine: resolve the right graphic for a piece of equipment " +
+      "and bind modeled points to its callouts, status chips, and parameters. " +
+      "Owned by the headless building-graphics service.",
+    methods: [
+      { name: "listDefinitions", sig: "listDefinitions()", returns: "DeviceGraphicDefinition[]",
+        desc: "All known device graphic definitions." },
+      { name: "graphicForEquip", sig: "graphicForEquip(equip, template?)", returns: "DeviceGraphicDefinition | null",
+        desc: "The graphic for an equip; resolves its template from inventory if omitted." },
+      { name: "resolveBindings", sig: "resolveBindings({ equip?, graphic?, points?, liveValues?, formatValue? })", returns: "ResolvedGraphicBindings",
+        desc: "Bind callout/status/parameter slots to modeled points, applying live values when given." },
+      { name: "setPointGraphicRole", sig: "setPointGraphicRole(pointId, role)", returns: "Entity",
+        desc: "Bind (or clear) a point's graphicRole tag and persist it to the model." },
+      { name: "applyAutoTags", sig: "applyAutoTags(equipId, graphic?)", returns: "number",
+        desc: "Auto-tag an equip's points to graphic roles by name; returns how many were tagged." },
+      { name: "effectiveDeviceView", sig: "effectiveDeviceView({ deviceView, graphic, bindings })", returns: "\"graphic\" | \"table\"",
+        desc: "Resolve the active view, defaulting to graphic when bindings exist." },
+    ],
+  },
+
+  alerts: {
+    summary:
+      "Unifies analytics rule findings and live BACnet alarms into one " +
+      "acknowledgeable feed. Owned by the headless building-alerts service.",
+    methods: [
+      { name: "listRuleFindings", sig: "listRuleFindings({ runId?, status? })", returns: "Alert[]",
+        desc: "Findings from the latest (or a specified) rule run as unified alerts." },
+      { name: "listBacnetAlarms", sig: "listBacnetAlarms({ devices? })", returns: "Promise<Alert[]>",
+        desc: "Live BACnet alarms across the given device refs." },
+      { name: "listUnified", sig: "listUnified({ runId?, devices?, status? })", returns: "Promise<Alert[]>",
+        desc: "Rule findings and BACnet alarms merged into one feed." },
+      { name: "acknowledge", sig: "acknowledge({ device, objectType, instance })", returns: "Promise<any>",
+        desc: "Acknowledge a live BACnet alarm (delegates to bacnet.read)." },
+      { name: "runRuleScan", sig: "runRuleScan({ scope?, options?, useLive? })", returns: "Promise<RuleRun>",
+        desc: "Run the rule packs in scope and persist the run." },
+    ],
+  },
 };
 
 /** "bacnet.read" -> "bacnetRead" (a sample variable name for usage snippets). */

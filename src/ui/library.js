@@ -1,5 +1,7 @@
 // Tool library — grid/list cards, favorites affordances, hidden tools.
 
+import { filterTools, groupToolsByCategory } from "./tool-search.js";
+
 /**
  * @param {object} deps
  * @param {import("./dom.js").el} deps.el
@@ -12,9 +14,12 @@
  * @param {(id: string, on: boolean) => void} deps.setHidden
  * @param {(view: string) => void} deps.setView
  * @param {(id: string) => string} deps.pluginView
+ * @param {(id: string) => object|undefined} [deps.toolById]
+ * @param {() => string[]} [deps.getRecentTools]
  */
 export function createLibraryUi({
   el, getUserState, saveUserState, getTools, isFavorite, isHidden, setFavorite, setHidden, setView, pluginView,
+  toolById = () => null, getRecentTools = () => [],
 }) {
 
   function setShowHidden(on) {
@@ -25,6 +30,12 @@ export function createLibraryUi({
 
   function setLibraryView(view) {
     getUserState().libraryView = view === "list" ? "list" : "grid";
+    saveUserState();
+    renderPage();
+  }
+
+  function setLibrarySearch(value) {
+    getUserState().librarySearch = value;
     saveUserState();
     renderPage();
   }
@@ -53,6 +64,13 @@ export function createLibraryUi({
     return status ? el("span", { class: `pill ${status.cls}` }, status.label) : null;
   }
 
+  function toolCategoryPill(tool) {
+    const cat = tool.manifest?.category;
+    if (!cat) return null;
+    const label = cat === "service" ? "Service" : cat === "app" ? "App" : cat;
+    return el("span", { class: "pill pill-muted pill-sm tool-cat-pill" }, label);
+  }
+
   function renderToolCard(tool) {
     return el("article",
       {
@@ -67,11 +85,16 @@ export function createLibraryUi({
       el("div", { class: "tool-icon" }, tool.emoji),
       el("div", { class: "tool-body" },
         el("div", { class: "tool-header" },
-          el("h3", {}, tool.name),
-          el("div", { class: "card-header-right" },
+          el("div", { class: "tool-title-row" },
+            el("h3", {}, tool.name),
+            el("div", { class: "card-header-actions" },
+              toolStarBtn(tool),
+              toolHideBtn(tool),
+            ),
+          ),
+          el("div", { class: "tool-meta-row" },
+            toolCategoryPill(tool),
             toolStatusPill(tool),
-            toolStarBtn(tool),
-            toolHideBtn(tool),
           ),
         ),
         el("p", { class: "tool-tagline" }, tool.tagline),
@@ -93,6 +116,7 @@ export function createLibraryUi({
       el("span", { class: "tool-row-icon" }, tool.emoji),
       el("span", { class: "tool-row-name" }, tool.name),
       el("span", { class: "tool-row-tag" }, tool.tagline),
+      toolCategoryPill(tool) || el("span", {}),
       toolStatusPill(tool) || el("span", {}),
       toolStarBtn(tool),
       toolHideBtn(tool),
@@ -108,6 +132,51 @@ export function createLibraryUi({
     );
   }
 
+  function renderRecentStrip() {
+    const recent = getRecentTools()
+      .map((id) => toolById(id))
+      .filter((t) => t && !isHidden(t.id));
+    if (!recent.length) return null;
+    return el("section", { class: "lib-recent" },
+      el("h3", { class: "section-subhead" }, "Recently used"),
+      el("div", { class: "home-quick-grid lib-recent-grid" },
+        ...recent.map((tool) => el("button", {
+          type: "button",
+          class: "home-quick-tile",
+          onclick: () => setView(pluginView(tool.id)),
+        },
+          el("span", { class: "home-quick-icon" }, tool.emoji),
+          el("span", { class: "home-quick-name" }, tool.name),
+        )),
+      ),
+    );
+  }
+
+  function renderGroupedTools(tools, listView) {
+    const userState = getUserState();
+    const query = userState.librarySearch || "";
+    const filtered = filterTools(tools, query, { isHidden });
+    if (!query && !listView) {
+      const groups = groupToolsByCategory(filtered, () => false);
+      const wrap = el("div", { class: "lib-groups" });
+      for (const group of groups) {
+        wrap.appendChild(el("h3", { class: "section-subhead" }, group.label));
+        const grid = el("section", { class: "tool-grid" });
+        for (const tool of group.tools) grid.appendChild(renderToolCard(tool));
+        wrap.appendChild(grid);
+      }
+      return wrap;
+    }
+    if (listView) {
+      const list = el("ul", { class: "tool-list" });
+      for (const tool of filtered) list.appendChild(renderToolRow(tool));
+      return list;
+    }
+    const grid = el("section", { class: "tool-grid" });
+    for (const tool of filtered) grid.appendChild(renderToolCard(tool));
+    return grid;
+  }
+
   function renderPage() {
     const userState = getUserState();
     const root = document.getElementById("view-root");
@@ -116,8 +185,9 @@ export function createLibraryUi({
     const TOOLS = getTools();
     const visible = TOOLS.filter((t) => !isHidden(t.id));
     const hidden = TOOLS.filter((t) => isHidden(t.id));
-
     const listView = userState.libraryView === "list";
+    const search = userState.librarySearch || "";
+
     const viewToggle = el("div", { class: "lib-toggle", role: "group", "aria-label": "Library layout" },
       el("button", {
         class: listView ? "" : "active",
@@ -146,20 +216,32 @@ export function createLibraryUi({
       ),
     ));
 
+    root.appendChild(el("div", { class: "lib-search-row" },
+      el("input", {
+        class: "nm-input lib-search",
+        type: "search",
+        placeholder: "Search tools by name, tagline, or capability…",
+        value: search,
+        oninput: (e) => setLibrarySearch(e.target.value),
+      }),
+    ));
+
+    if (!search) {
+      const recentStrip = renderRecentStrip();
+      if (recentStrip) root.appendChild(recentStrip);
+    }
+
+    const filteredCount = filterTools(visible, search, { isHidden }).length;
     if (visible.length === 0) {
       root.appendChild(el("p", { class: "empty-state" },
         hidden.length > 0
           ? "All tools are hidden. Toggle “Show hidden” to restore them."
           : "No tools available.",
       ));
-    } else if (listView) {
-      const list = el("ul", { class: "tool-list" });
-      for (const tool of visible) list.appendChild(renderToolRow(tool));
-      root.appendChild(list);
+    } else if (filteredCount === 0) {
+      root.appendChild(el("p", { class: "empty-state" }, `No tools match “${search}”.`));
     } else {
-      const grid = el("section", { class: "tool-grid" });
-      for (const tool of visible) grid.appendChild(renderToolCard(tool));
-      root.appendChild(grid);
+      root.appendChild(renderGroupedTools(visible, listView));
     }
 
     if (userState.showHidden && hidden.length > 0) {
@@ -170,5 +252,5 @@ export function createLibraryUi({
     }
   }
 
-  return { renderPage, setLibraryView, setShowHidden };
+  return { renderPage, setLibraryView, setShowHidden, setLibrarySearch };
 }

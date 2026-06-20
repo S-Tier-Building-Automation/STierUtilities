@@ -24,6 +24,25 @@ test("normalizeUserState preserves BACnet keys across a reload round-trip", () =
   assert.deepEqual(reloaded.bacnetObjectPresets, stored.bacnetObjectPresets);
 });
 
+test("normalizeUserState preserves BMS app state across a reload round-trip", () => {
+  const stored = {
+    deviceGraphics: { selectedEquipId: "equip:vav-1", deviceView: "graphic", showUpdated: true },
+    analytics: { datMin: "52", datMax: "118", flowMin: "60", siteId: "site:1", lastRunId: "ruleRun:9" },
+    alarmConsole: { siteId: "site:1" },
+  };
+  const reloaded = normalizeUserState(JSON.parse(JSON.stringify(normalizeUserState(stored))));
+  assert.deepEqual(reloaded.deviceGraphics, stored.deviceGraphics);
+  assert.deepEqual(reloaded.analytics, stored.analytics);
+  assert.deepEqual(reloaded.alarmConsole, stored.alarmConsole);
+});
+
+test("normalizeUserState defaults BMS app keys when absent", () => {
+  const empty = normalizeUserState({});
+  assert.equal(empty.deviceGraphics, null);
+  assert.equal(empty.analytics, null);
+  assert.equal(empty.alarmConsole, null);
+});
+
 test("normalizeUserState defaults BACnet keys when absent or malformed", () => {
   const empty = normalizeUserState({});
   assert.equal(empty.bacnetManager, null);
@@ -50,6 +69,13 @@ test("normalizeUserState preserves sidebarWidth across reload", () => {
   assert.equal(once.sidebarWidth, 312);
   const reloaded = normalizeUserState(JSON.parse(JSON.stringify(once)));
   assert.equal(reloaded.sidebarWidth, 312);
+});
+
+test("normalizeUserState defaults home view and recent tools", () => {
+  const s = normalizeUserState({});
+  assert.equal(s.view, "home");
+  assert.deepEqual(s.recentTools, []);
+  assert.equal(s.librarySearch, "");
 });
 
 test("clampSidebarWidth enforces sidebar resizer bounds", () => {

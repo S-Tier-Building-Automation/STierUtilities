@@ -27,6 +27,9 @@ export function normalizeUserState(stored = {}) {
     activityKindFilter: typeof stored.activityKindFilter === "string" ? stored.activityKindFilter : "all",
     historian: stored.historian || null,
     buildingWorkspace: stored.buildingWorkspace || null,
+    deviceGraphics: stored.deviceGraphics || null,
+    analytics: stored.analytics || null,
+    alarmConsole: stored.alarmConsole || null,
     inventory: stored.inventory || null,
     inventoryLegacyMigrated: Boolean(stored.inventoryLegacyMigrated),
     networkManager: stored.networkManager || null,
@@ -376,7 +379,7 @@ export function createUserStateManager({
   }
 
   function getRecentTools() {
-    return userState.recentTools || [];
+    return (userState.recentTools || []).filter((id) => !isFavorite(id));
   }
 
   function setView(view) {
@@ -386,6 +389,7 @@ export function createUserStateManager({
     }
     userState.view = view;
     saveUserState();
+    try { window.dispatchEvent(new CustomEvent("stier:view-change")); } catch (_) {}
     renderAll();
   }
 

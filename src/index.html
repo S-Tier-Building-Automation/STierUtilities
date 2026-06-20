@@ -23,14 +23,17 @@
           </svg>
         </button>
 
-        <nav class="app-header-nav" aria-label="Main navigation">
-          <button class="header-nav-item" data-view="library" type="button">
-            <span>📚</span> Library
-          </button>
-          <button class="header-nav-item" data-view="activity" type="button">
-            <span>📋</span> Activity
-          </button>
-        </nav>
+        <div class="header-search-wrap">
+          <input
+            id="header-tool-search"
+            class="header-search"
+            type="search"
+            placeholder="Search tools…"
+            aria-label="Search tools"
+            autocomplete="off"
+          />
+          <div id="header-search-results" class="header-search-results" hidden></div>
+        </div>
 
         <div class="app-header-title" id="header-breadcrumb"></div>
 
@@ -78,12 +81,44 @@
           </div>
         </div>
 
+        <div class="sidebar-section sidebar-nav-section">
+          <ul class="sidebar-nav">
+            <li>
+              <button class="sidebar-nav-item" data-view="home" type="button" title="Home">
+                <span class="sidebar-nav-icon">🏠</span>
+                <span class="sidebar-nav-label">Home</span>
+              </button>
+            </li>
+            <li>
+              <button class="sidebar-nav-item" data-view="library" type="button" title="Library">
+                <span class="sidebar-nav-icon">📚</span>
+                <span class="sidebar-nav-label">Library</span>
+              </button>
+            </li>
+            <li>
+              <button class="sidebar-nav-item" id="sidebar-nav-activity" data-view="activity" type="button" title="Activity">
+                <span class="sidebar-nav-icon">📋</span>
+                <span class="sidebar-nav-label">Activity</span>
+              </button>
+            </li>
+          </ul>
+        </div>
+
         <div class="sidebar-section">
           <h2 class="sidebar-heading"><span>⭐</span> Favorites</h2>
           <ul class="sidebar-list" id="sidebar-favorites">
             <li class="sidebar-empty">No favorites yet. Tap the star on a tool.</li>
           </ul>
         </div>
+
+        <div class="sidebar-section sidebar-recent-section">
+          <h2 class="sidebar-heading"><span>🕐</span> Recent</h2>
+          <ul class="sidebar-list" id="sidebar-recent">
+            <li class="sidebar-empty">Open a tool to see it here.</li>
+          </ul>
+        </div>
+
+        <div class="sidebar-footer" id="sidebar-footer-status"></div>
       </aside>
 
       <div

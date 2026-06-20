@@ -10,6 +10,7 @@ import {
   pickFolder,
   createActivityLog,
   createLibraryUi,
+  createHomeUi,
   createServicesPageUi,
   createAccountPageUi,
   createSettingsPageUi,
@@ -23,6 +24,9 @@ import { createBacnetManagerUi } from "../tools/ui/bacnetmanager.js";
 import { createObservabilityUi } from "../tools/ui/observability.js";
 import { createBuildingWorkspaceUi } from "../tools/ui/buildingworkspace.js";
 import { createBacnetHistorianUi } from "../tools/ui/bacnethistorian.js";
+import { createDeviceGraphicsUi } from "../tools/ui/devicegraphics.js";
+import { createBuildingAnalyticsUi } from "../tools/ui/buildinganalytics.js";
+import { createAlarmConsoleUi } from "../tools/ui/alarmconsole.js";
 
 /**
  * @param {object} deps
@@ -43,6 +47,9 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
   let bacnetManager = null;
   let buildingWorkspace = null;
   let bacnetHistorian = null;
+  let deviceGraphics = null;
+  let buildingAnalytics = null;
+  let alarmConsole = null;
 
   let ALL_MANIFESTS = [...TOOL_MANIFESTS];
   let TOOLS = [];
@@ -97,7 +104,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     getAllManifests: () => ALL_MANIFESTS,
     onCatalogRebuild: rebuildCatalog,
     onScopedStateReload: applyScopedUserState,
-    onBeforeViewChange: () => buildingWorkspace?.stopLivePoll(),
+    onBeforeViewChange: () => { buildingWorkspace?.stopLivePoll(); deviceGraphics?.stopPoll(); },
   });
 
   const {
@@ -131,6 +138,8 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     currentView,
     currentPluginId,
     pluginView,
+    getRecentTools,
+    touchRecentTool,
   } = userStateApi;
 
   rebuildCatalog();
@@ -159,6 +168,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     getTools: () => TOOLS,
     isHidden,
     toolLabel: activityToolLabel,
+    renderChrome: () => appUi.renderScoped("chrome"),
   });
   const logTo = activity.logTo;
 
@@ -202,6 +212,24 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     histSyncFromInventory: () => bacnetHistorian.syncFromInventory(),
     histPersist: () => bacnetHistorian.persist(),
   });
+  deviceGraphics = createDeviceGraphicsUi({
+    el, logTo, renderAll: () => appUi.renderAll(),
+    getPlatform: () => platform,
+    getInventory: () => (platform ? platform.capability("inventory.v1") : null),
+    currentPluginId, userState, saveUserState,
+  });
+  buildingAnalytics = createBuildingAnalyticsUi({
+    el, logTo, renderAll: () => appUi.renderAll(),
+    getPlatform: () => platform,
+    getInventory: () => (platform ? platform.capability("inventory.v1") : null),
+    userState, saveUserState, setView, pluginView,
+  });
+  alarmConsole = createAlarmConsoleUi({
+    el, logTo, renderAll: () => appUi.renderAll(),
+    getPlatform: () => platform,
+    getInventory: () => (platform ? platform.capability("inventory.v1") : null),
+    userState, saveUserState,
+  });
 
   Object.assign(TOOL_RENDERERS, {
     clipboardtyper: { renderStatusPill: clipboardTyper.renderStatusPill, renderPage: clipboardTyper.renderPage },
@@ -211,6 +239,9 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     observability: { renderStatusPill: observability.renderStatusPill, renderPage: observability.renderPage },
     "building-workspace": { renderStatusPill: buildingWorkspace.renderStatusPill, renderPage: buildingWorkspace.renderPage },
     "bacnet-historian": { renderStatusPill: bacnetHistorian.renderStatusPill, renderPage: bacnetHistorian.renderPage },
+    "device-graphics": { renderStatusPill: deviceGraphics.renderStatusPill, renderPage: deviceGraphics.renderPage },
+    "building-analytics": { renderStatusPill: buildingAnalytics.renderStatusPill, renderPage: buildingAnalytics.renderPage },
+    "alarm-console": { renderStatusPill: alarmConsole.renderStatusPill, renderPage: alarmConsole.renderPage },
   });
   rebuildCatalog();
   clipboardTyper.bindEvents(listen);
@@ -237,6 +268,55 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
   const library = createLibraryUi({
     el, getUserState: () => userState, saveUserState, getTools: () => TOOLS,
     isFavorite, isHidden, setFavorite, setHidden, setView, pluginView,
+    toolById, getRecentTools,
+  });
+  const getSystemStatus = () => {
+    const obsPill = observability.renderStatusPill?.() || { label: "—", cls: "pill-muted" };
+    const histPill = bacnetHistorian.renderStatusPill?.() || { label: "—", cls: "pill-muted" };
+    const inv = inventoryInstance();
+    const sites = inv ? inv.listEntities({ type: "site" }).length : 0;
+    const points = inv ? inv.listEntities({ type: "point" }).length : 0;
+    const bootedCount = platform
+      ? ALL_MANIFESTS.filter((m) => platform.isBooted(m.id)).length
+      : 0;
+    const manifestCount = ALL_MANIFESTS.length;
+    return {
+      observability: {
+        label: obsPill.label,
+        cls: obsPill.cls,
+        detail: observability.getHealthState?.().message || "Timeseries and optional Observability Pack.",
+      },
+      historian: {
+        label: histPill.label,
+        cls: histPill.cls,
+        detail: histPill.label === "Logging" ? "BACnet points are being historized." : "Historian idle or not configured.",
+      },
+      inventory: {
+        label: points ? `${points} pts` : sites ? `${sites} site${sites === 1 ? "" : "s"}` : "Empty",
+        cls: points ? "pill-running" : sites ? "pill-idle" : "pill-muted",
+        detail: sites
+          ? `${sites} site${sites === 1 ? "" : "s"}, ${points} modeled point${points === 1 ? "" : "s"}.`
+          : "Import BACnet devices in Building Workspace to start modeling.",
+      },
+      platform: {
+        label: platform ? (bootedCount ? "Ready" : "Issues") : "Booting",
+        cls: platform && bootedCount ? "pill-running" : "pill-muted",
+        detail: platform ? `${bootedCount} of ${manifestCount} tools booted.` : "Platform kernel not ready.",
+      },
+    };
+  };
+  const home = createHomeUi({
+    el,
+    appVersion,
+    getTools: () => TOOLS,
+    isFavorite,
+    isHidden,
+    toolById,
+    getRecentTools,
+    setView,
+    pluginView,
+    getActivitySummary: () => activity.activitySummary(),
+    getSystemStatus,
   });
   const servicesPage = createServicesPageUi({ el, getAllManifests: () => ALL_MANIFESTS });
   const accountPage = createAccountPageUi({
@@ -253,6 +333,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     isFavorite, isHidden, setView, pluginView, currentView, currentPluginId,
     applySidebarCollapsed, setSidebarCollapsed,
     pages: {
+      home,
       library,
       settings: settingsPage,
       account: accountPage,
@@ -262,12 +343,19 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     },
     getBuildingWorkspace: () => buildingWorkspace,
     getBacnetManager: () => bacnetManager,
+    getActivitySummary: () => activity.activitySummary(),
+    getSystemStatus,
+    getRecentTools,
+    toolById,
   });
 
   return {
     renderAll: appShell.renderAll,
     renderScoped: appShell.renderScoped,
     checkForUpdates: appShell.checkForUpdates,
+    getTools: () => TOOLS,
+    isHidden,
+    pluginView,
     userState,
     saveUserState,
     logTo,
