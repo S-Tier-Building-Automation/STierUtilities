@@ -9,11 +9,12 @@
  * @param {() => void} deps.saveUserState
  * @param {() => object|null} deps.getPlatform
  * @param {() => object|null} deps.getInventory
- * @param {ReturnType<typeof import("./bacnet.js").createBacnetUi>} deps.bacnet
+ * @param {ReturnType<typeof import("./bacnetmanager.js").createBacnetManagerUi>} deps.bacnetManager
  * @param {() => object|null} deps.getBuildingWorkspace
+ * @param {typeof import("../../platform/tauri.js").listen} [deps.listen]
  */
 export function createBacnetHistorianUi({
-  el, logTo, renderAll, userState, saveUserState, getPlatform, getInventory, bacnet, getBuildingWorkspace,
+  el, logTo, renderAll, userState, saveUserState, getPlatform, getInventory, bacnetManager, getBuildingWorkspace, listen,
 }) {
 
 function historianInstance() {
@@ -26,6 +27,20 @@ function inventoryInstance() {
 }
 
 let histIntervalMs = 60000;
+let histUseCov = false;
+let histCovListenerReady = false;
+
+function ensureHistorianCovListener() {
+  if (histCovListenerReady || !listen) return;
+  listen("bacnet:cov", (event) => {
+    const hist = historianInstance();
+    if (hist?.handleCovEvent?.(event.payload)) renderAll();
+  })
+    .then(() => {
+      histCovListenerReady = true;
+    })
+    .catch((err) => console.warn("listen bacnet:cov (historian) failed:", err));
+}
 
 function histStatusPill() {
   const hist = historianInstance();
@@ -50,6 +65,7 @@ function histPersist() {
     })),
     running: hist.isRunning(),
     intervalMs: histIntervalMs,
+    useCov: histUseCov,
   };
   saveUserState();
 }
@@ -87,6 +103,18 @@ function histSyncFromInventory() {
       // Keep manual historian records intact.
     }
   }
+  // Auto-register points the user flagged "trend" during import/config but that
+  // aren't tracked yet. The entity's `historize` flag is the source of truth.
+  const trackedIds = new Set(hist.points().map((p) => p.pointId).filter(Boolean));
+  for (const point of inv.listEntities({ type: "point" })) {
+    if (!point.historize || trackedIds.has(point.id)) continue;
+    try {
+      const record = buildingWorkspace?.historianRecordForPoint?.(inv, point);
+      if (record) { hist.addPoint(record); refreshed++; }
+    } catch (_) {
+      // Skip points without a resolvable BACnet binding.
+    }
+  }
   return refreshed;
 }
 
@@ -101,15 +129,18 @@ function histRestore({ replace = false } = {}) {
   if (!saved) return;
   for (const p of saved.points || []) hist.addPoint(p);
   if (saved.intervalMs) histIntervalMs = saved.intervalMs;
+  if (saved.useCov) histUseCov = Boolean(saved.useCov);
+  ensureHistorianCovListener();
   const refreshed = histSyncFromInventory();
   if (refreshed) histPersist();
   if (saved.running && (saved.points || []).length) {
-    hist.start(histIntervalMs);
+    hist.start(histIntervalMs, { cov: histUseCov });
     logTo("bacnet-historian", `Resumed logging ${saved.points.length} point(s).`, "info");
   }
 }
 
 function renderHistorianPage() {
+  ensureHistorianCovListener();
   const hist = historianInstance();
   if (!hist) {
     return el("div", { class: "plugin-controls" },
@@ -119,15 +150,15 @@ function renderHistorianPage() {
   const synced = histSyncFromInventory();
   if (synced) histPersist();
 
-  const devices = bacnet.getDevices();
+  const devices = bacnetManager.getDevices();
   let devIdx = devices.length ? "0" : "";
   const objTypeInput = el("input", { type: "number", class: "nm-input bac-range-input", value: "0", title: "Object type (0=AI, 1=AO, 2=AV, …)" });
   const instInput = el("input", { type: "number", class: "nm-input bac-range-input", value: "0" });
   const labelInput = el("input", { type: "text", class: "nm-input", placeholder: "label (optional)" });
   const devSelect = el("select", { class: "nm-input", onchange: (e) => { devIdx = e.target.value; } },
     ...(devices.length
-      ? devices.map((d, i) => el("option", { value: String(i) }, bacnet.deviceLabel(d)))
-      : [el("option", { value: "" }, "No devices — discover from Building Workspace first")]));
+      ? devices.map((d, i) => el("option", { value: String(i) }, bacnetManager.deviceLabel(d)))
+      : [el("option", { value: "" }, "No devices — discover from BACnet Manager first")]));
 
   const addBtn = el("button", {
     class: "btn",
@@ -136,7 +167,7 @@ function renderHistorianPage() {
       const dev = devices[Number(devIdx)];
       if (!dev) return;
       hist.addPoint({
-        device: { ...bacnet.deviceRef(dev), deviceInstance: dev.instance },
+        device: { ...bacnetManager.deviceRef(dev), deviceInstance: dev.instance },
         objectType: Number(objTypeInput.value),
         instance: Number(instInput.value),
         label: labelInput.value.trim(),
@@ -160,20 +191,28 @@ function renderHistorianPage() {
   );
 
   const intervalInput = el("input", { type: "number", class: "nm-input bac-range-input", value: String(Math.round(histIntervalMs / 1000) || 60), title: "seconds" });
+  const covToggle = el("label", { class: "nm-field bac-cov-toggle" },
+    el("input", {
+      type: "checkbox",
+      checked: histUseCov ? "checked" : undefined,
+      onchange: (e) => { histUseCov = e.target.checked; histPersist(); },
+    }),
+    el("span", { class: "nm-field-label" }, "Use COV (event-driven updates between polls)"));
   const running = hist.isRunning();
   const controlCard = el("section", { class: "plugin-section" },
     el("div", { class: "section-head" },
       el("h3", {}, "Logging"),
-      el("span", { class: `pill ${running ? "pill-running" : "pill-idle"}` }, running ? "Logging" : "Idle")),
+      el("span", { class: `pill ${running ? "pill-running" : "pill-idle"}` }, running ? (hist.covEnabled?.() ? "Logging · COV" : "Logging") : "Idle")),
     el("p", { class: "muted small" },
-      "Writes present-value to the time-series service. Connect the Observability Pack to chart it in Grafana."),
+      "Writes present-value to the time-series service. Poll interval remains as a fallback; enable COV for faster updates on supported objects. Unreachable devices are skipped when Network Manager is available."),
     el("div", { class: "bac-discover-controls" },
       el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Interval (s)"), intervalInput),
+      covToggle,
       el("button", {
         class: "btn btn-primary",
         onclick: () => {
           histIntervalMs = Math.max(5, Number(intervalInput.value) || 60) * 1000;
-          hist.start(histIntervalMs);
+          hist.start(histIntervalMs, { cov: histUseCov });
           logTo("bacnet-historian", "Started logging.", "ok");
           histPersist();
           renderAll();

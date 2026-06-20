@@ -1,7 +1,7 @@
 import { invoke, listen, convertFileSrc } from "./platform/tauri.js";
 import { createApplication } from "./platform/app-tools.js";
 import { installBootstrap, registerPagehideHandler, createStartupWarmup } from "./platform/bootstrap.js";
-import { initWindowControls, createAccountMenu } from "./ui/index.js";
+import { initWindowControls, createAccountMenu, initSidebarSplitter } from "./ui/index.js";
 
 const APP_VERSION = "0.6.0";
 const REPO_URL = "https://github.com/S-Tier-Building-Automation/STierUtilities";
@@ -36,7 +36,7 @@ registerPagehideHandler({
   getPackFlushTimer: app.getPackFlushTimer,
   setPackFlushTimer: app.setPackFlushTimer,
   flushNetworkManagerSave: () => app.networkManager.flushPendingSave(),
-  flushBacnetOnPageHide: () => app.bacnet.flushOnPageHide(),
+  flushBacnetOnPageHide: () => app.bacnetManager?.flushOnPageHide?.(),
 });
 
 installBootstrap({
@@ -60,6 +60,8 @@ installBootstrap({
   setView: app.setView,
   setSidebarCollapsed: app.setSidebarCollapsed,
   applySidebarCollapsed: app.applySidebarCollapsed,
+  saveUserState: app.saveUserState,
+  initSidebarSplitter,
   authBootstrapUserState: app.authBootstrapUserState,
   createAccountMenu,
   getAuthState: app.getAuthState,
@@ -68,4 +70,7 @@ installBootstrap({
   authSignOut: app.authSignOut,
   initWindowControls,
   hydrateFromStartupWarmup,
+  getTools: app.getTools,
+  isHidden: app.isHidden,
+  pluginView: app.pluginView || ((id) => `plugin:${id}`),
 });

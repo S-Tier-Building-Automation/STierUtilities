@@ -1,4 +1,8 @@
 // Per-tool plugin page shell and third-party MCP tool pages.
+//
+// Chrome ownership: this module owns tool identity (name, tagline, status, star).
+// Tools must not re-render those in renderPage(); use headerAddonFor for context only.
+// See docs/rendering-standards.md § Tool page chrome ownership.
 
 import { openModal } from "./modal.js";
 import { openExternal } from "./dom.js";
@@ -104,7 +108,7 @@ export function createPluginPageUi({
         ),
       ),
       el("div", { class: "plugin-header-right" },
-        status && el("span", { class: `pill ${status.cls}` }, status.label),
+        status && el("span", { class: `pill ${status.cls}`, role: "status", "aria-live": "polite" }, status.label),
         el("button", {
           class: `star-btn ${fav ? "star-on" : ""}`,
           title: fav ? "Unfavorite" : "Favorite",

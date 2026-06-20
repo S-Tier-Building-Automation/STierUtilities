@@ -45,3 +45,24 @@ Building Workspace is the reference implementation:
 - BACnet discovered-device queueing re-renders only the inbox/import-plan area.
 - Building Workspace tab changes re-render only the workspace root.
 
+## Tool page chrome ownership
+
+Plugin tools render inside the shared shell in `src/ui/plugin-page.js`. To avoid stacked duplicate headers:
+
+| Layer | Owns | Must not duplicate |
+| --- | --- | --- |
+| `plugin-page.js` | `← Library` back link, tool name, tagline, about button, status pill, favorite star | — |
+| Tool `renderPage()` | Workspace UI: tabs, panes, controls, **context-only** add-ons (model breadcrumb, live poll badge, scope filters) | Tool name, manifest tagline, status pill |
+| `headerAddonFor(tool)` hook | Optional context row mounted **below the tagline** in the plugin header | Full second page headers with title + status |
+
+**Rules**
+
+1. Do not render an `<h2>` with the tool name inside a tool page — the shell already renders `plugin-title`.
+2. Do not repeat `renderStatusPill()` output inside the tool body — the shell shows it in `plugin-header-right`.
+3. Context that changes often (model path, live poll state) belongs in `headerAddonFor` with a stable wrapper id so scoped renderers can patch it (`bwRenderHeaderAddon` pattern).
+4. If a tool needs header updates during scoped renders, update the addon node — not a second header block.
+
+**Building Workspace** is the reference: model breadcrumb + live indicator live in `bwPluginHeaderAddon()`; tabs and panes start at `bw-root` with no `bw-page-header`.
+
+**Regression guard:** `src/ui/plugin-chrome.test.js` statically scans `src/tools/ui/*.js` for forbidden shell class tokens (`plugin-title`, `plugin-header`, `bw-page-header`, etc.). Run `npm test` after adding or changing a tool page.
+

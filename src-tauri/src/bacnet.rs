@@ -53,6 +53,10 @@ const NAME_CHUNK: usize = 12;
 /// Consecutive unanswered reads before a fallback loop gives up on a device.
 const MAX_CONSECUTIVE_TIMEOUTS: u32 = 2;
 
+/// Name enrichment tolerates more silence than object-list walks — MS/TP gear
+/// (e.g. JCI MP-V on a routed link) can take several seconds between replies.
+const NAME_MAX_CONSECUTIVE_TIMEOUTS: u32 = 12;
+
 // ---------------------------------------------------------------------------
 // Models (shared with the frontend)
 // ---------------------------------------------------------------------------
@@ -122,6 +126,30 @@ pub struct PropertyEntry {
 struct ObjectsProgress {
     done: usize,
     total: usize,
+}
+
+/// Streamed during the post-discovery name-enrichment phase so the UI can show
+/// real "X / N enriched" progress instead of an indeterminate "almost done".
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct EnrichProgress {
+    done: usize,
+    total: usize,
+}
+
+/// Health snapshot of the BACnet/IP stack for surfacing degraded states (e.g. a
+/// port conflict that silently breaks broadcast discovery).
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BacnetDiagnostics {
+    /// Whether the shared UDP 47808 listener is bound (false = likely port
+    /// conflict; broadcast I-Am replies may be missed).
+    listener_bound: bool,
+    listener_port: u16,
+    /// Local address of the request socket (host:ephemeral-port).
+    local_address: String,
+    /// Active BBMD foreign-device registration, if any.
+    foreign_device: Option<ForeignDeviceStatus>,
 }
 
 #[derive(Serialize, Clone)]
@@ -310,6 +338,13 @@ struct Client {
     /// keep-alive's re-register can't run concurrently for the same BBMD and
     /// clobber each other's `fdr_waiters` entry.
     fdr_lock: Mutex<()>,
+    /// Whether the best-effort shared listener on UDP 47808 bound successfully.
+    /// When false (e.g. another BACnet stack holds the port), broadcast I-Am
+    /// replies sent to 47808 won't be heard — surfaced via `bacnet_diagnostics`.
+    listener_bound: bool,
+    /// Set by `bacnet_cancel_discovery` to stop the current discovery early; the
+    /// listening loop and the name-enrichment workers both poll it.
+    cancel_discovery: std::sync::atomic::AtomicBool,
 }
 
 /// An active foreign-device registration with a BBMD. The keep-alive thread
@@ -337,6 +372,14 @@ impl Client {
         let reader = socket
             .try_clone()
             .map_err(|e| format!("could not clone socket: {e}"))?;
+        // Loopback-bound clients (unit tests) skip the listener so stray site
+        // traffic on 47808 can't leak into deterministic tests.
+        let wildcard = bind.starts_with("0.0.0.0");
+        let listener = if wildcard { bind_bacnet_port_listener() } else { None };
+        // On a real (wildcard) bind the listener is required to hear broadcast
+        // I-Ams; missing it is a degraded state. On loopback it's intentionally
+        // absent, so don't flag that as a problem.
+        let listener_bound = listener.is_some() || !wildcard;
         let client = Arc::new(Client {
             socket,
             pending: Mutex::new(HashMap::new()),
@@ -351,16 +394,14 @@ impl Client {
             bbmd: Mutex::new(None),
             fdr_waiters: Mutex::new(HashMap::new()),
             fdr_lock: Mutex::new(()),
+            listener_bound,
+            cancel_discovery: std::sync::atomic::AtomicBool::new(false),
         });
         let for_thread = Arc::clone(&client);
         thread::spawn(move || reader_loop(for_thread, reader));
-        // Loopback-bound clients (unit tests) skip the listener so stray site
-        // traffic on 47808 can't leak into deterministic tests.
-        if bind.starts_with("0.0.0.0") {
-            if let Some(listener) = bind_bacnet_port_listener() {
-                let for_thread = Arc::clone(&client);
-                thread::spawn(move || reader_loop(for_thread, listener));
-            }
+        if let Some(listener) = listener {
+            let for_thread = Arc::clone(&client);
+            thread::spawn(move || reader_loop(for_thread, listener));
         }
         Ok(client)
     }
@@ -1297,7 +1338,13 @@ fn discover_core(
             if now >= deadline {
                 break;
             }
-            match rx.recv_timeout(deadline - now) {
+            // Cancellation is polled every step so a user "Cancel" returns the
+            // devices found so far within ~250 ms instead of waiting the window.
+            if client.cancel_discovery.load(Ordering::Relaxed) {
+                break;
+            }
+            let step = (deadline - now).min(Duration::from_millis(250));
+            match rx.recv_timeout(step) {
                 Ok(DiscoveryEvent::Device(raw)) => {
                     let dev = BacnetDevice {
                         key: device_key(
@@ -1337,7 +1384,8 @@ fn discover_core(
                         }
                     }
                 }
-                Err(_) => break, // window elapsed
+                Err(mpsc::RecvTimeoutError::Timeout) => {} // re-check deadline/cancel
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
         devices.sort_by_key(|d| d.instance);
@@ -1399,6 +1447,51 @@ fn first_string(values: &[BacnetValue]) -> Option<String> {
         BacnetValue::CharacterString { value } => Some(value.clone()),
         _ => None,
     })
+}
+
+fn non_empty_label(s: Option<String>) -> Option<String> {
+    s.map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
+/// Prefer BACnet object-name; fall back to description. JCI MP-V / Metasys
+/// field gear often leaves object-name blank while description carries the
+/// operator-facing label.
+fn pick_object_label(object_name: Option<String>, description: Option<String>) -> Option<String> {
+    non_empty_label(object_name).or_else(|| non_empty_label(description))
+}
+
+fn label_from_properties(properties: &[codec::RpmProperty]) -> Option<String> {
+    let mut object_name = None;
+    let mut description = None;
+    for p in properties {
+        match p.property {
+            codec::PROP_OBJECT_NAME => object_name = p.values.as_deref().and_then(first_string),
+            codec::PROP_DESCRIPTION => description = p.values.as_deref().and_then(first_string),
+            _ => {}
+        }
+    }
+    pick_object_label(object_name, description)
+}
+
+fn name_read_specs() -> [codec::PropertyRef; 2] {
+    [
+        codec::PropertyRef {
+            property: codec::PROP_OBJECT_NAME,
+            array_index: None,
+        },
+        codec::PropertyRef {
+            property: codec::PROP_DESCRIPTION,
+            array_index: None,
+        },
+    ]
+}
+
+fn initial_name_chunk(max_apdu: Option<u32>) -> usize {
+    match max_apdu {
+        Some(n) if n <= 480 => 3,
+        Some(n) if n <= 960 => 6,
+        _ => NAME_CHUNK,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1479,7 +1572,8 @@ fn enrich_object_names_core(
     should_continue: impl Fn() -> bool,
     mut on_names: impl FnMut(&[(ObjectId, String)]),
 ) {
-    let mut chunk_size = NAME_CHUNK;
+    let props = name_read_specs();
+    let mut chunk_size = initial_name_chunk(target.max_apdu);
     let mut rp_mode = false;
     let mut i = 0usize;
     let mut timeouts = 0u32;
@@ -1492,17 +1586,29 @@ fn enrich_object_names_core(
             match read_property(client, target, id, codec::PROP_OBJECT_NAME, None) {
                 Ok(values) => {
                     timeouts = 0;
-                    if let Some(name) = first_string(&values) {
+                    let label = non_empty_label(first_string(&values)).or_else(|| {
+                        read_property(client, target, id, codec::PROP_DESCRIPTION, None)
+                            .ok()
+                            .and_then(|v| non_empty_label(first_string(&v)))
+                    });
+                    if let Some(name) = label {
                         on_names(&[(id, name)]);
                     }
                 }
                 Err(e) if e.starts_with("no response") => {
                     timeouts += 1;
-                    if timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
-                        return; // names are best-effort — keep what we have
+                    if timeouts >= NAME_MAX_CONSECUTIVE_TIMEOUTS {
+                        return;
                     }
                 }
-                Err(_) => {}
+                Err(_) => {
+                    if let Ok(values) = read_property(client, target, id, codec::PROP_DESCRIPTION, None) {
+                        timeouts = 0;
+                        if let Some(name) = non_empty_label(first_string(&values)) {
+                            on_names(&[(id, name)]);
+                        }
+                    }
+                }
             }
             i += 1;
             continue;
@@ -1512,10 +1618,7 @@ fn enrich_object_names_core(
             .iter()
             .map(|id| codec::ReadAccessSpec {
                 object: *id,
-                properties: vec![codec::PropertyRef {
-                    property: codec::PROP_OBJECT_NAME,
-                    array_index: None,
-                }],
+                properties: props.to_vec(),
             })
             .collect();
         match read_property_multiple(client, target, &specs) {
@@ -1523,10 +1626,8 @@ fn enrich_object_names_core(
                 timeouts = 0;
                 let mut batch = Vec::new();
                 for r in results {
-                    for p in r.properties {
-                        if let Some(name) = p.values.as_deref().and_then(first_string) {
-                            batch.push((r.object, name));
-                        }
+                    if let Some(name) = label_from_properties(&r.properties) {
+                        batch.push((r.object, name));
                     }
                 }
                 if !batch.is_empty() {
@@ -1536,14 +1637,22 @@ fn enrich_object_names_core(
             }
             Err(e) if e.starts_with("no response") => {
                 timeouts += 1;
-                if timeouts >= MAX_CONSECUTIVE_TIMEOUTS {
+                // Some devices silently drop oversized/unsupported RPM batches.
+                // Shrink the chunk (then fall back to single-object RP) before
+                // burning the whole timeout budget on the same failing batch.
+                if chunk_size > 2 {
+                    chunk_size = (chunk_size / 2).max(2);
+                    timeouts = 0;
+                } else if chunk.len() > 1 {
+                    rp_mode = true;
+                    timeouts = 0;
+                } else if timeouts >= NAME_MAX_CONSECUTIVE_TIMEOUTS {
                     return;
                 }
             }
-            Err(_) if chunk_size > 4 => chunk_size = 4, // response too big — retry smaller
-            Err(_) if chunk.len() > 1 => rp_mode = true, // RPM is out — go one at a time
+            Err(_) if chunk_size > 2 => chunk_size = (chunk_size / 2).max(2),
+            Err(_) if chunk.len() > 1 => rp_mode = true,
             Err(_) => {
-                // Even a single-object RPM failed; this object may be gone.
                 rp_mode = true;
                 i += 1;
             }
@@ -1728,11 +1837,11 @@ fn render_values(object_type: u16, property: u32, values: &[BacnetValue]) -> Str
                 return if raised.is_empty() { "normal".into() } else { raised.join(", ") };
             }
         }
-        // units: symbol + raw number.
+        // units: symbol + raw number (no-units maps to an empty symbol).
         117 => {
             if let BacnetValue::Enumerated { value } = &values[0] {
                 if let Some(sym) = codec::engineering_unit_name(*value) {
-                    return format!("{sym} ({value})");
+                    return if sym.is_empty() { String::new() } else { format!("{sym} ({value})") };
                 }
             }
         }
@@ -1829,24 +1938,34 @@ pub async fn bacnet_discover(
     // before routed devices can even start answering.
     let window = Duration::from_millis(duration_ms.unwrap_or(5000).clamp(500, 15000));
 
+    // Clear any stale cancel from a previous run before listening.
+    client.cancel_discovery.store(false, Ordering::Relaxed);
+
     tauri::async_runtime::spawn_blocking(move || {
         let app_for_stream = app.clone();
         let devices = discover_core(&client, &target, low_limit, high_limit, window, |dev| {
             let _ = app_for_stream.emit("bacnet:device", dev);
         })?;
         // Enrich names in parallel — a site with hundreds of devices (or a few
-        // that won't answer RPM) would take minutes sequentially.
+        // that won't answer RPM) would take minutes sequentially. Progress is
+        // streamed so the UI can show a real "X / N" during this long phase,
+        // and a Cancel stops claiming new work (keeping what's already enriched).
         let len = devices.len();
         let shared = Arc::new(Mutex::new(devices));
         let next = Arc::new(AtomicUsize::new(0));
+        let done = Arc::new(AtomicUsize::new(0));
         let workers = 8.min(len).max(1);
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
             let shared = Arc::clone(&shared);
             let next = Arc::clone(&next);
+            let done = Arc::clone(&done);
             let client = Arc::clone(&client);
             let app = app.clone();
             handles.push(thread::spawn(move || loop {
+                if client.cancel_discovery.load(Ordering::Relaxed) {
+                    break;
+                }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= len {
                     break;
@@ -1855,6 +1974,12 @@ pub async fn bacnet_discover(
                 enrich_device(&client, &mut dev);
                 let _ = app.emit("bacnet:device_update", &dev);
                 shared.lock().unwrap_or_else(|e| e.into_inner())[i] = dev;
+                // Throttle progress to ~1 event per 5 devices (plus the final
+                // one) so a large site doesn't flood the IPC channel.
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if d % 5 == 0 || d == len {
+                    let _ = app.emit("bacnet:enrich_progress", EnrichProgress { done: d, total: len });
+                }
             }));
         }
         for h in handles {
@@ -1871,6 +1996,43 @@ pub async fn bacnet_discover(
     })
     .await
     .map_err(|e| format!("discovery task panicked: {e}"))?
+}
+
+/// Requests cancellation of the in-flight discovery. The listening loop and the
+/// name-enrichment workers poll this and stop early, returning whatever was
+/// found so far. No-op (and never spawns a client) when discovery isn't running.
+#[tauri::command]
+pub fn bacnet_cancel_discovery() -> Result<(), String> {
+    if let Some(client) = CLIENT.get() {
+        client.cancel_discovery.store(true, Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Health snapshot of the BACnet/IP stack: whether the shared 47808 listener is
+/// bound (a missing bind usually means another BACnet app holds the port, which
+/// silently breaks broadcast I-Am reception), the local request address, and any
+/// active foreign-device registration.
+#[tauri::command]
+pub fn bacnet_diagnostics() -> Result<BacnetDiagnostics, String> {
+    let client = client()?;
+    let local_address = client
+        .socket
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| "unknown".into());
+    let foreign_device = client
+        .bbmd
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .map(|b| ForeignDeviceStatus { bbmd: b.addr.to_string(), ttl_seconds: b.ttl });
+    Ok(BacnetDiagnostics {
+        listener_bound: client.listener_bound,
+        listener_port: codec::BACNET_PORT,
+        local_address,
+        foreign_device,
+    })
 }
 
 /// Reads the object list of `device` (instance `device_instance`), streaming
@@ -2699,6 +2861,50 @@ mod tests {
     }
 
     #[test]
+    fn pick_object_label_prefers_name_then_description() {
+        assert_eq!(
+            pick_object_label(Some("SAT".into()), Some("Zone temp".into())),
+            Some("SAT".into())
+        );
+        assert_eq!(
+            pick_object_label(Some("".into()), Some("Zone temp".into())),
+            Some("Zone temp".into())
+        );
+        assert_eq!(
+            pick_object_label(Some("   ".into()), Some("Discharge Fan".into())),
+            Some("Discharge Fan".into())
+        );
+        assert_eq!(pick_object_label(None, None), None);
+    }
+
+    #[test]
+    fn label_from_properties_falls_back_to_description() {
+        let props = vec![
+            codec::RpmProperty {
+                property: codec::PROP_OBJECT_NAME,
+                array_index: None,
+                values: Some(vec![BacnetValue::CharacterString { value: String::new() }]),
+                error: None,
+            },
+            codec::RpmProperty {
+                property: codec::PROP_DESCRIPTION,
+                array_index: None,
+                values: Some(vec![BacnetValue::CharacterString {
+                    value: "Discharge Air Temp".into(),
+                }]),
+                error: None,
+            },
+        ];
+        assert_eq!(label_from_properties(&props).as_deref(), Some("Discharge Air Temp"));
+    }
+
+    #[test]
+    fn initial_name_chunk_scales_for_small_apdu() {
+        assert_eq!(initial_name_chunk(Some(480)), 3);
+        assert_eq!(initial_name_chunk(Some(1476)), NAME_CHUNK);
+    }
+
+    #[test]
     fn resolve_device_routed() {
         let t = resolve_device(&DeviceRef {
             address: "10.1.2.3".into(),
@@ -2726,6 +2932,11 @@ mod tests {
     fn render_units_and_binary_pv() {
         let v = vec![BacnetValue::Enumerated { value: 66 }];
         assert_eq!(render_values(0, 117, &v), "°F (66)");
+        // ppm (96) now resolves; no-units (95) renders blank.
+        let v = vec![BacnetValue::Enumerated { value: 96 }];
+        assert_eq!(render_values(0, 117, &v), "ppm (96)");
+        let v = vec![BacnetValue::Enumerated { value: 95 }];
+        assert_eq!(render_values(0, 117, &v), "");
         let v = vec![BacnetValue::Enumerated { value: 1 }];
         assert_eq!(render_values(4, 85, &v), "active (1)");
         // Analog present-value is untouched.
@@ -3171,6 +3382,153 @@ mod tests {
         let client = Client::new("127.0.0.1:0").unwrap();
         let target = Target { sa: fake_addr, route: None, max_apdu: None, segmentation: None };
         subscribe_cov_core(&client, &target, 7, ObjectId::new(0, 0), false, Some(60)).unwrap();
+        t.join().unwrap();
+    }
+
+    fn fake_event_information_ack(invoke_id: u8) -> Vec<u8> {
+        let mut payload = Vec::new();
+        codec::encode_opening_tag(&mut payload, 0);
+        codec::encode_context_object_id(&mut payload, 0, ObjectId::new(0, 5));
+        codec::encode_context_unsigned(&mut payload, 1, 2); // offnormal
+        codec::encode_tag(&mut payload, 2, true, 2);
+        payload.extend_from_slice(&[5, 0x00]); // to-offnormal not acknowledged
+        codec::encode_opening_tag(&mut payload, 3);
+        codec::encode_opening_tag(&mut payload, 2);
+        codec::encode_application_value(
+            &mut payload,
+            &BacnetValue::Date {
+                year: 2026,
+                month: 6,
+                day: 17,
+                weekday: 3,
+            },
+        );
+        codec::encode_application_value(
+            &mut payload,
+            &BacnetValue::Time {
+                hour: 9,
+                minute: 30,
+                second: 0,
+                hundredths: 0,
+            },
+        );
+        codec::encode_closing_tag(&mut payload, 2);
+        codec::encode_closing_tag(&mut payload, 3);
+        codec::encode_context_unsigned(&mut payload, 4, 0);
+        codec::encode_tag(&mut payload, 5, true, 2);
+        payload.extend_from_slice(&[5, 0xE0]);
+        codec::encode_opening_tag(&mut payload, 6);
+        codec::encode_application_value(&mut payload, &BacnetValue::Unsigned { value: 16 });
+        codec::encode_application_value(&mut payload, &BacnetValue::Unsigned { value: 0 });
+        codec::encode_application_value(&mut payload, &BacnetValue::Unsigned { value: 0 });
+        codec::encode_closing_tag(&mut payload, 6);
+        codec::encode_closing_tag(&mut payload, 0);
+        codec::encode_tag(&mut payload, 1, true, 1);
+        payload.push(0);
+        let mut reply = vec![codec::PDU_COMPLEX_ACK, invoke_id, codec::SERVICE_GET_EVENT_INFORMATION];
+        reply.extend_from_slice(&payload);
+        unicast_reply(&reply)
+    }
+
+    #[test]
+    fn get_alarms_via_event_information_over_loopback() {
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            let (frame, src) = recv_frame(&fake);
+            let bvlc = codec::bvlc_decode(&frame).unwrap();
+            let npdu = codec::decode_npdu(&frame[bvlc.payload_offset..]).unwrap();
+            let Apdu::ConfirmedRequest { invoke_id, service, .. } =
+                codec::decode_apdu(&frame[bvlc.payload_offset + npdu.apdu_offset..]).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(service, codec::SERVICE_GET_EVENT_INFORMATION);
+            fake.send_to(&fake_event_information_ack(invoke_id), src).unwrap();
+
+            // Best-effort object-name enrichment issues ReadPropertyMultiple next.
+            let (frame2, src2) = recv_frame(&fake);
+            let bvlc2 = codec::bvlc_decode(&frame2).unwrap();
+            let npdu2 = codec::decode_npdu(&frame2[bvlc2.payload_offset..]).unwrap();
+            let Apdu::ConfirmedRequest { invoke_id: inv2, service: svc2, .. } =
+                codec::decode_apdu(&frame2[bvlc2.payload_offset + npdu2.apdu_offset..]).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(svc2, codec::SERVICE_READ_PROPERTY_MULTIPLE);
+            let mut reply = vec![codec::PDU_COMPLEX_ACK, inv2, codec::SERVICE_READ_PROPERTY_MULTIPLE];
+            codec::encode_context_object_id(&mut reply, 0, ObjectId::new(0, 5));
+            codec::encode_opening_tag(&mut reply, 1);
+            codec::encode_context_unsigned(&mut reply, 2, codec::PROP_OBJECT_NAME as u64);
+            codec::encode_opening_tag(&mut reply, 4);
+            codec::encode_application_value(
+                &mut reply,
+                &BacnetValue::CharacterString {
+                    value: "Zone Temp".into(),
+                },
+            );
+            codec::encode_closing_tag(&mut reply, 4);
+            codec::encode_closing_tag(&mut reply, 1);
+            fake.send_to(&unicast_reply(&reply), src2).unwrap();
+        });
+
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let target = Target {
+            sa: fake_addr,
+            route: None,
+            max_apdu: None,
+            segmentation: None,
+        };
+        let alarms = get_alarms_core(&client, &target).unwrap();
+        t.join().unwrap();
+        assert_eq!(alarms.len(), 1);
+        assert_eq!(alarms[0].object_type, 0);
+        assert_eq!(alarms[0].instance, 5);
+        assert_eq!(alarms[0].event_state, "offnormal");
+        assert!(!alarms[0].acknowledged);
+        assert_eq!(alarms[0].name, "Zone Temp");
+    }
+
+    #[test]
+    fn acknowledge_alarm_over_loopback() {
+        let fake = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fake_addr = fake.local_addr().unwrap();
+        let t = thread::spawn(move || {
+            let (frame, src) = recv_frame(&fake);
+            let bvlc = codec::bvlc_decode(&frame).unwrap();
+            let npdu = codec::decode_npdu(&frame[bvlc.payload_offset..]).unwrap();
+            let Apdu::ConfirmedRequest { invoke_id, service, .. } =
+                codec::decode_apdu(&frame[bvlc.payload_offset + npdu.apdu_offset..]).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(service, codec::SERVICE_GET_EVENT_INFORMATION);
+            fake.send_to(&fake_event_information_ack(invoke_id), src).unwrap();
+
+            let (frame2, src2) = recv_frame(&fake);
+            let bvlc2 = codec::bvlc_decode(&frame2).unwrap();
+            let npdu2 = codec::decode_npdu(&frame2[bvlc2.payload_offset..]).unwrap();
+            let Apdu::ConfirmedRequest { invoke_id: inv2, service: svc2, .. } =
+                codec::decode_apdu(&frame2[bvlc2.payload_offset + npdu2.apdu_offset..]).unwrap()
+            else {
+                panic!("expected confirmed request");
+            };
+            assert_eq!(svc2, codec::SERVICE_ACKNOWLEDGE_ALARM);
+            fake.send_to(
+                &unicast_reply(&[codec::PDU_SIMPLE_ACK, inv2, codec::SERVICE_ACKNOWLEDGE_ALARM]),
+                src2,
+            )
+            .unwrap();
+        });
+
+        let client = Client::new("127.0.0.1:0").unwrap();
+        let target = Target {
+            sa: fake_addr,
+            route: None,
+            max_apdu: None,
+            segmentation: None,
+        };
+        acknowledge_alarm_core(&client, &target, ObjectId::new(0, 5)).unwrap();
         t.join().unwrap();
     }
 

@@ -133,17 +133,16 @@ export const TOOL_MANIFESTS = [
         "read a point's properties. It owns the BACnet/IP stack on an ephemeral " +
         "UDP port (so it coexists with Niagara or any other BACnet stack) and " +
         "exposes a stable bacnet.read contract any platform app can depend on. " +
-        "The BACnet Inspector and the BACnet Historian both consume it rather " +
+        "BACnet Manager and the BACnet Historian consume it rather " +
         "than reimplementing BACnet. Runs headless — it has no page of its own.",
       repo: REPO,
     },
   },
   {
-    // The advanced BACnet Inspector App — the YABE-style power UI. It no longer provides
-    // bacnet.read; it *consumes* it from bacnet-core (discovery + point reads),
-    // and exists as an advanced field-debugging UI over the shared contract.
-    id: "bacnet",
-    name: "Advanced BACnet Inspector",
+    // BACnet Manager — discovery, inbox/import, browse, COV, alarms, and BBMD.
+    // Replaces the hidden Advanced BACnet Inspector; Building Workspace stays model-only.
+    id: "bacnet-manager",
+    name: "BACnet Manager",
     version: "1.0.0",
     apiVersion: "1",
     kind: "native",
@@ -151,20 +150,19 @@ export const TOOL_MANIFESTS = [
     provides: [],
     requires: [
       { capability: "bacnet.read", version: "^1.0" },
+      { capability: "inventory", version: "^1.0" },
       { capability: "netscan", version: "^1.0", optional: true },
     ],
-    permissions: ["fs.appdata"],
+    permissions: ["inventory.read", "inventory.write"],
     ui: {
       emoji: "🏢",
-      tagline: "Advanced raw BACnet/IP inspection, object browsing, writes, COV, and trends.",
+      tagline: "Discover BACnet devices, import into the building model, browse objects, COV, and alarms.",
       description:
-        "An advanced YABE-style BACnet/IP inspector kept as a field-debugging " +
-        "escape hatch. Building Workspace is the normal SI workflow; this view " +
-        "uses the same bacnet-core service for discovery, object lists, reads, " +
-        "writes, COV, and trend-log inspection when raw protocol visibility is " +
-        "needed. Uses an ephemeral UDP port, so it coexists with Niagara or any " +
-        "other BACnet stack running on this machine.",
-      defaultHidden: true,
+        "The SI workflow for BACnet protocol work: subnet discovery and drift tracking, " +
+        "device discovery with direct import into the building model, object browse with reads/writes/COV/trends, and alarm " +
+        "acknowledgement. Imports land in the shared inventory for Building Workspace to " +
+        "model, historize, and commission. Uses the headless bacnet-core service on an " +
+        "ephemeral UDP port so it coexists with Niagara or any other BACnet stack.",
       repo: REPO,
     },
   },
@@ -206,8 +204,11 @@ export const TOOL_MANIFESTS = [
     apiVersion: "1",
     kind: "native",
     category: "app",
-    provides: [{ capability: "inventory", version: "1.0" }],
+    provides: [],
     requires: [
+      { capability: "inventory", version: "^1.0" },
+      { capability: "graphics", version: "^1.0" },
+      { capability: "rules", version: "^1.0", optional: true },
       { capability: "bacnet.read", version: "^1.0" },
       { capability: "bacnet.historian", version: "^1.0" },
       { capability: "timeseries", version: "^1.0" },
@@ -223,8 +224,185 @@ export const TOOL_MANIFESTS = [
         "A BACnet-first building automation workflow: import discovered devices and " +
         "objects into a lightweight tagged model, apply equipment templates, historize " +
         "points, generate dashboard definitions, run commissioning checks, and export " +
-        "Markdown/CSV reports. Local-first and built on the same platform capabilities " +
-        "as the BACnet Inspector, Historian, and Observability Pack.",
+        "Markdown/CSV reports. The model-tree aggregator that ties together the building-model, " +
+        "Graphics, Analytics, Alarm Console, and Historian apps on the shared platform capabilities.",
+      repo: REPO,
+    },
+  },
+  {
+    // building-model: the headless building model. Owns the lightweight tagged
+    // inventory (sites/equip/points/templates/runs) and provides the inventory
+    // capability that BACnet Manager, Building Workspace, and every BMS app
+    // consume. Runs headless — it has no page of its own.
+    id: "building-model",
+    name: "Building Model",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "service",
+    provides: [{ capability: "inventory", version: "1.0" }],
+    requires: [],
+    permissions: ["inventory.read", "inventory.write", "fs.appdata"],
+    ui: {
+      emoji: "🧱",
+      tagline: "Headless building model — the shared tagged inventory other tools read and write.",
+      description:
+        "The lightweight Haystack-aware building model: sites, equipment, points, source " +
+        "references, equipment templates, commissioning runs, and rule runs. It owns the " +
+        "inventory contract every building tool consumes — BACnet Manager imports into it, " +
+        "Building Workspace models it, and the Graphics, Analytics, and Alarm Console apps " +
+        "read it. Runs headless — it has no page of its own.",
+      repo: REPO,
+    },
+  },
+  {
+    // building-rules: the analytics engine. Evaluates modeled equipment against
+    // rule packs and provides the rules capability the Analytics app and Alarm
+    // Console consume. Runs headless.
+    id: "building-rules",
+    name: "Analytics Engine",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "service",
+    provides: [{ capability: "rules", version: "1.0" }],
+    requires: [
+      { capability: "inventory", version: "^1.0" },
+      { capability: "bacnet.read", version: "^1.0", optional: true },
+    ],
+    permissions: ["inventory.read"],
+    ui: {
+      emoji: "🧮",
+      tagline: "Headless analytics — evaluate modeled equipment against rule packs.",
+      description:
+        "The shared analytics engine: it runs rule packs (missing sensors, out-of-range " +
+        "values, low airflow, and more) against the modeled equipment and optionally reads " +
+        "live BACnet values during a run. The Analytics app and Alarm Console consume it " +
+        "rather than embedding rule logic. Runs headless — it has no page of its own.",
+      repo: REPO,
+    },
+  },
+  {
+    // building-graphics: resolves device graphic definitions and binds modeled
+    // points to graphic slots. Provides the graphics capability the Graphics app
+    // and Building Workspace consume. Runs headless.
+    id: "building-graphics",
+    name: "Graphics Engine",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "service",
+    provides: [{ capability: "graphics", version: "1.0" }],
+    requires: [{ capability: "inventory", version: "^1.0" }],
+    permissions: ["inventory.read", "inventory.write"],
+    ui: {
+      emoji: "🎛️",
+      tagline: "Headless graphics — resolve device graphics and bind points to callouts.",
+      description:
+        "The device-graphics engine: it resolves the right graphic for a piece of equipment " +
+        "and binds modeled points to its callouts, status chips, and parameters, including " +
+        "auto-tagging by point name. The Graphics app and Building Workspace render through " +
+        "it. Runs headless — it has no page of its own.",
+      repo: REPO,
+    },
+  },
+  {
+    // building-alerts: unifies rule findings and live BACnet alarms into one
+    // acknowledgeable feed. Provides the alerts capability the Alarm Console
+    // consumes. Runs headless.
+    id: "building-alerts",
+    name: "Alerts Engine",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "service",
+    provides: [{ capability: "alerts", version: "1.0" }],
+    requires: [
+      { capability: "inventory", version: "^1.0" },
+      { capability: "rules", version: "^1.0" },
+      { capability: "bacnet.read", version: "^1.0", optional: true },
+    ],
+    permissions: ["inventory.read", "inventory.write"],
+    ui: {
+      emoji: "🚨",
+      tagline: "Headless alerts — unify rule findings and live BACnet alarms.",
+      description:
+        "The alerts engine: it merges analytics rule findings with live BACnet alarms into a " +
+        "single acknowledgeable feed and runs rule scans on demand. The Alarm Console consumes " +
+        "it. Runs headless — it has no page of its own.",
+      repo: REPO,
+    },
+  },
+  {
+    id: "alarm-console",
+    name: "Alarm Console",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "app",
+    provides: [],
+    requires: [
+      { capability: "alerts", version: "^1.0" },
+      { capability: "inventory", version: "^1.0" },
+      { capability: "bacnet.read", version: "^1.0", optional: true },
+    ],
+    permissions: ["inventory.read", "inventory.write"],
+    ui: {
+      emoji: "🚨",
+      tagline: "One feed for analytics findings and live BACnet alarms.",
+      description:
+        "Triage building alerts in one place: out-of-range and missing-sensor findings from " +
+        "the Analytics engine alongside live BACnet alarms read from devices, filterable by " +
+        "site and equipment. Acknowledge BACnet alarms inline and re-run analytics on demand.",
+      repo: REPO,
+    },
+  },
+  {
+    id: "building-analytics",
+    name: "Analytics",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "app",
+    provides: [],
+    requires: [
+      { capability: "rules", version: "^1.0" },
+      { capability: "inventory", version: "^1.0" },
+    ],
+    permissions: ["inventory.read", "inventory.write"],
+    ui: {
+      emoji: "🧮",
+      tagline: "Run rule packs against the building model and export findings.",
+      description:
+        "Evaluate the modeled equipment against rule packs — missing space temperature, " +
+        "discharge-air-temperature range, low airflow, and more — with configurable thresholds. " +
+        "Review run history and export findings to Markdown or CSV. Built on the shared " +
+        "Analytics engine and building model.",
+      repo: REPO,
+    },
+  },
+  {
+    id: "device-graphics",
+    name: "Graphics",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "app",
+    provides: [],
+    requires: [
+      { capability: "graphics", version: "^1.0" },
+      { capability: "inventory", version: "^1.0" },
+      { capability: "bacnet.read", version: "^1.0", optional: true },
+    ],
+    permissions: ["inventory.read", "inventory.write"],
+    ui: {
+      emoji: "🎛️",
+      tagline: "Live device graphics for modeled equipment, like a VAV box screen.",
+      description:
+        "Open a device-level graphic for any modeled piece of equipment: a schematic with live " +
+        "callouts, status chips, and monitoring parameters bound to modeled points. Poll live " +
+        "BACnet values, and bind or rebind points to graphic roles. Built on the shared Graphics " +
+        "engine and building model.",
       repo: REPO,
     },
   },

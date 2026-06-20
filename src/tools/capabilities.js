@@ -8,6 +8,9 @@ import { createTimeseries } from "../platform/services/timeseries.js";
 import { createScheduler } from "../platform/services/scheduler.js";
 import { createHistorian } from "./historian.js";
 import { createBrowserInventoryStorage, createInventory } from "./inventory.js";
+import { createRulesService } from "./rules-service.js";
+import { createGraphicsService } from "./graphics-service.js";
+import { createAlertsService } from "./alerts-service.js";
 
 // ---- pure helpers (exported for tests) ----
 
@@ -75,7 +78,42 @@ export function buildFactories(invoke, options = {}) {
     const bacnet = host.use("bacnet.read.v1");
     const scheduler = host.use("scheduler.v1");
     const timeseries = host.tryUse("timeseries.v1");
-    host.provide("bacnet.historian", "1.0", createHistorian({ bacnet, scheduler, timeseries }));
+    const netscan = host.tryUse("netscan.v1");
+    host.provide("bacnet.historian", "1.0", createHistorian({ bacnet, scheduler, timeseries, netscan }));
+  });
+
+  // building-model: the headless building-model service. Owns the lightweight
+  // tagged inventory (sites/equip/points/templates/runs) and provides the
+  // inventory capability every BMS app and Building Workspace consume.
+  factories.set("building-model", async (host) => {
+    host.provide("inventory", "1.0", createInventory({
+      storage: options.inventoryStorage || createBrowserInventoryStorage(),
+    }));
+  });
+
+  // building-rules: evaluates modeled equipment against rule packs (the
+  // analytics engine). Reuses inventory for the model and graphics for role
+  // resolution, and optionally reads live BACnet values during a run.
+  factories.set("building-rules", async (host) => {
+    const inventory = host.use("inventory.v1");
+    const bacnet = host.tryUse("bacnet.read.v1");
+    host.provide("rules", "1.0", createRulesService({ inventory, bacnet }));
+  });
+
+  // building-graphics: resolves device graphic definitions and binds modeled
+  // points to graphic slots/callouts for the Graphics app and Building Workspace.
+  factories.set("building-graphics", async (host) => {
+    const inventory = host.use("inventory.v1");
+    host.provide("graphics", "1.0", createGraphicsService({ inventory }));
+  });
+
+  // building-alerts: unifies rule findings and live BACnet alarms into one
+  // acknowledgeable feed for the Alarm Console.
+  factories.set("building-alerts", async (host) => {
+    const inventory = host.use("inventory.v1");
+    const rules = host.use("rules.v1");
+    const bacnet = host.tryUse("bacnet.read.v1");
+    host.provide("alerts", "1.0", createAlertsService({ inventory, rules, bacnet }));
   });
 
   factories.set("building-workspace", async (host) => {
@@ -83,9 +121,9 @@ export function buildFactories(invoke, options = {}) {
     host.use("bacnet.historian.v1");
     host.use("scheduler.v1");
     host.use("timeseries.v1");
-    host.provide("inventory", "1.0", createInventory({
-      storage: options.inventoryStorage || createBrowserInventoryStorage(),
-    }));
+    host.use("inventory.v1");
+    host.use("graphics.v1");
+    host.tryUse("rules.v1");
   });
 
   // networkmanager provides the network primitives other tools reuse.
@@ -157,6 +195,10 @@ export function buildFactories(invoke, options = {}) {
           highLimit: opts.highLimit ?? null,
           durationMs: opts.durationMs ?? null,
         }),
+      /** Cancel an in-flight discovery (returns devices found so far). */
+      cancelDiscovery: () => invoke("bacnet_cancel_discovery"),
+      /** BACnet/IP stack health: listener bind, local address, foreign device. */
+      diagnostics: () => invoke("bacnet_diagnostics"),
       /** Read all properties of one object on a device. `device` is a device ref. */
       readPoint: (device, objectType, instance) =>
         invoke("bacnet_read_properties", { device, objectType, instance }),

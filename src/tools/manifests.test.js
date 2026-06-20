@@ -22,11 +22,11 @@ test("networkmanager provides the network primitives", () => {
   assert.ok(reg.providers.get("netscan").some((p) => p.toolId === "networkmanager"));
 });
 
-test("bacnet resolves its optional netscan dependency to networkmanager", () => {
+test("bacnet-manager resolves its optional netscan dependency to networkmanager", () => {
   const reg = buildRegistry(TOOL_MANIFESTS);
-  const res = reg.resolutions.get("bacnet").find((r) => r.capability === "netscan");
+  const res = reg.resolutions.get("bacnet-manager").find((r) => r.capability === "netscan");
   assert.equal(res.providerId, "networkmanager");
-  assert.ok(reg.initOrder.indexOf("networkmanager") < reg.initOrder.indexOf("bacnet"));
+  assert.ok(reg.initOrder.indexOf("networkmanager") < reg.initOrder.indexOf("bacnet-manager"));
 });
 
 test("bacnet.read is extracted into the headless bacnet-core service", () => {
@@ -34,11 +34,11 @@ test("bacnet.read is extracted into the headless bacnet-core service", () => {
   // The service owns the capability...
   assert.ok(reg.providers.get("bacnet.read").some((p) => p.toolId === "bacnet-core"));
   assert.equal(manifestById("bacnet-core").category, "service");
-  // ...and the Inspector App consumes it rather than providing it.
-  assert.deepEqual(manifestById("bacnet").provides, []);
-  const res = reg.resolutions.get("bacnet").find((r) => r.capability === "bacnet.read");
+  // ...and BACnet Manager consumes it rather than providing it.
+  assert.deepEqual(manifestById("bacnet-manager").provides, []);
+  const res = reg.resolutions.get("bacnet-manager").find((r) => r.capability === "bacnet.read");
   assert.equal(res.providerId, "bacnet-core");
-  assert.ok(reg.initOrder.indexOf("bacnet-core") < reg.initOrder.indexOf("bacnet"));
+  assert.ok(reg.initOrder.indexOf("bacnet-core") < reg.initOrder.indexOf("bacnet-manager"));
 });
 
 test("the observability service provides timeseries, resolving consumers' optional dep", () => {
@@ -74,25 +74,50 @@ test("bacnet-historian composes bacnet.read + scheduler + timeseries", () => {
   }
 });
 
-test("building-workspace provides inventory and composes the BACnet workflow stack", () => {
+test("the building-model service owns inventory; building-workspace consumes it", () => {
   const reg = buildRegistry(TOOL_MANIFESTS);
   assert.ok(reg.ok, reg.errors.join("; "));
-  assert.ok(reg.providers.get("inventory").some((p) => p.toolId === "building-workspace"));
+  // The headless building-model service is the sole inventory provider.
+  const inventoryProviders = reg.providers.get("inventory").map((p) => p.toolId);
+  assert.deepEqual(inventoryProviders, ["building-model"]);
+  assert.equal(manifestById("building-model").category, "service");
+  // building-workspace now consumes inventory + graphics rather than providing.
+  assert.deepEqual(manifestById("building-workspace").provides, []);
   const res = reg.resolutions.get("building-workspace");
   const by = (cap) => res.find((r) => r.capability === cap);
+  assert.equal(by("inventory").providerId, "building-model");
+  assert.equal(by("graphics").providerId, "building-graphics");
   assert.equal(by("bacnet.read").providerId, "bacnet-core");
   assert.equal(by("bacnet.historian").providerId, "bacnet-historian");
   assert.equal(by("scheduler").providerId, "observability");
   assert.equal(by("timeseries").providerId, "observability");
   const order = reg.initOrder;
-  for (const dep of ["bacnet-core", "bacnet-historian", "observability"]) {
+  for (const dep of ["bacnet-core", "bacnet-historian", "observability", "building-model", "building-graphics"]) {
     assert.ok(order.indexOf(dep) < order.indexOf("building-workspace"), `${dep} before building-workspace`);
   }
 });
 
+test("the analytics, graphics, and alerts services own their capabilities", () => {
+  const reg = buildRegistry(TOOL_MANIFESTS);
+  assert.ok(reg.ok, reg.errors.join("; "));
+  assert.deepEqual(reg.providers.get("rules").map((p) => p.toolId), ["building-rules"]);
+  assert.deepEqual(reg.providers.get("graphics").map((p) => p.toolId), ["building-graphics"]);
+  assert.deepEqual(reg.providers.get("alerts").map((p) => p.toolId), ["building-alerts"]);
+  for (const id of ["building-rules", "building-graphics", "building-alerts"]) {
+    assert.equal(manifestById(id).category, "service");
+  }
+  // building-alerts composes rules + inventory and boots after both.
+  const alertsRes = reg.resolutions.get("building-alerts");
+  assert.equal(alertsRes.find((r) => r.capability === "rules").providerId, "building-rules");
+  assert.equal(alertsRes.find((r) => r.capability === "inventory").providerId, "building-model");
+  const order = reg.initOrder;
+  for (const dep of ["building-model", "building-rules"]) {
+    assert.ok(order.indexOf(dep) < order.indexOf("building-alerts"), `${dep} before building-alerts`);
+  }
+});
+
 test("manifestById looks tools up", () => {
-  assert.equal(manifestById("bacnet").name, "Advanced BACnet Inspector");
-  assert.equal(manifestById("bacnet").ui.defaultHidden, true);
+  assert.equal(manifestById("bacnet-manager").name, "BACnet Manager");
   assert.equal(manifestById("nope"), null);
 });
 

@@ -1,12 +1,12 @@
 // Building inventory / lightweight Haystack model service.
 // Local-first, pure, and storage-injected so tests can run without Tauri.
 
-const ENTITY_TYPES = new Set(["site", "building", "floor", "equip", "point", "sourceRef", "tag", "template", "commissioningRun"]);
+const ENTITY_TYPES = new Set(["site", "building", "floor", "equip", "point", "sourceRef", "tag", "template", "commissioningRun", "ruleRun"]);
 const BACNET_REF_RE = /^bacnet:(\d+):(\d+):(\d+)$/;
 const NIAGARA_REF_RE = /^niagara:([^:]+):(.+)$/;
 
 export const DEFAULT_TEMPLATES = [
-  { id: "template:vav", type: "template", name: "VAV", tags: { equip: true, vav: true, hvac: true } },
+  { id: "template:vav", type: "template", name: "VAV", tags: { equip: true, vav: true, hvac: true }, graphicId: "vav-reheat-series" },
   { id: "template:ahu", type: "template", name: "AHU", tags: { equip: true, ahu: true, hvac: true } },
   { id: "template:zone", type: "template", name: "Zone", tags: { equip: true, zone: true } },
   { id: "template:meter", type: "template", name: "Meter", tags: { equip: true, meter: true } },
@@ -127,6 +127,13 @@ export function createInventory({ storage = createMemoryInventoryStorage(), now 
     if (!Array.isArray(state.entities)) state = defaultState();
     ids = new Map(state.entities.map((e) => [e.id, e]));
     for (const t of DEFAULT_TEMPLATES) if (!ids.has(t.id)) ids.set(t.id, clone(t));
+    for (const t of DEFAULT_TEMPLATES) {
+      const existing = ids.get(t.id);
+      if (existing && t.graphicId && !existing.graphicId) {
+        existing.graphicId = t.graphicId;
+        ids.set(t.id, existing);
+      }
+    }
     persist();
   }
 
@@ -268,6 +275,15 @@ export function createInventory({ storage = createMemoryInventoryStorage(), now 
         type: "commissioningRun",
         id: run.id || nextId("commissioningRun"),
         name: run.name || `Commissioning ${nowIso(now)}`,
+      });
+    },
+
+    recordRuleRun(run) {
+      return api.upsertEntity({
+        ...run,
+        type: "ruleRun",
+        id: run.id || nextId("ruleRun"),
+        name: run.name || `Rule evaluation ${nowIso(now)}`,
       });
     },
 

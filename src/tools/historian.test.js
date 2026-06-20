@@ -124,9 +124,112 @@ test("start registers a scheduler job and polls immediately; stop removes it", a
 
   h.start(30000);
   assert.ok(h.isRunning());
-  await Promise.resolve(); // let the immediate tick settle
+  await new Promise((resolve) => setImmediate(resolve));
   assert.ok(ts.recent().length >= 1);
 
   h.stop();
   assert.ok(!h.isRunning());
+});
+
+test("pollOnce skips unreachable devices when netscan is available", async () => {
+  const bacnet = {
+    readPoint: async () => PV("real", 50),
+  };
+  const netscan = {
+    isReachable: async (ip) => ({ reachable: ip === "10.0.0.5", rttMs: 1 }),
+  };
+  const scheduler = createScheduler({ timer: fakeTimer() });
+  const ts = createTimeseries();
+  const h = createHistorian({ bacnet, scheduler, timeseries: ts, netscan });
+  h.addPoint({ device: { deviceInstance: 1, address: "10.0.0.9" }, objectType: 0, instance: 1 });
+  h.addPoint({ device: { deviceInstance: 2, address: "10.0.0.5" }, objectType: 0, instance: 2 });
+
+  const summary = await h.pollOnce();
+  assert.equal(summary.written, 1);
+  assert.equal(summary.skipped, 1);
+  assert.match(h.points()[0].lastError, /unreachable/);
+});
+
+test("handleCovEvent writes present-value from COV notifications", async () => {
+  const bacnet = {
+    subscribeCov: async () => 42,
+    unsubscribeCov: async () => {},
+    readPoint: async () => [],
+  };
+  const scheduler = createScheduler({ timer: fakeTimer() });
+  const ts = createTimeseries({ now: () => 9000 });
+  const h = createHistorian({ bacnet, scheduler, timeseries: ts, now: () => 9000 });
+  h.addPoint({ device: { deviceInstance: 7 }, objectType: 0, instance: 3, label: "SAT" });
+  h.start(60000, { cov: true });
+  await new Promise((resolve) => setImmediate(resolve));
+
+  const handled = h.handleCovEvent({
+    processId: 42,
+    objectType: 0,
+    instance: 3,
+    values: PV("real", 68.2),
+  });
+  assert.ok(handled);
+  assert.equal(h.points()[0].lastValue, 68.2);
+  assert.equal(ts.recent().at(-1).fields.present_value, 68.2);
+  h.stop();
+});
+
+test("writePointSample accumulates in-memory history on poll and COV", async () => {
+  const bacnet = {
+    readPoint: async (_d, _t, instance) => PV("real", 60 + instance),
+    subscribeCov: async () => 7,
+    unsubscribeCov: async () => {},
+  };
+  const scheduler = createScheduler({ timer: fakeTimer() });
+  const h = createHistorian({ bacnet, scheduler, maxSamples: 3, now: () => 1000 });
+  const pt = { device: { deviceInstance: 5 }, objectType: 0, instance: 1 };
+  h.addPoint(pt);
+
+  await h.pollOnce();
+  assert.equal(h.history(pt).length, 1);
+  assert.deepEqual(h.history(pt)[0], { ts: 1000, value: 61 });
+
+  assert.ok(!h.handleCovEvent({ processId: 7, objectType: 0, instance: 1, values: PV("real", 62) }));
+  assert.equal(h.history(pt).length, 1);
+
+  h.start(60000, { cov: true });
+  await new Promise((resolve) => setImmediate(resolve));
+  const beforeCov = h.history(pt).length;
+  assert.ok(beforeCov >= 2);
+
+  assert.ok(h.handleCovEvent({ processId: 7, objectType: 0, instance: 1, values: PV("real", 62) }));
+  assert.equal(h.history(pt).length, beforeCov + 1);
+  assert.equal(h.history(pt).at(-1).value, 62);
+
+  await h.pollOnce();
+  assert.equal(h.history(pt).length, 3);
+
+  await h.pollOnce();
+  assert.equal(h.history(pt).length, 3);
+  h.stop();
+});
+
+test("removePoint clears in-memory history", async () => {
+  const bacnet = { readPoint: async () => PV("real", 1) };
+  const scheduler = createScheduler({ timer: fakeTimer() });
+  const h = createHistorian({ bacnet, scheduler });
+  const pt = { device: { deviceInstance: 1 }, objectType: 0, instance: 0 };
+  h.addPoint(pt);
+  await h.pollOnce();
+  assert.equal(h.history(pt).length, 1);
+  h.removePoint(pt);
+  assert.equal(h.history(pt).length, 0);
+});
+
+test("addPoint merge preserves sample history", async () => {
+  const bacnet = { readPoint: async () => PV("real", 10) };
+  const scheduler = createScheduler({ timer: fakeTimer() });
+  const h = createHistorian({ bacnet, scheduler });
+  const pt = { device: { deviceInstance: 1 }, objectType: 0, instance: 1, label: "A" };
+  h.addPoint(pt);
+  await h.pollOnce();
+  h.addPoint({ ...pt, label: "B" });
+  assert.equal(h.history(pt).length, 1);
+  assert.equal(h.points()[0].label, "B");
 });

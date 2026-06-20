@@ -29,12 +29,18 @@ async function bootRealPlatform(invoke, telemetry, scheduler) {
 
 test("the whole tool catalog boots with a clean capability graph", async () => {
   const kernel = await bootRealPlatform(mockInvoke(), createTimeseries(), createScheduler());
-  for (const id of ["observability", "clipboardtyper", "heicmov", "networkmanager", "bacnet-core", "bacnet", "bacnet-historian", "building-workspace"]) {
+  for (const id of [
+    "observability", "clipboardtyper", "heicmov", "networkmanager", "bacnet-core",
+    "bacnet-manager", "bacnet-historian", "building-model", "building-rules",
+    "building-graphics", "building-alerts", "building-workspace",
+    "alarm-console", "building-analytics", "device-graphics",
+  ]) {
     assert.ok(kernel.isBooted(id), `${id} should be booted`);
   }
   for (const cap of [
     "timeseries.v1", "scheduler.v1", "network.adapters.v1", "netscan.v1",
     "media.convert.v1", "bacnet.read.v1", "bacnet.historian.v1", "inventory.v1",
+    "rules.v1", "graphics.v1", "alerts.v1",
   ]) {
     assert.ok(kernel.capability(cap), `${cap} should resolve`);
   }
@@ -83,6 +89,34 @@ test("building workflow imports, historizes, charts, and exports reports", async
   });
   assert.match(exportCommissioningMarkdown(inventory.exportSnapshot(), run), /RAT/);
   assert.match(exportCommissioningCsv(run), /range/);
+});
+
+test("graphics, rules, and alerts services compose over the building model", async () => {
+  const kernel = await bootRealPlatform(mockInvoke(), createTimeseries(), createScheduler());
+  const inventory = kernel.capability("inventory.v1");
+  const graphics = kernel.capability("graphics.v1");
+  const rules = kernel.capability("rules.v1");
+  const alerts = kernel.capability("alerts.v1");
+
+  const equip = inventory.applyTemplate(inventory.upsertEntity({
+    id: "equip:vav-2", type: "equip", name: "VAV-2",
+  }).id, "vav");
+
+  // graphics.v1 resolves the VAV graphic and exposes bindable slots.
+  const graphic = graphics.graphicForEquip(equip);
+  assert.ok(graphic, "VAV should resolve a device graphic");
+  assert.ok(graphics.resolveBindings({ equip }).totalSlots > 0);
+
+  // rules.v1 flags the missing space-temp / DAT sensors (no live reads needed).
+  const run = await rules.run({ scope: { equipId: equip.id }, useLive: false });
+  assert.ok(run.summary.fail >= 1, "missing sensors should fail");
+
+  // alerts.v1 persists a scan and surfaces the findings as unified alerts.
+  const saved = await alerts.runRuleScan({ scope: { equipId: equip.id }, useLive: false });
+  assert.equal(saved.type, "ruleRun");
+  const findings = alerts.listRuleFindings({ status: ["fail"] });
+  assert.ok(findings.length >= 1);
+  assert.equal(findings[0].source, "rule");
 });
 
 test("a netscan sweep flows into the degraded telemetry without a backend", async () => {

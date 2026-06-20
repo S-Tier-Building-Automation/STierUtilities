@@ -2,6 +2,13 @@
 
 export const STORAGE_KEY = "microtools.user_state.v2";
 
+/** Clamp persisted sidebar width to the resizer bounds (160–360px). */
+export function clampSidebarWidth(px) {
+  const n = Number(px);
+  const w = Number.isFinite(n) ? n : 200;
+  return Math.max(160, Math.min(360, Math.round(w)));
+}
+
 export function normalizeUserState(stored = {}) {
   const persistedAt = Number(stored._persistedAt);
   return {
@@ -10,16 +17,25 @@ export function normalizeUserState(stored = {}) {
     hidden: stored.hidden || {},
     showHidden: Boolean(stored.showHidden),
     libraryView: stored.libraryView === "list" ? "list" : "grid",
+    librarySearch: typeof stored.librarySearch === "string" ? stored.librarySearch : "",
+    recentTools: Array.isArray(stored.recentTools) ? stored.recentTools.filter((id) => typeof id === "string") : [],
     nmRailWidth: Number.isFinite(stored.nmRailWidth) ? stored.nmRailWidth : 240,
-    view: typeof stored.view === "string" ? stored.view : "library",
+    sidebarWidth: Number.isFinite(stored.sidebarWidth) ? stored.sidebarWidth : 200,
+    view: typeof stored.view === "string" ? stored.view : "home",
     sidebarCollapsed: Boolean(stored.sidebarCollapsed),
     activityToolFilter: typeof stored.activityToolFilter === "string" ? stored.activityToolFilter : "all",
     activityKindFilter: typeof stored.activityKindFilter === "string" ? stored.activityKindFilter : "all",
     historian: stored.historian || null,
     buildingWorkspace: stored.buildingWorkspace || null,
+    deviceGraphics: stored.deviceGraphics || null,
+    analytics: stored.analytics || null,
+    alarmConsole: stored.alarmConsole || null,
     inventory: stored.inventory || null,
     inventoryLegacyMigrated: Boolean(stored.inventoryLegacyMigrated),
     networkManager: stored.networkManager || null,
+    bacnetManager: stored.bacnetManager || null,
+    bacnetDiscoveryCache: Array.isArray(stored.bacnetDiscoveryCache) ? stored.bacnetDiscoveryCache : null,
+    bacnetObjectPresets: stored.bacnetObjectPresets || null,
     installedTools: Array.isArray(stored.installedTools) ? stored.installedTools : [],
     installedGrants: stored.installedGrants || {},
   };
@@ -74,7 +90,13 @@ export function createUserStateManager({
 
   function saveUserState() {
     userState._persistedAt = Date.now();
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(userState));
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(userState));
+    } catch (err) {
+      // Most likely QuotaExceededError on a very large site. Don't let a failed
+      // local persist throw into callers (imports, discovery) and break the UI.
+      console.warn("[user-state] could not persist to localStorage:", err);
+    }
     queueAuthUserStateSave();
   }
 
@@ -101,7 +123,11 @@ export function createUserStateManager({
   }
 
   function flushUserStatePersistence() {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(userState));
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(userState));
+    } catch (err) {
+      console.warn("[user-state] could not persist to localStorage during flush:", err);
+    }
     if (authUserStateSaveTimer) {
       clearTimeout(authUserStateSaveTimer);
       authUserStateSaveTimer = null;
@@ -297,8 +323,11 @@ export function createUserStateManager({
     userState.hidden = {};
     userState.showHidden = false;
     userState.libraryView = "grid";
-    userState.view = "library";
+    userState.librarySearch = "";
+    userState.recentTools = [];
+    userState.view = "home";
     userState.sidebarCollapsed = false;
+    userState.sidebarWidth = 200;
     try {
       if (authState && authState.session) {
         await invoke("auth_save_user_state", { userId: null, orgId: null, state: userState });
@@ -343,16 +372,41 @@ export function createUserStateManager({
     renderAll();
   }
 
+  function touchRecentTool(id) {
+    if (!id) return;
+    const prev = (userState.recentTools || []).filter((x) => x !== id);
+    userState.recentTools = [id, ...prev].slice(0, 8);
+  }
+
+  function getRecentTools() {
+    return (userState.recentTools || []).filter((id) => !isFavorite(id));
+  }
+
   function setView(view) {
     onBeforeViewChange();
+    if (typeof view === "string" && view.startsWith("plugin:")) {
+      touchRecentTool(view.slice("plugin:".length));
+    }
     userState.view = view;
     saveUserState();
+    try { window.dispatchEvent(new CustomEvent("stier:view-change")); } catch (_) {}
     renderAll();
   }
 
   function applySidebarCollapsed() {
     const app = document.querySelector(".app");
-    if (app) app.classList.toggle("sidebar-collapsed", userState.sidebarCollapsed);
+    if (app) {
+      app.classList.toggle("sidebar-collapsed", userState.sidebarCollapsed);
+      if (!userState.sidebarCollapsed) {
+        const w = clampSidebarWidth(userState.sidebarWidth);
+        userState.sidebarWidth = w;
+        app.style.setProperty("--sidebar-width", `${w}px`);
+        app.style.removeProperty("grid-template-columns");
+      } else {
+        app.style.removeProperty("--sidebar-width");
+        app.style.removeProperty("grid-template-columns");
+      }
+    }
     const toggle = document.getElementById("sidebar-toggle");
     if (toggle) {
       toggle.setAttribute("aria-expanded", String(!userState.sidebarCollapsed));
@@ -367,13 +421,13 @@ export function createUserStateManager({
   }
 
   function currentView() {
-    if (userState.view === "library" || userState.view === "settings" || userState.view === "services" || userState.view === "activity" || userState.view === "account") {
+    if (userState.view === "home" || userState.view === "library" || userState.view === "settings" || userState.view === "services" || userState.view === "activity" || userState.view === "account") {
       return userState.view;
     }
     if (typeof userState.view === "string" && userState.view.startsWith("plugin:")) {
       return userState.view;
     }
-    return "library";
+    return "home";
   }
 
   function currentPluginId() {
@@ -414,5 +468,7 @@ export function createUserStateManager({
     currentView,
     currentPluginId,
     pluginView,
+    getRecentTools,
+    touchRecentTool,
   };
 }

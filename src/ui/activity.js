@@ -9,9 +9,10 @@
  * @param {() => Array<object>} deps.getTools
  * @param {(id: string) => boolean} deps.isHidden
  * @param {(toolId: string) => string} deps.toolLabel
+ * @param {() => void} [deps.renderChrome]
  */
 export function createActivityLog({
-  el, getUserState, saveUserState, currentView, getTools, isHidden, toolLabel,
+  el, getUserState, saveUserState, currentView, getTools, isHidden, toolLabel, renderChrome,
 }) {
   const pluginLogs = new Map();
 
@@ -24,6 +25,8 @@ export function createActivityLog({
     arr.unshift({ time: new Date(), msg, kind });
     while (arr.length > 100) arr.pop();
     if (currentView() === "activity") renderPage();
+    // Keep the sidebar warn/error badge current even while the Activity view is open.
+    if (kind === "error" || kind === "warn") renderChrome?.();
   }
 
   function activityEntries() {
@@ -77,6 +80,52 @@ export function createActivityLog({
     renderPage();
   }
 
+  function activitySummary({ recentLimit = 6 } = {}) {
+    const entries = activityEntries();
+    const errors = entries.filter((e) => e.kind === "error").length;
+    const warns = entries.filter((e) => e.kind === "warn").length;
+    return {
+      total: entries.length,
+      errors,
+      warns,
+      recent: entries.slice(0, recentLimit).map((entry) => ({
+        ...entry,
+        toolLabel: toolLabel(entry.toolId),
+      })),
+    };
+  }
+
+  function activityCountByKind(entries, kind) {
+    return entries.filter((e) => e.kind === kind).length;
+  }
+
+  function renderActivitySummary(allEntries) {
+    const total = allEntries.length;
+    const chips = [
+      ["total", `${total} event${total === 1 ? "" : "s"}`, "pill-muted"],
+      ["ok", `${activityCountByKind(allEntries, "ok")} ok`, "pill-running"],
+      ["info", `${activityCountByKind(allEntries, "info")} info`, "pill-idle"],
+      ["warn", `${activityCountByKind(allEntries, "warn")} warn`, activityCountByKind(allEntries, "warn") ? "pill-warn" : "pill-muted"],
+      ["error", `${activityCountByKind(allEntries, "error")} error`, activityCountByKind(allEntries, "error") ? "pill-error" : "pill-muted"],
+    ];
+    return el("div", { class: "activity-summary" },
+      ...chips.map(([, label, cls]) => el("span", { class: `pill pill-sm ${cls}` }, label)));
+  }
+
+  function renderActivityEmpty(allEntries) {
+    if (allEntries.length) {
+      return el("div", { class: "activity-empty-state" },
+        el("p", { class: "activity-empty-title" }, "No matches"),
+        el("p", { class: "muted small" }, "Try a different tool or status filter, or clear filters to see everything again."));
+    }
+    return el("div", { class: "activity-empty-state" },
+      el("p", { class: "activity-empty-title" }, "No activity yet"),
+      el("p", { class: "muted small" }, "Events from BACnet discovery, historian runs, network scans, and other tools show up here."),
+      el("ul", { class: "activity-empty-tips" },
+        el("li", {}, "Errors and warnings show a badge on Activity in the sidebar."),
+        el("li", {}, "Use the filters above once tools start logging.")));
+  }
+
   function renderPage() {
     const root = document.getElementById("view-root");
     root.replaceChildren();
@@ -98,7 +147,8 @@ export function createActivityLog({
       ),
     ));
 
-    root.appendChild(el("section", { class: "plugin-section plugin-section-fill activity-panel" },
+    root.appendChild(el("section", { class: "plugin-section activity-panel" },
+      renderActivitySummary(allEntries),
       el("div", { class: "activity-controls" },
         el("label", { class: "nm-field activity-filter" },
           el("span", { class: "nm-field-label" }, "Tool"),
@@ -122,13 +172,20 @@ export function createActivityLog({
               const count = allEntries.filter((entry) => entry.kind === kind).length;
               return el("option", { value: kind, selected: kindFilter === kind ? "selected" : undefined }, `${kind} (${count})`);
             })))),
-      entries.length === 0
-        ? el("p", { class: "muted small activity-empty" }, allEntries.length ? "No activity matches the current filters." : "No activity yet. Use a tool and its events will appear here.")
-        : el("ol", { id: "activity-log-list", class: "plugin-log activity-log scroll-fill" },
-            ...entries.map(renderActivityLogEntry),
-          ),
+      entries.length
+        ? el("div", { class: "activity-table" },
+            el("div", { class: "activity-log-head activity-log-row", "aria-hidden": "true" },
+              el("span", {}, "Time"),
+              el("span", {}, "Tool"),
+              el("span", {}, "Status"),
+              el("span", {}, "Message")),
+            el("ol", {
+              id: "activity-log-list",
+              class: `plugin-log activity-log ${entries.length > 12 ? "activity-log-scroll" : ""}`,
+            }, ...entries.map(renderActivityLogEntry)))
+        : renderActivityEmpty(allEntries),
     ));
   }
 
-  return { logTo, renderPage };
+  return { logTo, renderPage, activitySummary };
 }

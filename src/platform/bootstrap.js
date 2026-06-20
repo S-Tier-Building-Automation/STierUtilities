@@ -7,6 +7,7 @@ import { buildMcpFactories } from "./services/mcp-client.js";
 import { createTimeseries } from "./services/timeseries.js";
 import { createScheduler } from "./services/scheduler.js";
 import { createPackController } from "./services/pack-controller.js";
+import { initHeaderSearch } from "../ui/header-search.js";
 
 /**
  * @param {object} deps
@@ -107,10 +108,15 @@ export function createStartupWarmup({ invoke, networkManager, observability, get
  * @param {(view: string) => void} deps.setView
  * @param {(on: boolean) => void} deps.setSidebarCollapsed
  * @param {() => void} deps.applySidebarCollapsed
+ * @param {() => void} deps.saveUserState
+ * @param {(opts: object) => void} deps.initSidebarSplitter
  * @param {() => Promise<void>} deps.authBootstrapUserState
  * @param {object} deps.accountMenu — { mount() }
  * @param {() => void} deps.initWindowControls
  * @param {() => Promise<void>} deps.hydrateFromStartupWarmup
+ * @param {() => Array<object>} [deps.getTools]
+ * @param {(id: string) => boolean} [deps.isHidden]
+ * @param {(id: string) => string} [deps.pluginView]
  */
 export async function runBootstrap({
   invoke,
@@ -132,19 +138,27 @@ export async function runBootstrap({
   setView,
   setSidebarCollapsed,
   applySidebarCollapsed,
+  saveUserState,
+  initSidebarSplitter,
   authBootstrapUserState,
   accountMenu,
   initWindowControls,
   hydrateFromStartupWarmup,
+  getTools = () => [],
+  isHidden = () => false,
+  pluginView = (id) => `plugin:${id}`,
 }) {
-  for (const btn of document.querySelectorAll(".header-nav-item")) {
+  for (const btn of document.querySelectorAll(".sidebar-nav-item")) {
     btn.addEventListener("click", () => setView(btn.dataset.view));
   }
+
+  initHeaderSearch({ getTools, isHidden, setView, pluginView });
 
   document
     .getElementById("sidebar-toggle")
     ?.addEventListener("click", () => setSidebarCollapsed(!userState.sidebarCollapsed));
   applySidebarCollapsed();
+  initSidebarSplitter({ userState, saveUserState, applySidebarCollapsed });
 
   accountMenu.mount();
   initWindowControls();
