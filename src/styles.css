@@ -3650,12 +3650,11 @@ tr.bac-browse-row:hover { background: var(--bg-elev-2); }
 .bw-inbox-row {
   cursor: pointer;
   user-select: none;
-  height: 24px;
 }
-.bw-inbox-row:has(.bm-inbox-cell-secondary) {
-  height: auto;
-}
-.bw-inbox-row:has(.bm-inbox-cell-secondary) td {
+/* Every device row reserves the same two-line cell stack (see bmInboxCellStack),
+   so all .bw-inbox-row are a uniform height — required by the windowed scroller,
+   which measures one device row and assumes the rest match. */
+.bw-inbox-row td {
   padding-top: 3px;
   padding-bottom: 3px;
 }

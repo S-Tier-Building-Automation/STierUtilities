@@ -604,7 +604,9 @@ export function createBacnetInboxUi(deps) {
       title: title || [label, secondary].filter(Boolean).join(" · "),
     },
       el("span", { class: "bm-inbox-cell-primary" }, primary || el("span", { class: "muted" }, "Unnamed")),
-      secondary ? el("span", { class: "bm-inbox-cell-secondary muted" }, secondary) : null);
+      // Always render the secondary line (placeholder when empty) so every
+      // device row keeps the same two-line height the windowed scroller assumes.
+      el("span", { class: "bm-inbox-cell-secondary muted" }, secondary || "\u00a0"));
   }
 
   function bmInboxStatusTitle(inv, item, floor = null) {
