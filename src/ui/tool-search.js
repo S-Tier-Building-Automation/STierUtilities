@@ -40,7 +40,7 @@ export function groupToolsByCategory(tools, isHidden) {
     groups.get(key).push(tool);
   }
   const order = ["app", "service", "other"];
-  return order
-    .filter((k) => groups.has(k))
-    .map((k) => ({ key: k, label: toolCategoryLabel(k), tools: groups.get(k) }));
+  // Known categories first, then any nonstandard category so its tools still show.
+  const keys = [...order.filter((k) => groups.has(k)), ...[...groups.keys()].filter((k) => !order.includes(k)).sort()];
+  return keys.map((k) => ({ key: k, label: toolCategoryLabel(k), tools: groups.get(k) }));
 }

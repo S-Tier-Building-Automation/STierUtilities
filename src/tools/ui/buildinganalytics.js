@@ -2,7 +2,7 @@
 // findings. A thin shell over the rules.v1 capability: it owns no rule logic,
 // only the rule configuration, run controls, KPIs, filtering, and exports.
 
-import { setAppIntent } from "../../ui/app-intent.js";
+import { setAppIntent, takeAppIntent } from "../../ui/app-intent.js";
 import { confirmAction } from "../../ui/modal.js";
 
 const ANALYTICS_TS_RE = /[:.]/g;
@@ -166,10 +166,11 @@ export function createBuildingAnalyticsUi({
   function saveDraft() {
     if (!draft) return;
     if (!draft.name.trim()) { logTo("building-analytics", "Rule needs a name.", "warn"); return; }
-    if (!draftToRule().roles.length && draft.kind !== "missing-point") {
-      // range/threshold rules need a role to locate a point.
-    }
     const rule = draftToRule();
+    if (rule.kind !== "missing-point" && !rule.roles.length) {
+      logTo("building-analytics", "Range and threshold rules need at least one role to locate a point.", "warn");
+      return;
+    }
     const list = [...customRules()];
     const idx = list.findIndex((r) => r.id === rule.id);
     if (idx >= 0) list[idx] = rule; else list.push(rule);
@@ -209,10 +210,17 @@ export function createBuildingAnalyticsUi({
 
   function buildOverrides() {
     const overrides = {};
+    const num = (v) => (v === "" || v == null || !Number.isFinite(Number(v)) ? undefined : Number(v));
     for (const rule of rulePack()) {
       const p = paramFor(rule);
-      if (rule.kind === "range") overrides[rule.id] = { min: Number(p.min), max: Number(p.max) };
-      else if (rule.kind === "threshold") overrides[rule.id] = { value: Number(p.value) };
+      if (rule.kind === "range") {
+        const o = {};
+        if (num(p.min) !== undefined) o.min = num(p.min);
+        if (num(p.max) !== undefined) o.max = num(p.max);
+        if (Object.keys(o).length) overrides[rule.id] = o;
+      } else if (rule.kind === "threshold") {
+        if (num(p.value) !== undefined) overrides[rule.id] = { value: num(p.value) };
+      }
     }
     return overrides;
   }
@@ -230,7 +238,7 @@ export function createBuildingAnalyticsUi({
 
   function setAllRules(on) {
     const enabled = {};
-    for (const rule of rulePack()) enabled[rule.id] = on;
+    for (const rule of allRules()) enabled[rule.id] = on;
     patchState({ enabledRules: enabled });
     renderAll();
   }
@@ -505,6 +513,9 @@ export function createBuildingAnalyticsUi({
         el("section", { class: "plugin-section" },
           el("p", { class: "empty-state" }, "Building model or analytics engine is not available.")));
     }
+
+    const intent = takeAppIntent("building-analytics");
+    if (intent && "siteId" in intent && (!intent.siteId || inv.getEntity(intent.siteId))) patchState({ siteId: intent.siteId });
 
     const s = st();
     const runs = inv.listEntities({ type: "ruleRun" });

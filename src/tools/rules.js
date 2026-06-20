@@ -71,15 +71,19 @@ export function findPointForRoles(equip, points, roles = [], graphic = null, opt
 
 export function equipMatchesRuleScope(equip, rule) {
   const scope = rule?.scope || {};
-  if (scope.templateIds?.length) {
+  const hasTemplates = Boolean(scope.templateIds?.length);
+  const hasTags = Boolean(scope.tags && Object.keys(scope.tags).length);
+  // All configured constraints must hold (conjunctive). An empty scope matches all.
+  if (hasTemplates) {
     const tid = String(equip?.templateId || "");
     const templateOk = scope.templateIds.some((id) => tid === id || tid === `template:${id}` || tid.endsWith(`:${id}`));
-    if (templateOk) return true;
+    if (!templateOk) return false;
   }
-  if (scope.tags && Object.keys(scope.tags).length) {
-    return Object.entries(scope.tags).every(([k, v]) => (equip?.tags || {})[k] === v);
+  if (hasTags) {
+    const tagsOk = Object.entries(scope.tags).every(([k, v]) => (equip?.tags || {})[k] === v);
+    if (!tagsOk) return false;
   }
-  return !scope.templateIds?.length;
+  return true;
 }
 
 export function listEquipsInScope(inventory, { siteId = null, buildingId = null, floorId = null, equipId = null } = {}) {
@@ -118,6 +122,18 @@ function displayMatches(match, display) {
   const text = String(display ?? "").trim();
   if (match instanceof RegExp) return match.test(text);
   return text.toLowerCase() === String(match).toLowerCase();
+}
+
+/** Human phrasing for a threshold breach, e.g. "lt" -> "below". */
+function thresholdBreachText(operator) {
+  switch (operator) {
+    case "gt": return "above";
+    case "gte": return "at or above";
+    case "lte": return "at or below";
+    case "eq": return "equal to";
+    case "lt":
+    default: return "below";
+  }
 }
 
 function compareThreshold(operator, value, threshold) {
@@ -296,9 +312,10 @@ export function evaluateRuleOnEquip(rule, equip, points, ctx = {}) {
         at, pointId: point.id, pointName: point.name, display,
       });
     }
+    const unitText = rule.unit ? ` ${rule.unit}` : "";
     return finding(rule, equip, hit ? "fail" : "pass", hit
-      ? `${point.name} is ${numeric}${rule.unit ? ` ${rule.unit}` : ""} (below ${rule.value}${rule.unit ? ` ${rule.unit}` : ""}).`
-      : `${point.name} is ${numeric}${rule.unit ? ` ${rule.unit}` : ""}.`, {
+      ? `${point.name} is ${numeric}${unitText} (${thresholdBreachText(rule.operator || "lt")} ${rule.value}${unitText}).`
+      : `${point.name} is ${numeric}${unitText}.`, {
       at, pointId: point.id, pointName: point.name, value: numeric, display,
       threshold: { operator: rule.operator, value: rule.value, unit: rule.unit || null },
     });
@@ -342,9 +359,14 @@ export async function runRules({
       const graphic = graphicForEquip(equip, equip.templateId ? inventory.getEntity(equip.templateId) : null);
       for (const rule of mergedRules) {
         if (!equipMatchesRuleScope(equip, rule)) continue;
-        const roles = [...(rule.roles || []), ...((rule.when?.roles) || [])];
-        const point = findPointForRoles(equip, allPoints, roles, graphic, rule);
-        if (point) pointIds.add(point.id);
+        const primary = findPointForRoles(equip, allPoints, rule.roles || [], graphic, rule);
+        if (primary) pointIds.add(primary.id);
+        // A threshold rule's precondition (e.g. fan running) is a separate point;
+        // prefetch it too so its live value is available during evaluation.
+        if (rule.when?.roles?.length) {
+          const precondition = findPointForRoles(equip, allPoints, rule.when.roles, graphic, rule.when);
+          if (precondition) pointIds.add(precondition.id);
+        }
       }
     }
     for (const pointId of pointIds) {

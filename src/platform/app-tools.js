@@ -299,8 +299,8 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
           : "Import BACnet devices in Building Workspace to start modeling.",
       },
       platform: {
-        label: platform ? (bootedCount ? "Ready" : "Issues") : "Booting",
-        cls: platform && bootedCount ? "pill-running" : "pill-muted",
+        label: platform ? (bootedCount === manifestCount ? "Ready" : "Issues") : "Booting",
+        cls: !platform ? "pill-muted" : bootedCount === manifestCount ? "pill-running" : "pill-warn",
         detail: platform ? `${bootedCount} of ${manifestCount} tools booted.` : "Platform kernel not ready.",
       },
     };

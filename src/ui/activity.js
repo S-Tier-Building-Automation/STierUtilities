@@ -25,7 +25,8 @@ export function createActivityLog({
     arr.unshift({ time: new Date(), msg, kind });
     while (arr.length > 100) arr.pop();
     if (currentView() === "activity") renderPage();
-    else if (kind === "error" || kind === "warn") renderChrome?.();
+    // Keep the sidebar warn/error badge current even while the Activity view is open.
+    if (kind === "error" || kind === "warn") renderChrome?.();
   }
 
   function activityEntries() {

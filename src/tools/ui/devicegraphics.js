@@ -43,7 +43,10 @@ export function createDeviceGraphicsUi({
     return userState.deviceGraphics;
   }
   function patchState(patch) {
-    Object.assign(st(), patch);
+    const cur = st();
+    const changed = Object.entries(patch).some(([k, v]) => cur[k] !== v);
+    if (!changed) return;
+    Object.assign(cur, patch);
     saveUserState();
   }
 
@@ -260,8 +263,9 @@ export function createDeviceGraphicsUi({
             : null);
 
     if (!canPoll && polling) stopPoll();
-    // Keep polling alive across re-renders while this app is showing the equip.
-    if (polling && currentPluginId() === "device-graphics") startPoll(equip);
+    // Keep polling alive across re-renders, but don't restart the interval each
+    // render — only (re)start when polling is on yet no timer is currently active.
+    if (polling && !pollTimer && currentPluginId() === "device-graphics") startPoll(equip);
 
     return el("div", { class: "plugin-controls" },
       el("section", { class: "plugin-section" },
