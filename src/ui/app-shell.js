@@ -2,6 +2,48 @@
 
 import { updater, tauriProcess } from "../platform/tauri.js";
 import { el } from "./dom.js";
+import {
+  attachPaneDrag,
+  clampPaneWidth,
+  paneSplitterKeyHandler,
+  updateSplitterAria,
+} from "./split-pane.js";
+
+const SIDEBAR_MIN = 160;
+const SIDEBAR_MAX = 360;
+const SIDEBAR_DEFAULT = 200;
+
+/**
+ * Wire drag/keyboard resize for the app sidebar splitter.
+ * @param {{ userState: object, saveUserState: () => void, applySidebarCollapsed: () => void }} deps
+ */
+export function initSidebarSplitter({ userState, saveUserState, applySidebarCollapsed }) {
+  function sidebarWidthPx() {
+    return clampPaneWidth(userState.sidebarWidth ?? SIDEBAR_DEFAULT, { min: SIDEBAR_MIN, max: SIDEBAR_MAX });
+  }
+
+  function setSidebarWidth(px, persist) {
+    userState.sidebarWidth = clampPaneWidth(px, { min: SIDEBAR_MIN, max: SIDEBAR_MAX });
+    applySidebarCollapsed();
+    updateSplitterAria(document.getElementById("app-sidebar-splitter"), userState.sidebarWidth);
+    if (persist) saveUserState();
+  }
+
+  const splitter = document.getElementById("app-sidebar-splitter");
+  if (!splitter) return;
+
+  splitter.setAttribute("aria-valuemin", String(SIDEBAR_MIN));
+  splitter.setAttribute("aria-valuemax", String(SIDEBAR_MAX));
+  splitter.setAttribute("aria-valuenow", String(sidebarWidthPx()));
+
+  attachPaneDrag(splitter, {
+    getWidth: sidebarWidthPx,
+    setWidth: setSidebarWidth,
+    persist: saveUserState,
+  });
+  splitter.addEventListener("keydown", paneSplitterKeyHandler(sidebarWidthPx, (px) => setSidebarWidth(px, true), saveUserState));
+  splitter.addEventListener("dblclick", () => setSidebarWidth(SIDEBAR_DEFAULT, true));
+}
 
 /**
  * @param {object} deps
@@ -135,6 +177,7 @@ export function createAppShell({
       ".plugin-page",
       ".scroll-fill",
       ".bw-device-inbox-scroll",
+      ".bm-inbox-pane-body",
       ".bw-tree-list",
       ".activity-log",
       ".bac-table-wrap",
@@ -259,8 +302,8 @@ export function createAppShell({
       bw?.renderModelScope?.({ tree: true, details: true, header: true });
       return;
     }
-    if (scope === "bacnet-manager:inbox") {
-      getBacnetManager()?.renderInboxScope?.();
+    if (scope === "bacnet-manager:devices" || scope === "bacnet-manager:inbox") {
+      getBacnetManager()?.renderDevicesScope?.() || getBacnetManager()?.renderInboxScope?.();
       return;
     }
     if (scope === "all") {

@@ -82,6 +82,7 @@ pub const NETWORK_MSG_I_AM_ROUTER_TO_NETWORK: u8 = 0x01;
 pub const PROP_ALL: u32 = 8;
 pub const PROP_OBJECT_LIST: u32 = 76;
 pub const PROP_OBJECT_NAME: u32 = 77;
+pub const PROP_DESCRIPTION: u32 = 28;
 pub const PROP_PRESENT_VALUE: u32 = 85;
 pub const PROP_PRIORITY_ARRAY: u32 = 87;
 pub const PROP_RELINQUISH_DEFAULT: u32 = 104;
@@ -2300,14 +2301,15 @@ pub fn engineering_unit_name(u: u32) -> Option<&'static str> {
         90 => "L/min",
         91 => "GPM",
         92 => "°",
-        95 => "°F/h",
-        97 => "(none)",
-        98 => "ppm",
-        99 => "ppb",
-        100 => "%",
-        102 => "/min",
-        103 => "/s",
-        106 => "RPM",
+        // Concentration / rate / percent block (ASHRAE 135 EngineeringUnits).
+        95 => "", // no-units: render with no symbol
+        96 => "ppm",
+        97 => "ppb",
+        98 => "%",
+        99 => "%/s",
+        100 => "/min",
+        101 => "/s",
+        104 => "RPM",
         _ => return None,
     })
 }
@@ -3306,6 +3308,13 @@ mod tests {
         assert_eq!(property_name(9999), "property-9999");
         assert_eq!(engineering_unit_name(66), Some("°F"));
         assert_eq!(engineering_unit_name(64), Some("°C"));
+        // Concentration / percent block aligned to ASHRAE 135 enum values.
+        assert_eq!(engineering_unit_name(96), Some("ppm"));
+        assert_eq!(engineering_unit_name(97), Some("ppb"));
+        assert_eq!(engineering_unit_name(98), Some("%"));
+        assert_eq!(engineering_unit_name(100), Some("/min"));
+        assert_eq!(engineering_unit_name(104), Some("RPM"));
+        assert_eq!(engineering_unit_name(95), Some("")); // no-units
         assert_eq!(segmentation_name(3), "none");
     }
 

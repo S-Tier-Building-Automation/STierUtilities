@@ -269,6 +269,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     renderScoped: appShell.renderScoped,
     checkForUpdates: appShell.checkForUpdates,
     userState,
+    saveUserState,
     logTo,
     rebuildCatalog,
     getAllManifests: () => ALL_MANIFESTS,

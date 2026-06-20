@@ -13,4 +13,4 @@ export { createServicesPageUi } from "./services-page.js";
 export { createAccountPageUi } from "./account-page.js";
 export { createSettingsPageUi } from "./settings-page.js";
 export { createPluginPageUi } from "./plugin-page.js";
-export { createAppShell } from "./app-shell.js";
+export { createAppShell, initSidebarSplitter } from "./app-shell.js";

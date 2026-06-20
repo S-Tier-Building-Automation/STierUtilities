@@ -123,6 +123,8 @@ pub fn run() {
         mcp::mcp_call,
         mcp::mcp_stop,
         bacnet::bacnet_discover,
+        bacnet::bacnet_cancel_discovery,
+        bacnet::bacnet_diagnostics,
         bacnet::bacnet_read_objects,
         bacnet::bacnet_read_properties,
         bacnet::bacnet_write_property,

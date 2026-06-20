@@ -158,6 +158,10 @@ export function buildFactories(invoke, options = {}) {
           highLimit: opts.highLimit ?? null,
           durationMs: opts.durationMs ?? null,
         }),
+      /** Cancel an in-flight discovery (returns devices found so far). */
+      cancelDiscovery: () => invoke("bacnet_cancel_discovery"),
+      /** BACnet/IP stack health: listener bind, local address, foreign device. */
+      diagnostics: () => invoke("bacnet_diagnostics"),
       /** Read all properties of one object on a device. `device` is a device ref. */
       readPoint: (device, objectType, instance) =>
         invoke("bacnet_read_properties", { device, objectType, instance }),

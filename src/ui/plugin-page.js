@@ -104,7 +104,7 @@ export function createPluginPageUi({
         ),
       ),
       el("div", { class: "plugin-header-right" },
-        status && el("span", { class: `pill ${status.cls}` }, status.label),
+        status && el("span", { class: `pill ${status.cls}`, role: "status", "aria-live": "polite" }, status.label),
         el("button", {
           class: `star-btn ${fav ? "star-on" : ""}`,
           title: fav ? "Unfavorite" : "Favorite",

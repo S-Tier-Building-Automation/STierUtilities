@@ -100,6 +100,18 @@ function histSyncFromInventory() {
       // Keep manual historian records intact.
     }
   }
+  // Auto-register points the user flagged "trend" during import/config but that
+  // aren't tracked yet. The entity's `historize` flag is the source of truth.
+  const trackedIds = new Set(hist.points().map((p) => p.pointId).filter(Boolean));
+  for (const point of inv.listEntities({ type: "point" })) {
+    if (!point.historize || trackedIds.has(point.id)) continue;
+    try {
+      const record = buildingWorkspace?.historianRecordForPoint?.(inv, point);
+      if (record) { hist.addPoint(record); refreshed++; }
+    } catch (_) {
+      // Skip points without a resolvable BACnet binding.
+    }
+  }
   return refreshed;
 }
 

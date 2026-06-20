@@ -1,5 +1,14 @@
 // Network Manager tool page — profiles, adapters, subnet scan.
 
+import {
+  attachPaneDrag,
+  buildGridColumns,
+  clampPaneWidth,
+  createPaneSplitter,
+  paneSplitterKeyHandler,
+  updateSplitterAria,
+} from "../../ui/split-pane.js";
+
 /**
  * @param {object} deps
  * @param {typeof import("../../platform/tauri.js").invoke} deps.invoke
@@ -965,43 +974,19 @@ function nmAdapterCacheNotice() {
 
 // ---- resizable rail (the splitter between the rail and the config panel) ----
 
+const NM_RAIL_MIN = 180;
+const NM_RAIL_MAX = 440;
+const NM_RAIL_DEFAULT = 240;
+
 function nmRailWidthPx() {
-  return Math.max(180, Math.min(440, userState.nmRailWidth || 240));
+  return clampPaneWidth(userState.nmRailWidth || NM_RAIL_DEFAULT, { min: NM_RAIL_MIN, max: NM_RAIL_MAX });
 }
 function nmSetRailWidth(px, persist) {
-  userState.nmRailWidth = Math.max(180, Math.min(440, Math.round(px)));
+  userState.nmRailWidth = clampPaneWidth(px, { min: NM_RAIL_MIN, max: NM_RAIL_MAX });
   const md = document.getElementById("nm-config-md");
-  if (md) md.style.gridTemplateColumns = `${userState.nmRailWidth}px 8px minmax(0, 1fr)`;
-  const sep = document.getElementById("nm-splitter");
-  if (sep) sep.setAttribute("aria-valuenow", String(userState.nmRailWidth));
+  if (md) md.style.gridTemplateColumns = buildGridColumns({ left: userState.nmRailWidth });
+  updateSplitterAria(document.getElementById("nm-splitter"), userState.nmRailWidth);
   if (persist) saveUserState();
-}
-// Track the drag on window so it survives the pointer leaving the handle.
-// Pointer capture + a pointercancel teardown guard against a "stuck" drag if the
-// matching pointerup is ever lost (alt-tab, OS cancel).
-function nmStartRailDrag(e) {
-  e.preventDefault();
-  const startX = e.clientX;
-  const startW = nmRailWidthPx();
-  const handle = e.currentTarget;
-  try { handle.setPointerCapture(e.pointerId); } catch (_) { /* not fatal */ }
-  document.body.classList.add("nm-resizing");
-  const onMove = (ev) => nmSetRailWidth(startW + (ev.clientX - startX), false);
-  const onUp = () => {
-    window.removeEventListener("pointermove", onMove);
-    window.removeEventListener("pointerup", onUp);
-    window.removeEventListener("pointercancel", onUp);
-    document.body.classList.remove("nm-resizing");
-    try { handle.releasePointerCapture(e.pointerId); } catch (_) { /* already released */ }
-    saveUserState();
-  };
-  window.addEventListener("pointermove", onMove);
-  window.addEventListener("pointerup", onUp);
-  window.addEventListener("pointercancel", onUp);
-}
-function nmRailKeyResize(e) {
-  if (e.key === "ArrowLeft") { e.preventDefault(); nmSetRailWidth(nmRailWidthPx() - 16, true); }
-  else if (e.key === "ArrowRight") { e.preventDefault(); nmSetRailWidth(nmRailWidthPx() + 16, true); }
 }
 
 // ---- merged Configure view (adapters + profiles, master/detail) ----
@@ -1128,24 +1113,25 @@ function nmConfigureTab() {
     panel = sel ? el("div", { class: "nm-editor-pane" }, ...nmEditorContent(sel)) : nmConfigEmpty();
   }
 
-  const splitter = el("div", {
+  const splitter = createPaneSplitter({
     id: "nm-splitter",
-    class: "nm-splitter",
-    role: "separator",
-    tabindex: "0",
-    "aria-orientation": "vertical",
-    "aria-label": "Resize the configuration panel",
-    "aria-valuemin": "180",
-    "aria-valuemax": "440",
-    "aria-valuenow": String(nmRailWidthPx()),
-    title: "Drag to resize · double-click to reset",
-    onpointerdown: nmStartRailDrag,
-    ondblclick: () => nmSetRailWidth(240, true),
-    onkeydown: nmRailKeyResize,
+    className: "nm-splitter pane-splitter",
+    ariaLabel: "Resize the configuration panel",
+    min: NM_RAIL_MIN,
+    max: NM_RAIL_MAX,
+    value: nmRailWidthPx(),
+    defaultValue: NM_RAIL_DEFAULT,
+    onKeyDown: paneSplitterKeyHandler(nmRailWidthPx, (px) => nmSetRailWidth(px, true), saveUserState),
+    onDoubleReset: () => nmSetRailWidth(NM_RAIL_DEFAULT, true),
+  });
+  attachPaneDrag(splitter, {
+    getWidth: nmRailWidthPx,
+    setWidth: nmSetRailWidth,
+    persist: saveUserState,
   });
 
   const md = el("div", { id: "nm-config-md", class: "nm-config-md" }, rail, splitter, panel);
-  md.style.gridTemplateColumns = `${nmRailWidthPx()}px 8px minmax(0, 1fr)`;
+  md.style.gridTemplateColumns = buildGridColumns({ left: nmRailWidthPx() });
 
   return el("div", { class: "plugin-controls plugin-controls-fill" },
     el("div", { class: "nm-config-head" },

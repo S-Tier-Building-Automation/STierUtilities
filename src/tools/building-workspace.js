@@ -140,19 +140,21 @@ export function bwSetQueuedTargetFloor(candidates = {}, keys = [], targetFloorId
   return next;
 }
 
-export function bwModelQueuedDevices({ inventory, devices = [], candidates = {}, floor, site, building, makeEntity, keys = null } = {}) {
+/** Import discovered BACnet devices directly into inventory (no import-plan queue). */
+export function bwImportDevicesToFloor({
+  inventory, devices = [], keys = [], candidates = {}, floor, site, building, makeEntity,
+} = {}) {
   if (!inventory || typeof makeEntity !== "function") {
     return { imported: [], skipped: 0, candidates };
   }
+  const importKeys = [...new Set((keys || []).filter(Boolean))];
+  if (!importKeys.length) return { imported: [], skipped: 0, candidates };
+
   const next = { ...candidates };
-  const requested = Array.isArray(keys) && keys.length ? new Set(keys) : null;
-  const queuedKeys = Object.values(next)
-    .filter((c) => c?.status === "queued" && (!requested || requested.has(c.key)))
-    .map((c) => c.key);
   const byKey = new Map(devices.map((device) => [bwDeviceKey(device), device]));
   const imported = [];
   let skipped = 0;
-  for (const key of queuedKeys) {
+  for (const key of importKeys) {
     const device = byKey.get(key);
     if (!device) {
       skipped++;
@@ -187,6 +189,17 @@ export function bwModelQueuedDevices({ inventory, devices = [], candidates = {},
     imported.push(entity);
   }
   return { imported, skipped, candidates: next };
+}
+
+export function bwModelQueuedDevices({ inventory, devices = [], candidates = {}, floor, site, building, makeEntity, keys = null } = {}) {
+  const importKeys = Array.isArray(keys) && keys.length
+    ? keys
+    : Object.values(candidates)
+      .filter((c) => c?.status === "queued")
+      .map((c) => c.key);
+  return bwImportDevicesToFloor({
+    inventory, devices, keys: importKeys, candidates, floor, site, building, makeEntity,
+  });
 }
 
 export function bwImportPlanItems({ devices = [], modeledDevices = [], candidates = {}, targetFloorId = "", targetFloorName = "" } = {}) {
@@ -230,7 +243,7 @@ export function suggestEquipmentName(objectName = "", fallback = "Equipment") {
   return (head || raw).trim().replace(/\s+/g, " ") || fallback;
 }
 
-export function pointEntityFromBacnet({ siteId, buildingId, floorId, equipId, device, object, props = [] }) {
+export function pointEntityFromBacnet({ siteId, buildingId, floorId, equipId, device, object, props = [], config = {} }) {
   if (!device || !object) throw new Error("point import requires a BACnet device and object");
   const deviceInstance = Number(device.instance ?? device.deviceInstance);
   const objectType = Number(object.objectType);
@@ -238,12 +251,23 @@ export function pointEntityFromBacnet({ siteId, buildingId, floorId, equipId, de
   if (![deviceInstance, objectType, instance].every(Number.isFinite)) {
     throw new Error("point import requires numeric BACnet device instance, object type, and object instance");
   }
-  const name = object.name || `${object.typeName || objectType}:${instance}`;
+  // bacnetName preserves the device's own object name for reference / reset;
+  // name is the user-facing display name (config.displayName when supplied).
+  const bacnetName = object.bacnetName || object.name || `${object.typeName || objectType}:${instance}`;
+  const displayName = String(config.displayName ?? "").trim() || object.name || bacnetName;
   const unitProp = props.find((p) => p && (p.name === "units" || p.id === 117));
+  const importedUnit = unitProp && !unitProp.error ? unitProp.display : object.unit;
+  const unit = config.unit != null && String(config.unit).trim() !== "" ? String(config.unit).trim() : importedUnit;
   const sourceRef = bacnetSourceRef(deviceInstance, objectType, instance);
-  return {
+  const num = (v) => (v != null && v !== "" && Number.isFinite(Number(v)) ? Number(v) : null);
+  const precision = config.precision != null && config.precision !== "" && Number.isInteger(Number(config.precision))
+    ? Math.max(0, Math.min(10, Number(config.precision))) : null;
+  const min = num(config.min);
+  const max = num(config.max);
+  return compactObject({
     type: "point",
-    name,
+    name: displayName,
+    bacnetName,
     siteId,
     buildingId,
     floorId,
@@ -258,14 +282,107 @@ export function pointEntityFromBacnet({ siteId, buildingId, floorId, equipId, de
       mac: device.mac ?? null,
       deviceInstance,
     }),
-    unit: unitProp && !unitProp.error ? unitProp.display : object.unit,
+    unit,
+    precision,
+    min,
+    max,
+    historize: config.historize ? true : null,
     tags: {
       point: true,
       bacnet: true,
       cur: objectType === 0 || objectType === 2 || objectType === 13,
       writable: objectType === 1 || objectType === 2 || objectType === 5 || objectType === 14 || objectType === 19,
     },
-  };
+  });
+}
+
+// The codec renders a units property as "symbol (rawEnum)" (e.g. "°F (66)") for
+// debugging in the object browser. In the building model we want just the
+// symbol, so strip a trailing " (NN)". Passes through bare values and blanks.
+export function bacnetUnitSymbol(raw) {
+  if (raw == null) return raw;
+  return String(raw).replace(/\s*\(\d+\)\s*$/, "").trim();
+}
+
+// Apply a point's configured decimal precision to a value for display only
+// (storage/historian stays raw). Non-numeric or unset precision passes through.
+export function formatModeledValue(point, raw) {
+  const precision = point && Number.isInteger(point.precision) ? point.precision : null;
+  if (precision == null || raw == null) return raw;
+  const s = String(raw).trim();
+  if (s === "" || !/^[+-]?\d*\.?\d+$/.test(s)) return raw;
+  const n = Number(s);
+  return Number.isFinite(n) ? n.toFixed(Math.max(0, Math.min(10, precision))) : raw;
+}
+
+// One-time model cleanup: a BACnet object belongs to its controller, but older
+// imports parented points to name-inferred floor-level equip shells (siblings of
+// the device). Re-parent every BACnet point onto its device equipment (creating
+// the device equip if it's missing) and remove the now-empty inferred shells.
+// Returns { reparented, removed }. Operates on an inventory instance.
+export function bwRegroupPointsUnderDevices(inventory) {
+  if (!inventory) return { reparented: 0, removed: 0 };
+  const deviceEquipByInstance = new Map();
+  for (const e of inventory.listEntities({ type: "equip" })) {
+    const inst = Number(e.deviceInstance);
+    if (Number.isFinite(inst) && !deviceEquipByInstance.has(inst)) deviceEquipByInstance.set(inst, e);
+  }
+  let reparented = 0;
+  let removedDeviceObjects = 0;
+  const orphanedEquipIds = new Set();
+  for (const p of inventory.listEntities({ type: "point" })) {
+    const inst = Number(p.deviceInstance);
+    if (!Number.isFinite(inst)) continue; // manual / non-BACnet points stay put
+    // The device object (object-type 8) duplicates the device equipment; drop it.
+    if (Number(p.objectType) === 8) {
+      if (p.equipId) orphanedEquipIds.add(p.equipId);
+      inventory.removeEntity(p.id);
+      removedDeviceObjects++;
+      continue;
+    }
+    let devEquip = deviceEquipByInstance.get(inst);
+    if (!devEquip) {
+      devEquip = inventory.upsertEntity(compactObject({
+        type: "equip",
+        siteId: p.siteId,
+        buildingId: p.buildingId,
+        floorId: p.floorId,
+        parentId: p.floorId,
+        name: `Device ${inst}`,
+        deviceInstance: inst,
+        deviceRef: p.deviceRef || { deviceInstance: inst },
+        address: p.deviceRef?.address || "",
+        network: p.deviceRef?.network ?? null,
+        mac: p.deviceRef?.mac ?? null,
+        tags: { equip: true, device: true, bacnet: true },
+      }));
+      deviceEquipByInstance.set(inst, devEquip);
+    }
+    if (devEquip.id && p.equipId !== devEquip.id) {
+      if (p.equipId) orphanedEquipIds.add(p.equipId);
+      inventory.upsertEntity({
+        ...p,
+        equipId: devEquip.id,
+        siteId: devEquip.siteId,
+        buildingId: devEquip.buildingId,
+        floorId: devEquip.floorId,
+      });
+      reparented++;
+    }
+  }
+  // Remove only the shells we just emptied (never device equipment, and never a
+  // user equip that was already empty before this pass).
+  let removed = 0;
+  for (const id of orphanedEquipIds) {
+    const e = inventory.getEntity(id);
+    if (!e || e.type !== "equip") continue;
+    if (e.deviceInstance != null || e.tags?.device) continue;
+    if (inventory.listEntities({ type: "point", equipId: id }).length === 0) {
+      inventory.removeEntity(id);
+      removed++;
+    }
+  }
+  return { reparented, removed, removedDeviceObjects };
 }
 
 export function historianPointFromEntity(point, { site, building, floor, equip } = {}) {
@@ -339,8 +456,11 @@ export function bwModelObjectsBatch({ siteId, buildingId, floorId, device, items
     floorId,
     equipId: lookup(item.equipName),
     device,
-    object: { ...item.object, name: item.pointName || item.object?.name },
+    // Keep the object's own name as bacnetName; the display name comes from the
+    // plan's pointName (or a per-row override in item.config).
+    object: { ...item.object, bacnetName: item.object?.name },
     props: item.props || [],
+    config: { displayName: item.pointName, ...(item.config || {}) },
   }));
 }
 
@@ -511,6 +631,63 @@ export function parsePriorityArray(values) {
   }
   const activeSlot = slots.find((s) => s.active) || null;
   return { slots, activeLevel: activeSlot ? activeSlot.level : null, activeValue: activeSlot ? activeSlot.value : null };
+}
+
+/** BACnet property id buckets for grouped object inspection. */
+const BW_PROP_GROUP_DEFS = [
+  { key: "identity", label: "Identity", ids: new Set([77, 79, 28, 120, 121, 70]) },
+  { key: "value", label: "Value", ids: new Set([85, 87, 104, 4, 46, 74]) },
+  { key: "status", label: "Status", ids: new Set([111, 36, 103, 81, 112]) },
+  { key: "limits", label: "Limits", ids: new Set([65, 69, 59, 45, 25]) },
+  { key: "alarming", label: "Alarming / COV", ids: new Set([22, 35, 72, 17]) },
+  { key: "device", label: "Device", ids: new Set([44, 12, 98, 139, 107, 62, 58, 155, 11, 73]) },
+];
+
+/** Turn a BACnet kebab property name into a readable label. */
+export function humanizePropName(name) {
+  if (!name || typeof name !== "string") return "Property";
+  if (name.startsWith("property-")) return `Property ${name.slice("property-".length)}`;
+  return name.split("-").map((w) => (w ? w.charAt(0).toUpperCase() + w.slice(1) : "")).join(" ");
+}
+
+function bwPropRowFromEntry(entry) {
+  const display = entry?.display ?? "";
+  const hasValue = display !== "" || (Array.isArray(entry?.values) && entry.values.length);
+  if (!hasValue && !entry?.error) return null;
+  return {
+    id: entry.id,
+    label: humanizePropName(entry.name),
+    display: display || "—",
+    raw: entry.name || "",
+    error: entry.error || null,
+  };
+}
+
+/** Group a readPoint property list into labeled sections for the Properties pane. */
+export function groupObjectProperties(props) {
+  if (!Array.isArray(props) || !props.length) return [];
+  const assigned = new Set();
+  const groups = [];
+  for (const def of BW_PROP_GROUP_DEFS) {
+    const rows = [];
+    for (const p of props) {
+      if (p.id === 8 || !def.ids.has(p.id)) continue;
+      const row = bwPropRowFromEntry(p);
+      if (!row) continue;
+      assigned.add(p.id);
+      rows.push(row);
+    }
+    if (rows.length) groups.push({ key: def.key, label: def.label, rows });
+  }
+  const other = [];
+  for (const p of props) {
+    if (p.id === 8 || assigned.has(p.id)) continue;
+    const row = bwPropRowFromEntry(p);
+    if (!row) continue;
+    other.push(row);
+  }
+  if (other.length) groups.push({ key: "other", label: "Other", rows: other });
+  return groups;
 }
 
 /** Decode a BACnet status-flags bit-string into named flags. Accepts the {kind,bits} value, a raw bits string, or a property entry. */

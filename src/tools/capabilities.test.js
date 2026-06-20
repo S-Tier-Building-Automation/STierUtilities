@@ -139,6 +139,57 @@ test("bacnet.read exposes advanced service operations through bacnet-core", asyn
   assert.deepEqual(invoke.calls.at(-1), { cmd: "bacnet_unsubscribe_cov", args: { device, objectType: 0, instance: 1, processId: 42 } });
 });
 
+test("bacnet.read exposes alarm read/acknowledge through bacnet-core", async () => {
+  const invoke = mockInvoke({
+    bacnet_get_alarms: [{ objectType: 0, instance: 4, eventState: "offnormal", acknowledged: false }],
+    bacnet_acknowledge_alarm: { ok: true },
+  });
+  const kernel = await bootKernel(invoke);
+  const bacnet = kernel._peek("bacnet.read.v1").impl;
+  const device = { address: "192.168.1.10:47808", deviceInstance: 1001 };
+
+  const alarms = await bacnet.getAlarms(device);
+  assert.equal(alarms[0].eventState, "offnormal");
+  assert.deepEqual(invoke.calls.at(-1), { cmd: "bacnet_get_alarms", args: { device } });
+
+  await bacnet.acknowledgeAlarm({ device, objectType: 0, instance: 4 });
+  assert.deepEqual(invoke.calls.at(-1), {
+    cmd: "bacnet_acknowledge_alarm",
+    args: { device, objectType: 0, instance: 4 },
+  });
+});
+
+test("bacnet.read drives BBMD foreign-device register/status/unregister", async () => {
+  const invoke = mockInvoke({
+    bacnet_register_foreign_device: { bbmd: "10.0.0.1:47808", ttlSeconds: 90 },
+    bacnet_foreign_device_status: { bbmd: "10.0.0.1:47808", ttlSeconds: 90 },
+    bacnet_unregister_foreign_device: { ok: true },
+  });
+  const kernel = await bootKernel(invoke);
+  const bacnet = kernel._peek("bacnet.read.v1").impl;
+
+  const reg = await bacnet.registerForeignDevice({ bbmd: "10.0.0.1:47808", ttlSeconds: 90 });
+  assert.equal(reg.bbmd, "10.0.0.1:47808");
+  assert.deepEqual(invoke.calls.at(-1), {
+    cmd: "bacnet_register_foreign_device",
+    args: { bbmd: "10.0.0.1:47808", ttlSeconds: 90 },
+  });
+
+  // The default-TTL form passes ttlSeconds: null so the backend picks its default.
+  await bacnet.registerForeignDevice({ bbmd: "10.0.0.2:47808" });
+  assert.deepEqual(invoke.calls.at(-1), {
+    cmd: "bacnet_register_foreign_device",
+    args: { bbmd: "10.0.0.2:47808", ttlSeconds: null },
+  });
+
+  const status = await bacnet.foreignDeviceStatus();
+  assert.equal(status.bbmd, "10.0.0.1:47808");
+  assert.equal(invoke.calls.at(-1).cmd, "bacnet_foreign_device_status");
+
+  await bacnet.unregisterForeignDevice();
+  assert.equal(invoke.calls.at(-1).cmd, "bacnet_unregister_foreign_device");
+});
+
 test("observability provides the timeseries and scheduler capabilities", async () => {
   const kernel = await bootKernel(mockInvoke());
   assert.ok(kernel._peek("timeseries.v1"));

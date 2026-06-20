@@ -159,7 +159,7 @@ export const TOOL_MANIFESTS = [
       tagline: "Discover BACnet devices, import into the building model, browse objects, COV, and alarms.",
       description:
         "The SI workflow for BACnet protocol work: subnet discovery and drift tracking, " +
-        "device inbox and import plan, object browse with reads/writes/COV/trends, and alarm " +
+        "device discovery with direct import into the building model, object browse with reads/writes/COV/trends, and alarm " +
         "acknowledgement. Imports land in the shared inventory for Building Workspace to " +
         "model, historize, and commission. Uses the headless bacnet-core service on an " +
         "ephemeral UDP port so it coexists with Niagara or any other BACnet stack.",

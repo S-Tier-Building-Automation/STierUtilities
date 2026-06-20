@@ -107,6 +107,8 @@ export function createStartupWarmup({ invoke, networkManager, observability, get
  * @param {(view: string) => void} deps.setView
  * @param {(on: boolean) => void} deps.setSidebarCollapsed
  * @param {() => void} deps.applySidebarCollapsed
+ * @param {() => void} deps.saveUserState
+ * @param {(opts: object) => void} deps.initSidebarSplitter
  * @param {() => Promise<void>} deps.authBootstrapUserState
  * @param {object} deps.accountMenu — { mount() }
  * @param {() => void} deps.initWindowControls
@@ -132,6 +134,8 @@ export async function runBootstrap({
   setView,
   setSidebarCollapsed,
   applySidebarCollapsed,
+  saveUserState,
+  initSidebarSplitter,
   authBootstrapUserState,
   accountMenu,
   initWindowControls,
@@ -145,6 +149,7 @@ export async function runBootstrap({
     .getElementById("sidebar-toggle")
     ?.addEventListener("click", () => setSidebarCollapsed(!userState.sidebarCollapsed));
   applySidebarCollapsed();
+  initSidebarSplitter({ userState, saveUserState, applySidebarCollapsed });
 
   accountMenu.mount();
   initWindowControls();

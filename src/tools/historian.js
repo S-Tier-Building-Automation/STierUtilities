@@ -52,7 +52,7 @@ function compactTags(tags) {
 
 const JOB_ID = "bacnet-historian";
 
-export function createHistorian({ bacnet, scheduler, timeseries, netscan, now = () => Date.now() }) {
+export function createHistorian({ bacnet, scheduler, timeseries, netscan, now = () => Date.now(), maxSamples = 1000 }) {
   if (!bacnet) throw new Error("historian requires the bacnet.read capability");
   if (!scheduler) throw new Error("historian requires the scheduler capability");
 
@@ -83,11 +83,18 @@ export function createHistorian({ bacnet, scheduler, timeseries, netscan, now = 
     }
   }
 
+  function pushSample(p, value, ts) {
+    if (!p.samples) p.samples = [];
+    p.samples.push({ ts, value });
+    if (p.samples.length > maxSamples) p.samples.splice(0, p.samples.length - maxSamples);
+  }
+
   function writePointSample(p, value, ts) {
     p.reads++;
     p.lastError = null;
     if (value == null) return false;
     p.lastValue = value;
+    pushSample(p, value, ts);
     if (!timeseries) return false;
     timeseries.write({
       measurement: "bacnet_point",
@@ -169,12 +176,12 @@ export function createHistorian({ bacnet, scheduler, timeseries, netscan, now = 
       const existing = points.find((p) => keyOf(p) === keyOf(point));
       if (existing) {
         // Merge configuration fields only; preserve accumulated read state.
-        const { lastValue, lastError, reads } = existing;
-        Object.assign(existing, point, { lastValue, lastError, reads });
+        const { lastValue, lastError, reads, samples } = existing;
+        Object.assign(existing, point, { lastValue, lastError, reads, samples: samples || [] });
         if (covActive) void subscribePointCov(existing).catch((err) => { existing.lastError = String(err); });
         return existing;
       }
-      const rec = { ...point, lastValue: null, lastError: null, reads: 0 };
+      const rec = { ...point, lastValue: null, lastError: null, reads: 0, samples: [] };
       points.push(rec);
       if (covActive) void subscribePointCov(rec).catch((err) => { rec.lastError = String(err); });
       return rec;
@@ -201,7 +208,14 @@ export function createHistorian({ bacnet, scheduler, timeseries, netscan, now = 
     },
 
     points() {
-      return points.map((p) => ({ ...p }));
+      return points.map((p) => ({ ...p, samples: p.samples ? [...p.samples] : [] }));
+    },
+
+    /** In-memory trend samples for a configured point (poll + COV). */
+    history(point) {
+      const p = findPoint(keyOf(point));
+      if (!p || !p.samples?.length) return [];
+      return p.samples.map((s) => ({ ...s }));
     },
 
     /** Apply a bacnet:cov event payload; returns true when a configured point was updated. */
