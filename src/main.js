@@ -6,12 +6,12 @@ import { initWindowControls, createAccountMenu, initSidebarSplitter } from "./ui
 const APP_VERSION = "0.6.0";
 const REPO_URL = "https://github.com/S-Tier-Building-Automation/STierUtilities";
 
-const appUi = { renderAll() {}, renderScoped() {} };
 /** @type {ReturnType<import("./platform/services/timeseries.js").createTimeseries>|null} */
 let telemetry = null;
 
+// renderAll/renderScoped are provided by the render bridge (configured inside
+// createApplication), so there's no longer a late-bound appUi stub to patch.
 const app = createApplication({
-  appUi,
   invoke,
   listen,
   convertFileSrc,
@@ -19,15 +19,12 @@ const app = createApplication({
   getTelemetry: () => telemetry,
 });
 
-appUi.renderAll = app.renderAll;
-appUi.renderScoped = app.renderScoped;
-
 const { hydrateFromStartupWarmup } = createStartupWarmup({
   invoke,
   networkManager: app.networkManager,
   observability: app.observability,
   getPack: app.getPack,
-  renderAll: () => appUi.renderAll(),
+  renderAll: app.renderAll,
 });
 
 registerPagehideHandler({
@@ -56,7 +53,7 @@ installBootstrap({
   setPackFlushTimer: app.setPackFlushTimer,
   tools: app.tools,
   logTo: app.logTo,
-  renderAll: () => appUi.renderAll(),
+  renderAll: app.renderAll,
   checkForUpdates: app.checkForUpdates,
   setView: app.setView,
   setSidebarCollapsed: app.setSidebarCollapsed,

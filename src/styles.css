@@ -79,6 +79,33 @@
   background: var(--bg);
 }
 
+/* Light theme: override only surface/text/border/shadow tokens so the signal-teal
+   accent, amber override-signal, spacing, radius, and type ramp stay identical
+   across themes (a field instrument keeps one constant signal language). The dark
+   values in :root are the default; [data-theme="light"] flips surfaces. */
+:root[data-theme="light"] {
+  --bg: #eef1f6;
+  --bg-elev: #ffffff;
+  --bg-elev-2: #f4f6fa;
+  --border: #d4dae4;
+  --border-strong: #b3bdcd;
+  --text: #1a2230;
+  --text-dim: #5a6678;
+  --info: #0284c7;
+  --danger: #dc2626;
+  --accent: #0d9488;          /* slightly deeper teal for contrast on light */
+  --accent-2: #14b8a6;
+  --accent-soft: rgba(13, 148, 136, 0.12);
+  --signal-amber: #d97706;
+  --signal-amber-soft: rgba(217, 119, 6, 0.12);
+  --ok: #059669;
+  --warn: #d97706;
+  --error: #dc2626;
+  --shadow: 0 6px 18px rgba(15, 23, 42, 0.12);
+  --shadow-lg: 0 10px 28px rgba(15, 23, 42, 0.18);
+  --glow: 0 0 0 1px rgba(13, 148, 136, 0.40), 0 0 18px rgba(13, 148, 136, 0.12);
+}
+
 * { box-sizing: border-box; }
 html, body { margin: 0; padding: 0; height: 100%; }
 body { min-height: 100vh; min-height: 100dvh; overflow: hidden; line-height: 1.4; }
@@ -900,6 +927,113 @@ a:hover { text-decoration: underline; }
   flex: 1;
   min-width: 0;
   min-height: 0;
+}
+
+/* ContentRoot mount point collapses so the tool-host region is a direct flex
+   child of .content, sitting alongside #view-root (only one is shown at a time). */
+#app-content-root {
+  display: contents;
+}
+
+.tool-host-region,
+.tool-host {
+  display: flex;
+  flex-direction: column;
+  gap: var(--gap);
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* Command palette (Ctrl/Cmd-K) */
+.cmdk-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  justify-content: center;
+  align-items: flex-start;
+  padding-top: 12vh;
+  background: rgba(0, 0, 0, 0.45);
+  backdrop-filter: blur(2px);
+}
+.cmdk-panel {
+  width: 560px;
+  max-width: 92vw;
+  max-height: 70vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow-lg);
+  overflow: hidden;
+}
+.cmdk-input {
+  appearance: none;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  font-family: var(--font-ui);
+  font-size: var(--fs-md);
+  padding: 12px 14px;
+  outline: none;
+}
+.cmdk-input::placeholder { color: var(--text-dim); }
+.cmdk-list { overflow-y: auto; padding: 6px; }
+.cmdk-item {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-5);
+  width: 100%;
+  text-align: left;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  padding: 8px 10px;
+  border-radius: var(--r-md);
+  cursor: pointer;
+}
+.cmdk-item.active {
+  background: var(--accent-soft);
+  border-color: var(--border-strong);
+  box-shadow: var(--glow);
+}
+.cmdk-icon { width: 18px; text-align: center; flex: none; }
+.cmdk-copy { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.cmdk-label { font-size: var(--fs-body); }
+.cmdk-hint {
+  font-size: var(--fs-xs);
+  color: var(--text-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.cmdk-group {
+  flex: none;
+  font-size: var(--fs-label);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-dim);
+}
+.cmdk-empty { padding: 18px 14px; color: var(--text-dim); font-size: var(--fs-sm); text-align: center; }
+.cmdk-footer {
+  display: flex;
+  gap: var(--sp-6);
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  color: var(--text-dim);
+  font-size: var(--fs-label);
+}
+.cmdk-footer kbd {
+  font-family: var(--font-mono);
+  background: var(--bg-elev);
+  border: 1px solid var(--border);
+  border-radius: var(--r-sm);
+  padding: 0 4px;
+  margin-right: 2px;
 }
 
 /* ===== Headers / breadcrumbs ===== */

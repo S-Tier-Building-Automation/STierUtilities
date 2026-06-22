@@ -2,6 +2,17 @@
 
 S-Tier Utilities is a local-first operational app. UI updates should feel stable, fast, and field-friendly. Avoid full app redraws for ordinary actions.
 
+## Architecture (current — Svelte 5 + Vite)
+
+The frontend is **Svelte 5 on Vite**. Two kinds of UI coexist:
+
+- **Svelte chrome + tools (preferred).** The shell chrome (`Sidebar`, `Breadcrumb`, `CommandPalette`, `ContentRoot` in `src/ui/components/`) and the migrated tool pages (`src/tools/ui/*.svelte`) are Svelte components. State lives in `svelte/store`s (`src/platform/store.js`, `src/platform/router.js`); components read them and update surgically — **no `renderAll()`**. The building model has no change event, so tools that read inventory must track the **`inventoryVersion`** store inside their `$derived` (e.g. `$derived.by(() => { $inventoryVersion; return getInventory().listEntities(...); })`) — never key a `$derived` off the identity-stable inventory instance, or it won't refresh on cross-tool writes.
+- **Legacy imperative tools on the keep-alive bridge.** Large/critical tools (`bacnet-manager`, `building-workspace`, `networkmanager`, `bacnet-historian`, `observability`, `device-graphics`, `graphics-builder`) remain imperative `el()`-built pages. `ContentRoot.svelte` keeps each one's DOM **alive in a pool** across navigation (no rebuild, so scroll/focus/in-flight state survive). The legacy `renderAll()`/`renderScoped()` API still works for them via the compatibility layer in `src/platform/render-bridge.js` + scoped-renderer registry (`src/platform/scope-registry.js`). This is a permanent, supported end-state — the bridge is not scaffolding to delete.
+
+**Adding a tool:** prefer a Svelte component. Expose `{ renderStatusPill, component, componentProps }` from `TOOL_RENDERERS` in `app-tools.js` (the shell's `plugin-page.js` mounts `component` once into the keep-alive host and owns the header/title/status-pill/star/breadcrumb — the component renders only the body). `renderStatusPill` MUST stay a plain **sync** function (read by the shell header AND `getSystemStatus`); export it from the component's `<script module>` and pass deps as args. Use `onMount` for Tauri `listen()` subscriptions (with teardown) and one-shot `takeAppIntent` reads. See `Notes.svelte` as the reference.
+
+The scope rules below apply to the **legacy bridged tools**; Svelte tools rely on reactivity instead.
+
 ## Render Scope Rule
 
 Use the smallest render scope that reflects the state change:

@@ -5,17 +5,23 @@
   "type": "module",
   "scripts": {
     "tauri": "tauri",
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview",
     "test": "node --test \"src/**/*.test.js\"",
     "smoke:observability": "powershell -ExecutionPolicy Bypass -File scripts/observability-smoke.ps1",
     "docs:gen": "node scripts/gen-utilities-docs.mjs"
   },
   "devDependencies": {
     "@hypothesi/tauri-mcp-server": "^0.11.2",
-    "@tauri-apps/cli": "^2"
+    "@sveltejs/vite-plugin-svelte": "^7.1.2",
+    "@tauri-apps/cli": "^2",
+    "vite": "^8.0.16"
   },
   "dependencies": {
     "@tauri-apps/plugin-dialog": "^2",
     "@tauri-apps/plugin-process": "^2",
-    "@tauri-apps/plugin-updater": "^2"
+    "@tauri-apps/plugin-updater": "^2",
+    "svelte": "^5.56.3"
   }
 }

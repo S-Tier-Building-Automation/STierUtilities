@@ -1,6 +1,8 @@
 // Building inventory / lightweight Haystack model service.
 // Local-first, pure, and storage-injected so tests can run without Tauri.
 
+import { bumpInventoryVersion } from "../platform/store.js";
+
 const ENTITY_TYPES = new Set(["site", "building", "floor", "equip", "point", "sourceRef", "tag", "template", "commissioningRun", "ruleRun", "note"]);
 const BACNET_REF_RE = /^bacnet:(\d+):(\d+):(\d+)$/;
 const NIAGARA_REF_RE = /^niagara:([^:]+):(.+)$/;
@@ -136,6 +138,7 @@ export function createInventory({ storage = createMemoryInventoryStorage(), now 
   function persist() {
     state.entities = [...ids.values()].map(clone);
     storage.save(state);
+    bumpInventoryVersion(); // notify store-backed Svelte tools (no native change event)
   }
 
   function loadFromStorage() {

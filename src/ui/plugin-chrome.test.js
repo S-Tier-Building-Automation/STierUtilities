@@ -9,7 +9,7 @@ const UI_ROOT = join(fileURLToPath(new URL(".", import.meta.url)), "..", "tools"
 
 function toolUiSources() {
   return readdirSync(UI_ROOT)
-    .filter((name) => name.endsWith(".js") && !name.endsWith(".test.js"))
+    .filter((name) => (name.endsWith(".js") || name.endsWith(".svelte")) && !name.endsWith(".test.js"))
     .map((name) => ({
       file: join(UI_ROOT, name),
       rel: relative(join(UI_ROOT, "..", ".."), join(UI_ROOT, name)).replace(/\\/g, "/"),

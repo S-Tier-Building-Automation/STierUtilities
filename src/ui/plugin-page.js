@@ -4,6 +4,7 @@
 // Tools must not re-render those in renderPage(); use headerAddonFor for context only.
 // See docs/rendering-standards.md § Tool page chrome ownership.
 
+import { mount } from "svelte";
 import { openModal } from "./modal.js";
 import { openExternal } from "./dom.js";
 
@@ -70,14 +71,10 @@ export function createPluginPageUi({
     return { renderStatusPill: () => mcpStatusPill(m), renderPage: () => renderMcpToolPage(m) };
   }
 
-  function renderPage(id) {
-    const root = document.getElementById("view-root");
-    root.replaceChildren();
-    const tool = toolById(id);
-    if (!tool) {
-      root.appendChild(el("p", { class: "empty-state" }, "Unknown plugin."));
-      return;
-    }
+  // Build the shell-owned chrome (back link + plugin header with title, status
+  // pill, favorite star) into `root`. Returns nothing; the body is appended by
+  // the caller. Tools must NOT render this themselves.
+  function buildChrome(root, tool) {
     const status = tool.renderStatusPill ? tool.renderStatusPill() : null;
     const fav = isFavorite(tool.id);
     const headerAddon = headerAddonFor(tool);
@@ -117,7 +114,43 @@ export function createPluginPageUi({
         }, fav ? "★" : "☆"),
       ),
     ));
+  }
 
+  /**
+   * Render a tool page into `container` (the ContentRoot keep-alive host; falls
+   * back to #view-root). Two kinds of tool:
+   *  - Svelte tool (tool.component): the body is a Svelte component mounted ONCE
+   *    and left reactive. On a self-refresh (renderAll while active) we rebuild
+   *    only the chrome and re-attach the live body, so the component instance —
+   *    and its $state — survive while the status pill/star stay current.
+   *  - Legacy tool (tool.renderPage): body rebuilt imperatively each call.
+   */
+  function renderPage(id, container) {
+    const root = container || document.getElementById("view-root");
+    const tool = toolById(id);
+    if (!tool) {
+      root.replaceChildren(el("p", { class: "empty-state" }, "Unknown plugin."));
+      return;
+    }
+
+    if (tool.component) {
+      const liveBody = root.__stMountedId === id ? root.querySelector(":scope > .plugin-body") : null;
+      root.replaceChildren();
+      buildChrome(root, tool);
+      if (liveBody) {
+        root.appendChild(liveBody); // re-attach the already-mounted Svelte body
+      } else {
+        const body = el("div", { class: "plugin-body" });
+        root.appendChild(body);
+        const props = typeof tool.componentProps === "function" ? tool.componentProps() : (tool.componentProps || {});
+        mount(tool.component, { target: body, props });
+        root.__stMountedId = id;
+      }
+      return;
+    }
+
+    root.replaceChildren();
+    buildChrome(root, tool);
     if (tool.renderPage) root.appendChild(tool.renderPage(tool));
   }
 

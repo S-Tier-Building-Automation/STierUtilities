@@ -8,7 +8,6 @@ import { createTimeseries } from "./services/timeseries.js";
 import { createScheduler } from "./services/scheduler.js";
 import { createPackController } from "./services/pack-controller.js";
 import { initHeaderSearch } from "../ui/header-search.js";
-import { mountSidebarBrand } from "../ui/brand.js";
 
 /**
  * @param {object} deps
@@ -150,10 +149,7 @@ export async function runBootstrap({
   isHidden = () => false,
   pluginView = (id) => `plugin:${id}`,
 }) {
-  for (const btn of document.querySelectorAll(".sidebar-nav-item")) {
-    btn.addEventListener("click", () => setView(btn.dataset.view));
-  }
-
+  // Sidebar nav + brand are owned by the Svelte Sidebar (mounted in app-tools.js).
   initHeaderSearch({ getTools, isHidden, setView, pluginView });
 
   document
@@ -163,7 +159,6 @@ export async function runBootstrap({
   initSidebarSplitter({ userState, saveUserState, applySidebarCollapsed });
 
   accountMenu.mount();
-  mountSidebarBrand();
   initWindowControls();
 
   await authBootstrapUserState();
@@ -177,11 +172,8 @@ export async function runBootstrap({
   }
   applySidebarCollapsed();
 
-  try {
-    await tools.clipboardTyper.hydrate(await invoke("clipboardtyper_get_state"));
-  } catch (err) {
-    logTo("clipboardtyper", `Could not read state: ${err}`, "error");
-  }
+  // ClipboardTyper is now a Svelte component that hydrates + binds its own
+  // backend events in onMount; no bootstrap hydrate/bindEvents needed.
 
   try {
     const telemetry = createTimeseries();
