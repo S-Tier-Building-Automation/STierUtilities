@@ -1,6 +1,10 @@
 // BACnet/IP is plain UDP — portable, so not Windows-gated like the others.
 mod bacnet;
 mod bacnet_codec;
+// BACnet MS/TP frame codec (serial trunk framing). Pure, portable.
+mod bacnet_mstp;
+// Modbus/TCP driver — plain TCP, portable like bacnet.
+mod modbus;
 
 // Platform observability: InfluxDB line-protocol encoding (portable, pure) and
 // the Observability Pack supervisor (config gen, ports, line-protocol writes).
@@ -11,6 +15,14 @@ mod timeseries;
 mod auth;
 #[cfg(windows)]
 mod clipboardtyper;
+// Embedded SQLite store for the controller inventory + BACnet discovery cache.
+// Scoped per org/user from the active auth session, so Windows-gated like auth.
+#[cfg(windows)]
+mod inventory_db;
+// Supabase Cloud sync engine scaffold for the inventory store (push/pull over a
+// transport trait, last-write-wins, keyring-stored session token).
+#[cfg(windows)]
+mod inventory_sync;
 #[cfg(windows)]
 mod heicmov;
 #[cfg(windows)]
@@ -86,6 +98,14 @@ pub fn run() {
         auth::auth_set_sync_folder,
         auth::auth_clear_sync_folder,
         auth::auth_sync_now,
+        inventory_db::inventory_load_snapshot,
+        inventory_db::inventory_save_snapshot,
+        inventory_db::bacnet_cache_load,
+        inventory_db::bacnet_cache_save,
+        inventory_sync::inventory_sync_set_session,
+        inventory_sync::inventory_sync_clear_session,
+        inventory_sync::inventory_sync_status,
+        inventory_sync::inventory_sync_now,
         clipboardtyper::clipboardtyper_start,
         clipboardtyper::clipboardtyper_stop,
         clipboardtyper::clipboardtyper_set_armed,
@@ -136,6 +156,11 @@ pub fn run() {
         bacnet::bacnet_foreign_device_status,
         bacnet::bacnet_get_alarms,
         bacnet::bacnet_acknowledge_alarm,
+        bacnet::bacnet_read_schedule,
+        bacnet::bacnet_write_schedule,
+        modbus::modbus_read_registers,
+        modbus::modbus_write_register,
+        modbus::modbus_write_registers,
     ]);
 
     #[cfg(windows)]

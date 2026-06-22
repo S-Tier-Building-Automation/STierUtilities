@@ -8,6 +8,7 @@ import { createTimeseries } from "../platform/services/timeseries.js";
 import { createScheduler } from "../platform/services/scheduler.js";
 import { createHistorian } from "./historian.js";
 import { createBrowserInventoryStorage, createInventory } from "./inventory.js";
+import { createModbusService } from "./modbus-service.js";
 import { createRulesService } from "./rules-service.js";
 import { createGraphicsService } from "./graphics-service.js";
 import { createAlertsService } from "./alerts-service.js";
@@ -231,11 +232,24 @@ export function buildFactories(invoke, options = {}) {
       /** Acknowledge an alarm on an event-initiating object (a write). */
       acknowledgeAlarm: ({ device, objectType, instance }) =>
         invoke("bacnet_acknowledge_alarm", { device, objectType, instance }),
+      /** Read a Schedule object's properties (weekly-schedule, present-value, ...). */
+      readSchedule: ({ device, instance }) =>
+        invoke("bacnet_read_schedule", { device, instance }),
+      /** Command a Schedule object's present-value (manual override at a priority). */
+      writeSchedule: ({ device, instance, value, priority = null }) =>
+        invoke("bacnet_write_schedule", { device, instance, value, priority }),
       /** Whether discovery-target suggestions are available (netscan present). */
       canSuggestTargets: () => netscan != null,
       /** Suggest live hosts on a subnet as discovery targets (requires netscan). */
       suggestTargets: netscan ? (cidr) => netscan.scan(cidr) : null,
     });
+  });
+
+  // modbus-core is the headless Modbus/TCP driver. It provides the reusable
+  // modbus.read capability and normalizes register maps into the same point
+  // entities BACnet objects produce.
+  factories.set("modbus-core", async (host) => {
+    host.provide("modbus.read", "1.0", createModbusService({ invoke }));
   });
 
   // clipboardtyper declares no provided capabilities — nothing to register.

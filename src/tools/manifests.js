@@ -139,6 +139,30 @@ export const TOOL_MANIFESTS = [
     },
   },
   {
+    // The headless Modbus/TCP driver service. Second protocol after BACnet,
+    // proving the building model is protocol-agnostic: Modbus registers normalize
+    // into the same point entities. Runs headless — no page of its own.
+    id: "modbus-core",
+    name: "Modbus Service",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "service",
+    provides: [{ capability: "modbus.read", version: "1.0" }],
+    requires: [],
+    permissions: ["network.tcp"],
+    ui: {
+      emoji: "🔌",
+      tagline: "Headless Modbus/TCP read+write service — registers normalized into the building model.",
+      description:
+        "The reusable Modbus/TCP driver: read and write holding/input registers and " +
+        "decode 16/32-bit integer and float types. Register maps normalize into the same " +
+        "tagged point entities as BACnet objects, so the Historian, Graphics, and Analytics " +
+        "tools treat Modbus and BACnet points identically. Runs headless — it has no page of its own.",
+      repo: REPO,
+    },
+  },
+  {
     // BACnet Manager — discovery, inbox/import, browse, COV, alarms, and BBMD.
     // Replaces the hidden Advanced BACnet Inspector; Building Workspace stays model-only.
     id: "bacnet-manager",
@@ -403,6 +427,95 @@ export const TOOL_MANIFESTS = [
         "callouts, status chips, and monitoring parameters bound to modeled points. Poll live " +
         "BACnet values, and bind or rebind points to graphic roles. Built on the shared Graphics " +
         "engine and building model.",
+      repo: REPO,
+    },
+  },
+  {
+    id: "graphics-builder",
+    name: "Graphics Builder",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "app",
+    provides: [],
+    requires: [
+      { capability: "inventory", version: "^1.0" },
+      { capability: "bacnet.read", version: "^1.0", optional: true },
+    ],
+    permissions: ["inventory.read", "inventory.write"],
+    ui: {
+      emoji: "🎨",
+      tagline: "Draw custom per-job graphics and bind shapes to modeled points.",
+      description:
+        "A drag-and-drop SVG canvas for building custom equipment and floor graphics. Draw " +
+        "rectangles, ellipses, lines, text, and live value fields, then bind value fields to " +
+        "modeled points and refresh live BACnet values. Graphics persist in the shared model and " +
+        "sync with the rest of the inventory.",
+      repo: REPO,
+    },
+  },
+  {
+    id: "schedules",
+    name: "Schedules",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "app",
+    provides: [],
+    requires: [
+      { capability: "bacnet.read", version: "^1.0" },
+      { capability: "inventory", version: "^1.0", optional: true },
+    ],
+    permissions: ["inventory.read", "inventory.write"],
+    ui: {
+      emoji: "🗓️",
+      tagline: "Read BACnet schedules, plan weekly setpoints, and command overrides.",
+      description:
+        "Read a BACnet Schedule object's properties, plan a weekly schedule with conflict " +
+        "detection and value-at-time preview, and command the schedule's present-value as a " +
+        "manual override at a chosen priority. A commissioning surface that rides on the existing " +
+        "BACnet service.",
+      repo: REPO,
+    },
+  },
+  {
+    id: "notes",
+    name: "Notes",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "app",
+    provides: [],
+    requires: [{ capability: "inventory", version: "^1.0" }],
+    permissions: ["inventory.read", "inventory.write"],
+    ui: {
+      emoji: "📝",
+      tagline: "Collaborative notes and tasks tied to floors and equipment.",
+      description:
+        "Document issues and tasks against specific sites, floors, or equipment, assign them to " +
+        "people, and resolve them. Notes are part of the shared building model, so they sync " +
+        "across devices and users with the rest of the inventory.",
+      repo: REPO,
+    },
+  },
+  {
+    id: "design-system",
+    name: "Design System",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "app",
+    provides: [],
+    requires: [],
+    permissions: [],
+    ui: {
+      emoji: "🎚️",
+      tagline: "The S-Tier brand and design-system reference.",
+      description:
+        "A living reference for the control-room brand: the logo mark and its usage, the color " +
+        "tokens and their intent, the Archivo / IBM Plex type pairing, the spacing and radius " +
+        "scales, the component gallery (buttons, pills, inputs, cards), motion principles, and " +
+        "brand voice. Use it as a styling reference and a visual-QA surface.",
       repo: REPO,
     },
   },

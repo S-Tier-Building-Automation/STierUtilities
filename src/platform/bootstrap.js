@@ -8,6 +8,7 @@ import { createTimeseries } from "./services/timeseries.js";
 import { createScheduler } from "./services/scheduler.js";
 import { createPackController } from "./services/pack-controller.js";
 import { initHeaderSearch } from "../ui/header-search.js";
+import { mountSidebarBrand } from "../ui/brand.js";
 
 /**
  * @param {object} deps
@@ -141,6 +142,7 @@ export async function runBootstrap({
   saveUserState,
   initSidebarSplitter,
   authBootstrapUserState,
+  hydrateInventoryStore,
   accountMenu,
   initWindowControls,
   hydrateFromStartupWarmup,
@@ -161,9 +163,18 @@ export async function runBootstrap({
   initSidebarSplitter({ userState, saveUserState, applySidebarCollapsed });
 
   accountMenu.mount();
+  mountSidebarBrand();
   initWindowControls();
 
   await authBootstrapUserState();
+  // Hydrate the SQLite-backed inventory store for the active scope before the
+  // platform builds the inventory service (its load() is synchronous), so the
+  // first load serves the database snapshot rather than the legacy blob.
+  try {
+    await hydrateInventoryStore?.();
+  } catch (err) {
+    console.warn("[bootstrap] inventory store hydration failed:", err);
+  }
   applySidebarCollapsed();
 
   try {

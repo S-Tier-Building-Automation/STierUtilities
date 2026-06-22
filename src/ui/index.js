@@ -1,6 +1,7 @@
 // Shared UI modules — barrel re-exports for the app shell and tool pages.
 
-export { el, openExternal } from "./dom.js";
+export { el, svgEl, openExternal } from "./dom.js";
+export { brandMark, mountSidebarBrand, BRAND } from "./brand.js";
 export { pickHeicMovFiles, pickFolder } from "./dialogs.js";
 export { initWindowControls } from "./shell.js";
 export { openModal, closeModal, confirmAction } from "./modal.js";

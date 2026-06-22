@@ -118,10 +118,33 @@ export const CAPABILITY_DOCS = {
         desc: "List a device's active/unacknowledged alarms (GetEventInformation, GetAlarmSummary fallback)." },
       { name: "acknowledgeAlarm", sig: "acknowledgeAlarm({ device, objectType, instance })", returns: "Promise<any>",
         desc: "Acknowledge an alarm on an event-initiating object (a write; the UI confirms and audits it)." },
+      { name: "readSchedule", sig: "readSchedule({ device, instance })", returns: "Promise<Property[]>",
+        desc: "Read a Schedule object's properties (weekly-schedule, present-value, effective-period)." },
+      { name: "writeSchedule", sig: "writeSchedule({ device, instance, value, priority? })", returns: "Promise<any>",
+        desc: "Command a Schedule object's present-value (manual override at an optional priority)." },
       { name: "canSuggestTargets", sig: "canSuggestTargets()", returns: "boolean",
         desc: "Whether netscan-backed discovery-target suggestions are available." },
       { name: "suggestTargets", sig: "suggestTargets(cidr)", returns: "Promise<ScanResult> | null",
         desc: "Suggest live hosts on a subnet as discovery targets (delegates to netscan)." },
+    ],
+  },
+
+  "modbus.read": {
+    summary:
+      "The reusable Modbus/TCP contract: read/write holding and input registers " +
+      "and decode integer/float register types. Owned by the headless modbus-core " +
+      "service; register maps normalize into the same point entities as BACnet.",
+    methods: [
+      { name: "readRegisters", sig: "readRegisters({ host, port?, unitId?, kind?, address, count? })", returns: "Promise<RegisterReadResult>",
+        desc: "Read count registers from a unit. kind: holding | input." },
+      { name: "readValue", sig: "readValue({ host, port?, unitId?, kind?, address, dataType?, wordSwap? })", returns: "Promise<number|boolean>",
+        desc: "Read and decode one typed value (uint16/int16/uint32/int32/float32/bool)." },
+      { name: "writeRegister", sig: "writeRegister({ host, port?, unitId?, address, value })", returns: "Promise<void>",
+        desc: "Write a single holding register." },
+      { name: "writeRegisters", sig: "writeRegisters({ host, port?, unitId?, address, values })", returns: "Promise<void>",
+        desc: "Write a block of holding registers." },
+      { name: "pointsFromRegisterMap", sig: "pointsFromRegisterMap({ unitId, registers, siteId?, ... })", returns: "PointDraft[]",
+        desc: "Normalize a register map into point-entity drafts with stable modbus source refs." },
     ],
   },
 

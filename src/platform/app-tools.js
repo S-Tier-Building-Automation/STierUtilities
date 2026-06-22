@@ -2,7 +2,7 @@
 
 import { TOOL_MANIFESTS } from "../tools/manifests.js";
 import { validateManifest } from "./manifest.js";
-import { createUserStateInventoryStorage } from "../tools/inventory.js";
+import { createSqlInventoryStorage } from "./services/inventory-sql-storage.js";
 import { createUserStateManager } from "./user-state.js";
 import {
   el,
@@ -27,6 +27,10 @@ import { createBacnetHistorianUi } from "../tools/ui/bacnethistorian.js";
 import { createDeviceGraphicsUi } from "../tools/ui/devicegraphics.js";
 import { createBuildingAnalyticsUi } from "../tools/ui/buildinganalytics.js";
 import { createAlarmConsoleUi } from "../tools/ui/alarmconsole.js";
+import { createGraphicsBuilderUi } from "../tools/ui/graphicsbuilder.js";
+import { createSchedulesUi } from "../tools/ui/schedules.js";
+import { createNotesUi } from "../tools/ui/notes.js";
+import { createDesignSystemUi } from "../tools/ui/designsystem.js";
 
 /**
  * @param {object} deps
@@ -95,6 +99,16 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     applySidebarCollapsed();
     inventoryInstance()?.reload?.();
     bacnetHistorian?.restore({ replace: true });
+    // The active org/user may have changed; re-hydrate the SQLite-backed store
+    // for the new scope, then reload the inventory from the fresh snapshot.
+    Promise.resolve(inventoryStorage?.hydrate?.())
+      .then((wasActive) => {
+        if (wasActive) {
+          inventoryInstance()?.reload?.();
+          bacnetHistorian?.restore({ replace: true });
+        }
+      })
+      .catch(() => {});
   }
 
   const userStateApi = createUserStateManager({
@@ -144,15 +158,30 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
 
   rebuildCatalog();
 
+  // Single SQLite-backed inventory storage adapter, reused for the lifetime of
+  // the app so its hydrated mirror survives re-wiring. Falls back to the legacy
+  // user-state blob storage until a scope is hydrated from the database.
+  const inventoryStorage = createSqlInventoryStorage({
+    invoke,
+    getState: () => userState,
+    setInventory: (inventory, meta = {}) => {
+      userState.inventory = inventory;
+      if (meta.legacyMigrated) userState.inventoryLegacyMigrated = true;
+      saveUserState();
+    },
+    saveUserState,
+  });
+
   function createAppInventoryStorage() {
-    return createUserStateInventoryStorage({
-      getState: () => userState,
-      setInventory: (inventory, meta = {}) => {
-        userState.inventory = inventory;
-        if (meta.legacyMigrated) userState.inventoryLegacyMigrated = true;
-        saveUserState();
-      },
-    });
+    return inventoryStorage;
+  }
+
+  function hydrateInventoryStore() {
+    return inventoryStorage.hydrate();
+  }
+
+  function persistBacnetCache(devices) {
+    inventoryStorage.saveBacnetCache(devices);
   }
 
   function activityToolLabel(toolId) {
@@ -192,6 +221,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     renderScoped: (scope) => appUi.renderScoped(scope),
     networkManager, platformHost, userState, saveUserState, currentPluginId,
     getInventory: () => (platform ? platform.capability("inventory.v1") : null),
+    persistBacnetCache,
     setView, pluginView,
   });
   bacnetHistorian = createBacnetHistorianUi({
@@ -230,6 +260,24 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     getInventory: () => (platform ? platform.capability("inventory.v1") : null),
     userState, saveUserState,
   });
+  const graphicsBuilder = createGraphicsBuilderUi({
+    el, logTo, renderAll: () => appUi.renderAll(),
+    getPlatform: () => platform,
+    getInventory: () => (platform ? platform.capability("inventory.v1") : null),
+    userState, saveUserState,
+  });
+  const schedules = createSchedulesUi({
+    el, logTo, renderAll: () => appUi.renderAll(),
+    getPlatform: () => platform,
+    getInventory: () => (platform ? platform.capability("inventory.v1") : null),
+    userState, saveUserState,
+  });
+  const notes = createNotesUi({
+    el, logTo, renderAll: () => appUi.renderAll(),
+    getInventory: () => (platform ? platform.capability("inventory.v1") : null),
+    userState, saveUserState,
+  });
+  const designSystem = createDesignSystemUi({ el });
 
   Object.assign(TOOL_RENDERERS, {
     clipboardtyper: { renderStatusPill: clipboardTyper.renderStatusPill, renderPage: clipboardTyper.renderPage },
@@ -242,6 +290,10 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     "device-graphics": { renderStatusPill: deviceGraphics.renderStatusPill, renderPage: deviceGraphics.renderPage },
     "building-analytics": { renderStatusPill: buildingAnalytics.renderStatusPill, renderPage: buildingAnalytics.renderPage },
     "alarm-console": { renderStatusPill: alarmConsole.renderStatusPill, renderPage: alarmConsole.renderPage },
+    "graphics-builder": { renderStatusPill: graphicsBuilder.renderStatusPill, renderPage: graphicsBuilder.renderPage },
+    schedules: { renderStatusPill: schedules.renderStatusPill, renderPage: schedules.renderPage },
+    notes: { renderStatusPill: notes.renderStatusPill, renderPage: notes.renderPage },
+    "design-system": { renderStatusPill: designSystem.renderStatusPill, renderPage: designSystem.renderPage },
   });
   rebuildCatalog();
   clipboardTyper.bindEvents(listen);
@@ -362,6 +414,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     rebuildCatalog,
     getAllManifests: () => ALL_MANIFESTS,
     createAppInventoryStorage,
+    hydrateInventoryStore,
     flushUserStatePersistence,
     getAuthState,
     activeAuthUser,

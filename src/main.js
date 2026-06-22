@@ -48,6 +48,7 @@ installBootstrap({
   rebuildCatalog: app.rebuildCatalog,
   getAllManifests: app.getAllManifests,
   createAppInventoryStorage: app.createAppInventoryStorage,
+  hydrateInventoryStore: app.hydrateInventoryStore,
   setPlatform: app.setPlatform,
   setTelemetry: (t) => { telemetry = t; },
   setScheduler: () => {},

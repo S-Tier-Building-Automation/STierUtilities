@@ -1,4 +1,7 @@
-// Home overview — system health, quick launch, and recent activity.
+// Home overview — the branded operations hub: system health, quick launch, and
+// recent activity. Control-room instrument styling lives in styles.css.
+
+import { brandMark, BRAND } from "./brand.js";
 
 /**
  * @param {object} deps
@@ -19,13 +22,19 @@ export function createHomeUi({
   setView, pluginView, getActivitySummary, getSystemStatus,
 }) {
 
-  function statusCard({ title, label, detail, cls = "pill-idle", action = null }) {
-    return el("article", { class: "home-stat-card" },
-      el("div", { class: "home-stat-head" },
-        el("h3", { class: "home-stat-title" }, title),
-        el("span", { class: `pill ${cls}` }, label)),
-      detail ? el("p", { class: "muted small home-stat-detail" }, detail) : null,
-      action || null,
+  function statusCard({ title, label, detail, cls = "pill-idle", action = null }, index = 0) {
+    // Map pill class to a state token for the left signal bar.
+    const state = cls.replace("pill-", "");
+    return el("article", { class: `home-stat-card home-reveal stat-${state}`, style: `--i:${index}` },
+      el("span", { class: "home-stat-bar" }),
+      el("div", { class: "home-stat-main" },
+        el("div", { class: "home-stat-label" }, title),
+        el("div", { class: "home-stat-value-row" },
+          el("span", { class: "home-stat-value" }, label),
+        ),
+        detail ? el("p", { class: "muted small home-stat-detail" }, detail) : null,
+      ),
+      action ? el("div", { class: "home-stat-action" }, action) : null,
     );
   }
 
@@ -40,8 +49,9 @@ export function createHomeUi({
       el("span", { class: "home-quick-icon" }, tool.emoji),
       el("span", { class: "home-quick-copy" },
         el("span", { class: "home-quick-name" }, tool.name),
-        status ? el("span", { class: `pill pill-sm ${status.cls}` }, status.label) : null,
+        tool.tagline ? el("span", { class: "home-quick-sub muted small" }, tool.tagline) : null,
       ),
+      status ? el("span", { class: `pill pill-sm ${status.cls}` }, status.label) : null,
     );
   }
 
@@ -54,6 +64,13 @@ export function createHomeUi({
     );
   }
 
+  function gridSection(heading, tools) {
+    return [
+      el("h3", { class: "section-subhead" }, heading),
+      el("div", { class: "home-quick-grid" }, ...tools.map(quickTile)),
+    ];
+  }
+
   function renderPage() {
     const root = document.getElementById("view-root");
     root.replaceChildren();
@@ -63,93 +80,82 @@ export function createHomeUi({
     const favTools = getTools().filter((t) => isFavorite(t.id) && !isHidden(t.id));
     const recentIds = getRecentTools().filter((id) => !isHidden(id));
     const recentTools = recentIds.map((id) => toolById(id)).filter(Boolean);
-
     const alertBadge = activity.errors + activity.warns;
-    root.appendChild(el("div", { class: "view-header home-header" },
-      el("div", { class: "home-header-copy" },
-        el("h2", {}, "Home"),
-        el("p", { class: "muted small home-subtitle" }, `S-Tier Utilities v${appVersion} — your local operations hub`),
-      ),
-      el("div", { class: "view-header-right" },
-        alertBadge > 0
-          ? el("button", {
-              class: "btn-ghost home-alert-btn",
-              onclick: () => setView("activity"),
-            }, `${alertBadge} alert${alertBadge === 1 ? "" : "s"}`)
-          : null,
-        el("button", { class: "btn-ghost", onclick: () => setView("library") }, "Browse library"),
-      ),
-    ));
 
-    const stats = el("section", { class: "home-stats" },
-      statusCard({
-        title: "Observability",
-        label: status.observability.label,
-        detail: status.observability.detail,
-        cls: status.observability.cls,
-        action: el("button", { class: "btn-ghost btn-sm", onclick: () => setView(pluginView("observability")) }, "Open"),
-      }),
-      statusCard({
-        title: "Historian",
-        label: status.historian.label,
-        detail: status.historian.detail,
-        cls: status.historian.cls,
-        action: el("button", { class: "btn-ghost btn-sm", onclick: () => setView(pluginView("bacnet-historian")) }, "Open"),
-      }),
-      statusCard({
-        title: "Building model",
-        label: status.inventory.label,
-        detail: status.inventory.detail,
-        cls: status.inventory.cls,
-        action: el("button", { class: "btn-ghost btn-sm", onclick: () => setView(pluginView("building-workspace")) }, "Open"),
-      }),
-      statusCard({
-        title: "Platform",
-        label: status.platform.label,
-        detail: status.platform.detail,
-        cls: status.platform.cls,
-        action: el("button", { class: "btn-ghost btn-sm", onclick: () => setView("services") }, "Capabilities"),
-      }),
+    // ---- Branded hero ----
+    const healthChip = alertBadge > 0
+      ? el("button", { class: "home-chip home-chip-alert", onclick: () => setView("activity") },
+          el("span", { class: "home-dot dot-warn" }), `${alertBadge} alert${alertBadge === 1 ? "" : "s"}`)
+      : el("span", { class: "home-chip home-chip-ok" }, el("span", { class: "home-dot dot-ok" }), "All systems nominal");
+
+    const hero = el("section", { class: "home-hero home-reveal", style: "--i:0" },
+      el("div", { class: "home-hero-mark" }, brandMark({ size: 46 })),
+      el("div", { class: "home-hero-copy" },
+        el("div", { class: "home-hero-eyebrow" }, BRAND.org),
+        el("h2", { class: "home-hero-name" }, BRAND.name),
+        el("p", { class: "home-hero-tagline muted" }, BRAND.tagline),
+        el("div", { class: "home-hero-meta" },
+          el("span", { class: "home-chip mono" }, `v${appVersion}`),
+          el("span", { class: "home-chip home-chip-env" }, "LOCAL"),
+          healthChip,
+        ),
+      ),
+      el("div", { class: "home-hero-actions" },
+        el("button", { class: "btn btn-primary", onclick: () => setView("library") }, "Browse library"),
+        el("button", { class: "btn-ghost", onclick: () => setView("activity") }, "Activity"),
+      ),
     );
+    root.appendChild(hero);
+
+    // ---- Instrument status strip ----
+    const cards = [
+      { title: "Observability", ...status.observability, view: pluginView("observability"), actionLabel: "Open" },
+      { title: "Historian", ...status.historian, view: pluginView("bacnet-historian"), actionLabel: "Open" },
+      { title: "Building model", ...status.inventory, view: pluginView("building-workspace"), actionLabel: "Open" },
+      { title: "Platform", ...status.platform, view: "services", actionLabel: "Capabilities" },
+    ];
+    const stats = el("section", { class: "home-stats" }, ...cards.map((c, i) => statusCard({
+      title: c.title, label: c.label, detail: c.detail, cls: c.cls,
+      action: el("button", { class: "btn-ghost btn-sm", onclick: () => setView(c.view) }, c.actionLabel),
+    }, i + 1)));
     root.appendChild(stats);
 
-    const bmsApps = ["building-workspace", "alarm-console", "building-analytics", "device-graphics"]
+    // ---- Quick launch ----
+    const bmsApps = ["building-workspace", "alarm-console", "building-analytics", "device-graphics", "graphics-builder", "schedules", "notes"]
       .map((id) => toolById(id))
       .filter((t) => t && !isHidden(t.id));
-    if (bmsApps.length) {
-      root.appendChild(el("h3", { class: "section-subhead" }, "Building automation"));
-      root.appendChild(el("div", { class: "home-quick-grid" }, ...bmsApps.map(quickTile)));
-    }
+    if (bmsApps.length) root.append(...gridSection("Building automation", bmsApps));
+    if (favTools.length) root.append(...gridSection("Favorites", favTools));
+    if (recentTools.length) root.append(...gridSection("Recently used", recentTools));
 
-    if (favTools.length) {
-      root.appendChild(el("h3", { class: "section-subhead" }, "Favorites"));
-      root.appendChild(el("div", { class: "home-quick-grid" }, ...favTools.map(quickTile)));
-    }
-
-    if (recentTools.length) {
-      root.appendChild(el("h3", { class: "section-subhead" }, "Recently used"));
-      root.appendChild(el("div", { class: "home-quick-grid" }, ...recentTools.map(quickTile)));
-    }
-
-    root.appendChild(el("div", { class: "home-lower" },
-      el("section", { class: "home-panel" },
-        el("div", { class: "section-head" },
-          el("h3", {}, "Recent activity"),
-          el("button", { class: "btn-ghost btn-sm", onclick: () => setView("activity") }, "View all"),
-        ),
-        activity.recent.length
-          ? el("ol", { class: "home-activity-list" }, ...activity.recent.map(activityRow))
-          : el("p", { class: "muted small" }, "No activity yet. Open a tool and events will show up here."),
+    // ---- Lower panels ----
+    const activityPanel = el("section", { class: "home-panel" },
+      el("div", { class: "section-head" },
+        el("h3", {}, "Recent activity"),
+        el("button", { class: "btn-ghost btn-sm", onclick: () => setView("activity") }, "View all"),
       ),
-      el("section", { class: "home-panel home-panel-tips" },
-        el("h3", {}, "Quick tips"),
-        el("ul", { class: "home-tips" },
-          el("li", {}, "Star tools in the Library to pin them in the sidebar."),
-          el("li", {}, "Use the header search to jump to any tool by name or capability."),
-          el("li", {}, "Building Workspace models BACnet sites; BACnet Manager discovers devices."),
-        ),
+      activity.recent.length
+        ? el("ol", { class: "home-activity-list" }, ...activity.recent.map(activityRow))
+        : el("div", { class: "home-empty" },
+            el("p", { class: "muted small" }, "No activity yet. Get started:"),
+            el("div", { class: "home-next-chips" },
+              el("button", { class: "home-next-chip", onclick: () => setView(pluginView("bacnet-manager")) }, "Discover devices"),
+              el("button", { class: "home-next-chip", onclick: () => setView(pluginView("building-workspace")) }, "Model a site"),
+              el("button", { class: "home-next-chip", onclick: () => setView(pluginView("bacnet-historian")) }, "Historize points"),
+            ),
+          ),
+    );
+
+    const tipsPanel = el("section", { class: "home-panel home-panel-tips" },
+      el("h3", {}, "Quick tips"),
+      el("ul", { class: "home-tips" },
+        el("li", {}, "Star tools in the Library to pin them in the sidebar."),
+        el("li", {}, "Use the header search to jump to any tool by name or capability."),
+        el("li", {}, "Building Workspace models BACnet sites; BACnet Manager discovers devices."),
       ),
-    ));
+    );
+
+    root.appendChild(el("div", { class: "home-lower" }, activityPanel, tipsPanel));
   }
 
   return { renderPage };
