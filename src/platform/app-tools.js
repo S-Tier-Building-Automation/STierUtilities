@@ -27,6 +27,7 @@ import { createBacnetHistorianUi } from "../tools/ui/bacnethistorian.js";
 import { createDeviceGraphicsUi } from "../tools/ui/devicegraphics.js";
 import { createBuildingAnalyticsUi } from "../tools/ui/buildinganalytics.js";
 import { createAlarmConsoleUi } from "../tools/ui/alarmconsole.js";
+import { createDeviceManagerUi } from "../tools/ui/devicemanager.js";
 
 /**
  * @param {object} deps
@@ -50,6 +51,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
   let deviceGraphics = null;
   let buildingAnalytics = null;
   let alarmConsole = null;
+  let deviceManager = null;
 
   let ALL_MANIFESTS = [...TOOL_MANIFESTS];
   let TOOLS = [];
@@ -230,6 +232,12 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     getInventory: () => (platform ? platform.capability("inventory.v1") : null),
     userState, saveUserState,
   });
+  deviceManager = createDeviceManagerUi({
+    el, logTo, renderAll: () => appUi.renderAll(),
+    getPlatform: () => platform,
+    getInventory: () => (platform ? platform.capability("inventory.v1") : null),
+    userState, saveUserState,
+  });
 
   Object.assign(TOOL_RENDERERS, {
     clipboardtyper: { renderStatusPill: clipboardTyper.renderStatusPill, renderPage: clipboardTyper.renderPage },
@@ -242,6 +250,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     "device-graphics": { renderStatusPill: deviceGraphics.renderStatusPill, renderPage: deviceGraphics.renderPage },
     "building-analytics": { renderStatusPill: buildingAnalytics.renderStatusPill, renderPage: buildingAnalytics.renderPage },
     "alarm-console": { renderStatusPill: alarmConsole.renderStatusPill, renderPage: alarmConsole.renderPage },
+    "device-manager": { renderStatusPill: deviceManager.renderStatusPill, renderPage: deviceManager.renderPage },
   });
   rebuildCatalog();
   clipboardTyper.bindEvents(listen);

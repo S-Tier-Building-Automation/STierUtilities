@@ -3,9 +3,9 @@
 // capability. The Alarm Console consumes this; it owns no rule or BACnet logic.
 
 /**
- * @param {{ inventory: object, rules: object, bacnet?: object|null }} deps
+ * @param {{ inventory: object, rules: object, bacnet?: object|null, devices?: object|null }} deps
  */
-export function createAlertsService({ inventory, rules, bacnet = null }) {
+export function createAlertsService({ inventory, rules, bacnet = null, devices = null }) {
   if (!inventory) throw new Error("alerts service requires an inventory capability");
   if (!rules) throw new Error("alerts service requires a rules capability");
 
@@ -48,6 +48,26 @@ export function createAlertsService({ inventory, rules, bacnet = null }) {
       at: entry.timestamp || entry.eventTimestamp || null,
       ackable: !entry.acknowledged && objectType != null && instance != null,
       ref: { device, objectType, instance },
+    };
+  }
+
+  /** A device-health finding -> unified alert shape. */
+  function fromDeviceAlert(d) {
+    const offline = d.status === "offline";
+    return {
+      id: `device:${d.deviceInstance ?? d.equipId ?? "dev"}`,
+      source: "device",
+      severity: offline ? "high" : "medium",
+      status: offline ? "active" : "warn",
+      message: offline
+        ? `Device offline${d.lastSeenAt ? ` (last seen ${d.lastSeenAt})` : ""}`
+        : "Device degraded — not responding to BACnet or non-operational",
+      equipId: d.equipId || null,
+      equipName: d.equipName || null,
+      pointId: null,
+      at: d.since || null,
+      ackable: false,
+      ref: null,
     };
   }
 
@@ -95,14 +115,21 @@ export function createAlertsService({ inventory, rules, bacnet = null }) {
       return out;
     },
 
+    /** Offline/degraded device alerts from the device-health service. */
+    listDeviceAlerts() {
+      if (!devices) return [];
+      return (devices.listAlerts() || []).map(fromDeviceAlert);
+    },
+
     /**
-     * Unified rule findings + BACnet alarms.
+     * Unified rule findings + BACnet alarms + device-health alerts.
      * @param {{ runId?: string, devices?: object[], status?: string[] }} [opts]
      */
     async listUnified({ runId = null, devices = [], status = ["fail", "warn"] } = {}) {
       const ruleAlerts = this.listRuleFindings({ runId, status });
       const bacnetAlerts = await this.listBacnetAlarms({ devices });
-      return [...bacnetAlerts, ...ruleAlerts];
+      const deviceAlerts = this.listDeviceAlerts();
+      return [...deviceAlerts, ...bacnetAlerts, ...ruleAlerts];
     },
 
     /** Acknowledge a live BACnet alarm (delegates to bacnet.read). */

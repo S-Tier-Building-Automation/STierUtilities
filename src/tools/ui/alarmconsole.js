@@ -105,9 +105,11 @@ export function createAlarmConsoleUi({
     if (inv) readBacnetAlarms(inv);
   }
 
+  const SOURCE_LABEL = { bacnet: "BACnet", device: "Device", rule: "Rule" };
+
   function alertRow(alert) {
     return el("li", { class: alert.status === "active" || alert.status === "fail" ? "log-error" : alert.status === "error" ? "log-warn" : "log-info" },
-      el("span", { class: "log-time" }, alert.source === "bacnet" ? "BACnet" : "Rule"),
+      el("span", { class: "log-time" }, SOURCE_LABEL[alert.source] || "Rule"),
       el("span", { class: "log-msg" }, `${alert.equipName ? `${alert.equipName} · ` : ""}${alert.message}`),
       alert.ackable
         ? el("button", { class: "btn-ghost btn-sm", onclick: () => acknowledge(alert) }, "Ack")
@@ -128,8 +130,9 @@ export function createAlarmConsoleUi({
 
     const sites = inv.listEntities({ type: "site" });
     const ruleAlerts = alerts.listRuleFindings({ status: ["fail", "warn"] });
+    const deviceAlerts = alerts.listDeviceAlerts ? alerts.listDeviceAlerts() : [];
     const liveAlerts = bacnetAlarms || [];
-    const combined = [...liveAlerts, ...ruleAlerts];
+    const combined = [...deviceAlerts, ...liveAlerts, ...ruleAlerts];
     const deviceCount = deviceRefs(inv).length;
 
     const controls = el("div", { class: "bw-card bw-rule-controls" },
