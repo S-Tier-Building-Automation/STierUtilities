@@ -307,6 +307,43 @@ export const TOOL_MANIFESTS = [
     },
   },
   {
+    // building-devices: the headless device-health monitor. Polls every modeled
+    // BACnet device for reachability (netscan) and BACnet responsiveness, derives
+    // an online/degraded/offline status, and provides the devices capability the
+    // Device Manager app and the alerts engine consume. Composes inventory,
+    // bacnet.read, scheduler, netscan, and timeseries — owning none of them.
+    id: "building-devices",
+    name: "Device Health Service",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "service",
+    provides: [{ capability: "devices", version: "1.0" }],
+    requires: [
+      { capability: "inventory", version: "^1.0" },
+      // Optional: the service degrades to reachability-only (netscan) monitoring
+      // when bacnet-core is unavailable, matching the factory's tryUse wiring.
+      { capability: "bacnet.read", version: "^1.0", optional: true },
+      { capability: "scheduler", version: "^1.0" },
+      { capability: "netscan", version: "^1.0", optional: true },
+      { capability: "timeseries", version: "^1.0", optional: true },
+    ],
+    permissions: ["inventory.read", "inventory.write", "timeseries.write", "scheduler.register"],
+    dashboards: ["dashboards/device-health.json"],
+    ui: {
+      emoji: "🩺",
+      tagline: "Headless device-health monitor — online/offline/degraded status for every modeled device.",
+      description:
+        "Continuously health-checks every modeled BACnet device on a schedule: it pings for " +
+        "reachability and reads the Device object to confirm BACnet responsiveness, then derives " +
+        "an online, degraded, or offline status with flap debouncing and a last-seen timestamp. " +
+        "Up/down and latency stream to the time-series service, and offline devices surface as " +
+        "alerts in the Alarm Console. The Device Manager app consumes it. Runs headless — it has " +
+        "no page of its own.",
+      repo: REPO,
+    },
+  },
+  {
     // building-alerts: unifies rule findings and live BACnet alarms into one
     // acknowledgeable feed. Provides the alerts capability the Alarm Console
     // consumes. Runs headless.
@@ -321,6 +358,7 @@ export const TOOL_MANIFESTS = [
       { capability: "inventory", version: "^1.0" },
       { capability: "rules", version: "^1.0" },
       { capability: "bacnet.read", version: "^1.0", optional: true },
+      { capability: "devices", version: "^1.0", optional: true },
     ],
     permissions: ["inventory.read", "inventory.write"],
     ui: {
@@ -345,6 +383,7 @@ export const TOOL_MANIFESTS = [
       { capability: "alerts", version: "^1.0" },
       { capability: "inventory", version: "^1.0" },
       { capability: "bacnet.read", version: "^1.0", optional: true },
+      { capability: "devices", version: "^1.0", optional: true },
     ],
     permissions: ["inventory.read", "inventory.write"],
     ui: {
@@ -403,6 +442,35 @@ export const TOOL_MANIFESTS = [
         "callouts, status chips, and monitoring parameters bound to modeled points. Poll live " +
         "BACnet values, and bind or rebind points to graphic roles. Built on the shared Graphics " +
         "engine and building model.",
+      repo: REPO,
+    },
+  },
+  {
+    // Device Manager — the device-management workspace. A thin app over the
+    // devices.v1 capability: a live inventory of every modeled device with
+    // health status, last-seen, latency, and lifecycle controls. Owns no BACnet
+    // or scheduling logic — the Device Health Service does the work.
+    id: "device-manager",
+    name: "Device Manager",
+    version: "1.0.0",
+    apiVersion: "1",
+    kind: "native",
+    category: "app",
+    provides: [],
+    requires: [
+      { capability: "devices", version: "^1.0" },
+      { capability: "inventory", version: "^1.0" },
+    ],
+    permissions: ["inventory.read", "inventory.write"],
+    ui: {
+      emoji: "🩺",
+      tagline: "Live health and lifecycle for every modeled device — online, offline, degraded.",
+      description:
+        "The device-management workspace: a sortable inventory of every modeled BACnet device " +
+        "with its live health status, last-seen time, and ping latency. Start or stop continuous " +
+        "monitoring, run a health check on demand, filter by status, and set each device's " +
+        "lifecycle (active, maintenance, decommissioned) — maintenance and decommissioned devices " +
+        "stop raising offline alerts. Built on the shared Device Health Service and building model.",
       repo: REPO,
     },
   },
