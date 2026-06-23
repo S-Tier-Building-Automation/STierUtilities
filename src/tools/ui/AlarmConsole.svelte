@@ -10,7 +10,10 @@
     const alerts = platform ? platform.capability("alerts.v1") : null;
     if (!inv || !alerts) return { label: "—", cls: "pill-muted" };
     const ruleFails = alerts.listRuleFindings({ status: ["fail"] }).length;
-    const total = ruleFails;
+    // Device-health alerts derive from persisted inventory health (not ephemeral
+    // like live BACnet alarms), so the synchronous pill can include them.
+    const deviceFails = alerts.listDeviceAlerts ? alerts.listDeviceAlerts().length : 0;
+    const total = ruleFails + deviceFails;
     return total
       ? { label: `${total} alert${total === 1 ? "" : "s"}`, cls: "pill-warn" }
       : { label: "Clear", cls: "pill-running" };
@@ -26,6 +29,9 @@
   import { takeAppIntent } from "../../ui/app-intent.js";
 
   let { logTo, getPlatform, getInventory, userState, saveUserState } = $props();
+
+  // Feed-source label for each unified alert row.
+  const SOURCE_LABEL = { bacnet: "BACnet", device: "Device", rule: "Rule" };
 
   let busy = $state(false);
   let bacnetAlarms = $state(null); // null = not yet read; [] = read, none
@@ -165,8 +171,13 @@
     const i = getInventory();
     return i ? deviceRefs(i).length : 0;
   });
+  const deviceAlerts = $derived.by(() => {
+    $inventoryVersion;
+    const alerts = alertsCap();
+    return alerts && alerts.listDeviceAlerts ? alerts.listDeviceAlerts() : [];
+  });
   const liveAlerts = $derived(bacnetAlarms || []);
-  const combined = $derived([...liveAlerts, ...ruleAlerts]);
+  const combined = $derived([...deviceAlerts, ...liveAlerts, ...ruleAlerts]);
   const activeLive = $derived(liveAlerts.filter((a) => a.status === "active").length);
 
   onMount(() => {
@@ -225,7 +236,7 @@
         <ol class="plugin-log scroll-fill">
           {#each combined as alert}
             <li class={alertRowClass(alert)}>
-              <span class="log-time">{alert.source === "bacnet" ? "BACnet" : "Rule"}</span>
+              <span class="log-time">{SOURCE_LABEL[alert.source] || "Rule"}</span>
               <span class="log-msg">{alert.equipName ? `${alert.equipName} · ` : ""}{alert.message}</span>
               {#if alert.ackable}
                 <button class="btn-ghost btn-sm" onclick={() => acknowledge(alert)}>Ack</button>

@@ -51,6 +51,8 @@ import Schedules, { statusPill as schedulesStatusPill } from "../tools/ui/Schedu
 import HeicMov, { statusPill as heicMovStatusPill } from "../tools/ui/HeicMov.svelte";
 import ClipboardTyper, { statusPill as clipboardTyperStatusPill } from "../tools/ui/ClipboardTyper.svelte";
 import BuildingAnalytics, { statusPill as buildingAnalyticsStatusPill } from "../tools/ui/BuildingAnalytics.svelte";
+// Device Manager is a new imperative el()-built tool (not yet migrated to Svelte).
+import { createDeviceManagerUi } from "../tools/ui/devicemanager.js";
 
 /**
  * @param {object} deps
@@ -71,6 +73,7 @@ export function createApplication({ invoke, listen, convertFileSrc, appVersion, 
   let buildingWorkspace = null;
   let bacnetHistorian = null;
   let deviceGraphics = null;
+  let deviceManager = null;
 
   let ALL_MANIFESTS = [...TOOL_MANIFESTS];
   let TOOLS = [];
@@ -270,6 +273,12 @@ export function createApplication({ invoke, listen, convertFileSrc, appVersion, 
   // HeicMov publishes its live $state proxy here (via bindState) so the shell's
   // synchronous status pill can read it; seeded with a safe default pre-mount.
   let heicMovState = { files: [], busy: false, busyLabel: "", progress: null };
+  deviceManager = createDeviceManagerUi({
+    el, logTo, renderAll: renderAllBridge,
+    getPlatform: () => platform,
+    getInventory: () => (platform ? platform.capability("inventory.v1") : null),
+    userState, saveUserState,
+  });
 
   Object.assign(TOOL_RENDERERS, {
     clipboardtyper: {
@@ -313,6 +322,7 @@ export function createApplication({ invoke, listen, convertFileSrc, appVersion, 
       componentProps: { getInventory: toolGetInventory, userState, saveUserState, logTo },
     },
     "design-system": { renderStatusPill: () => ({ label: "Reference", cls: "pill-idle" }), component: DesignSystem },
+    "device-manager": { renderStatusPill: deviceManager.renderStatusPill, renderPage: deviceManager.renderPage },
   });
   rebuildCatalog();
 

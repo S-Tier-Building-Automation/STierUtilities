@@ -652,6 +652,10 @@ const BUNDLED_DASHBOARDS: &[(&str, &str)] = &[
         include_str!("../../src/tools/dashboards/bacnet-points.json"),
     ),
     (
+        "device-health.json",
+        include_str!("../../src/tools/dashboards/device-health.json"),
+    ),
+    (
         "building-workspace.json",
         include_str!("../../src/tools/dashboards/building-workspace.json"),
     ),
@@ -1946,10 +1950,14 @@ mod tests {
         let netscan = paths.dashboards_dir().join("netscan-hosts.json");
         let bacnet = paths.dashboards_dir().join("bacnet-points.json");
         let workspace = paths.dashboards_dir().join("building-workspace.json");
-        assert!(netscan.exists() && bacnet.exists() && workspace.exists());
+        let device_health = paths.dashboards_dir().join("device-health.json");
+        assert!(netscan.exists() && bacnet.exists() && workspace.exists() && device_health.exists());
         assert!(std::fs::read_to_string(&bacnet)
             .unwrap()
             .contains("bacnet_point"));
+        assert!(std::fs::read_to_string(&device_health)
+            .unwrap()
+            .contains("bacnet_device"));
         assert!(std::fs::read_to_string(&workspace)
             .unwrap()
             .contains("building-workspace"));

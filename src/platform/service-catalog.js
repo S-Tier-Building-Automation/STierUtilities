@@ -249,6 +249,30 @@ export const CAPABILITY_DOCS = {
         desc: "Run the rule packs in scope and persist the run." },
     ],
   },
+
+  devices: {
+    summary:
+      "Device-health monitor: continuously checks every modeled BACnet device for " +
+      "reachability and BACnet responsiveness, derives an online/degraded/offline " +
+      "status with flap debouncing, and exposes offline devices as alerts. Owned by " +
+      "the headless building-devices service.",
+    methods: [
+      { name: "getDevices", sig: "getDevices()", returns: "Entity[]",
+        desc: "Modeled devices with any persisted .health and .lifecycle attached." },
+      { name: "checkDevice", sig: "checkDevice(equip)", returns: "Promise<Health>",
+        desc: "Probe one device (reachability + BACnet), recompute, and persist its health." },
+      { name: "checkAll", sig: "checkAll()", returns: "Promise<{ online, degraded, offline, unknown, total }>",
+        desc: "Health-check every modeled device; writes per-device up/down + latency to timeseries." },
+      { name: "listAlerts", sig: "listAlerts()", returns: "DeviceAlert[]",
+        desc: "Offline/degraded devices as alert payloads (maintenance/decommissioned suppressed)." },
+      { name: "setLifecycle", sig: "setLifecycle(equipId, state)", returns: "Entity",
+        desc: "Set a device's lifecycle: active | maintenance | decommissioned." },
+      { name: "start", sig: "start(intervalMs = 60000)", returns: "string",
+        desc: "Begin continuous monitoring on a schedule (checks immediately)." },
+      { name: "stop", sig: "stop()", returns: "void", desc: "Stop continuous monitoring." },
+      { name: "isRunning", sig: "isRunning()", returns: "boolean", desc: "Whether continuous monitoring is active." },
+    ],
+  },
 };
 
 /** "bacnet.read" -> "bacnetRead" (a sample variable name for usage snippets). */

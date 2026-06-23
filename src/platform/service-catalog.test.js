@@ -25,7 +25,7 @@ test("bacnet.read is attributed to the bacnet-core service and its consumers", (
   assert.equal(e.provider.category, "service");
   assert.equal(e.ref, "bacnet.read.v1");
   const consumerIds = e.consumers.map((c) => c.id).sort();
-  assert.deepEqual(consumerIds, ["alarm-console", "bacnet-historian", "bacnet-manager", "building-alerts", "building-rules", "building-workspace", "device-graphics", "graphics-builder", "schedules"]);
+  assert.deepEqual(consumerIds, ["alarm-console", "bacnet-historian", "bacnet-manager", "building-alerts", "building-devices", "building-rules", "building-workspace", "device-graphics", "graphics-builder", "schedules"]);
   assert.ok(e.doc.methods.some((m) => m.name === "listDevices"));
   assert.ok(e.doc.methods.some((m) => m.name === "readPoint"));
   assert.ok(e.doc.methods.some((m) => m.name === "listObjects"));

@@ -7,6 +7,7 @@
 import { createTimeseries } from "../platform/services/timeseries.js";
 import { createScheduler } from "../platform/services/scheduler.js";
 import { createHistorian } from "./historian.js";
+import { createDeviceHealthService } from "./device-health.js";
 import { createBrowserInventoryStorage, createInventory } from "./inventory.js";
 import { createModbusService } from "./modbus-service.js";
 import { createRulesService } from "./rules-service.js";
@@ -92,6 +93,18 @@ export function buildFactories(invoke, options = {}) {
     }));
   });
 
+  // building-devices: composes inventory + bacnet.read + netscan + scheduler +
+  // timeseries into a continuous device-health monitor. Provides the devices.v1
+  // capability the Device Manager app and the alerts service consume.
+  factories.set("building-devices", async (host) => {
+    const inventory = host.use("inventory.v1");
+    const bacnet = host.tryUse("bacnet.read.v1");
+    const netscan = host.tryUse("netscan.v1");
+    const scheduler = host.use("scheduler.v1");
+    const timeseries = host.tryUse("timeseries.v1");
+    host.provide("devices", "1.0", createDeviceHealthService({ inventory, bacnet, netscan, scheduler, timeseries }));
+  });
+
   // building-rules: evaluates modeled equipment against rule packs (the
   // analytics engine). Reuses inventory for the model and graphics for role
   // resolution, and optionally reads live BACnet values during a run.
@@ -114,7 +127,8 @@ export function buildFactories(invoke, options = {}) {
     const inventory = host.use("inventory.v1");
     const rules = host.use("rules.v1");
     const bacnet = host.tryUse("bacnet.read.v1");
-    host.provide("alerts", "1.0", createAlertsService({ inventory, rules, bacnet }));
+    const devices = host.tryUse("devices.v1");
+    host.provide("alerts", "1.0", createAlertsService({ inventory, rules, bacnet, devices }));
   });
 
   factories.set("building-workspace", async (host) => {
