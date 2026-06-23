@@ -86,6 +86,14 @@ test("computeHealth: recovery resets misses and last-seen", () => {
   assert.equal(back.since, 9);
 });
 
+test("computeHealth returns unknown (no miss) when no probe ran", () => {
+  const h = computeHealth({ status: "online", since: 1, lastSeenAt: 1, consecutiveMisses: 0 },
+    { reachable: false, probed: false, at: 9 });
+  assert.equal(h.status, "unknown");
+  assert.equal(h.lastSeenAt, 1); // preserved, not cleared
+  assert.equal(h.consecutiveMisses, 0); // an unprobed device is not a miss
+});
+
 // ---- service ----
 
 test("device-health requires its core dependencies", () => {
@@ -122,6 +130,16 @@ test("checkDevice marks unreachable devices and skips the BACnet read", async ()
   const health = await svc.checkDevice(inv.getEntity("equip:b"));
   assert.equal(health.status, "offline");
   assert.equal(bacnetCalls, 0, "no BACnet read when ping already proved the device down");
+});
+
+test("a device with nothing to probe reports unknown, not online", async () => {
+  const inv = inventoryWith([{ id: "equip:ghost", name: "Ghost", deviceInstance: 42 }]); // no address
+  const scheduler = createScheduler({ timer: fakeTimer() });
+  // No netscan and no bacnet capability -> no probe is possible.
+  const svc = createDeviceHealthService({ inventory: inv, scheduler, now: () => 1 });
+  const health = await svc.checkDevice(inv.getEntity("equip:ghost"));
+  assert.equal(health.status, "unknown");
+  assert.equal(inv.getEntity("equip:ghost").health.status, "unknown");
 });
 
 test("checkAll tallies statuses, writes timeseries, and persists", async () => {

@@ -59,6 +59,22 @@ function compactTags(tags) {
 export function computeHealth(prev, signal, { offlineThreshold = 2 } = {}) {
   const prevStatus = prev?.status || "unknown";
   const at = signal.at;
+
+  // No probe was possible (device has neither a pingable IP nor a BACnet
+  // instance to read): we have no evidence either way, so report unknown rather
+  // than guess online — and don't let it drift toward a false offline either.
+  if (signal.probed === false) {
+    return {
+      status: "unknown",
+      since: prevStatus === "unknown" && prev?.since != null ? prev.since : at,
+      checkedAt: at,
+      lastSeenAt: prev?.lastSeenAt ?? null,
+      lastRttMs: prev?.lastRttMs ?? null,
+      consecutiveMisses: prev?.consecutiveMisses ?? 0,
+      systemStatus: prev?.systemStatus ?? null,
+    };
+  }
+
   let status;
   let consecutiveMisses = prev?.consecutiveMisses || 0;
   let lastSeenAt = prev?.lastSeenAt ?? null;
@@ -99,6 +115,10 @@ export function createDeviceHealthService({
   if (!inventory) throw new Error("device-health requires the inventory capability");
   if (!scheduler) throw new Error("device-health requires the scheduler capability");
 
+  // Busy guard: a slow sweep must not stack with the next scheduled tick or a
+  // manual "run now" — concurrent checkAll calls would double-probe every device.
+  let checking = false;
+
   /** Modeled BACnet devices: equip entities tagged device (or carrying a device ref). */
   function listDevices() {
     return inventory.listEntities({ type: "equip" })
@@ -111,9 +131,13 @@ export function createDeviceHealthService({
     const deviceInstance = deviceInstanceOf(equip);
     const pingable = Boolean(netscan && ip);
 
-    let reachable = true;
+    // Default to NOT reachable: a device we never managed to probe must not be
+    // reported online. `probed` records whether any probe actually ran.
+    let probed = false;
+    let reachable = false;
     let rttMs = null;
     if (pingable) {
+      probed = true;
       try {
         const r = await netscan.isReachable(ip);
         reachable = Boolean(r?.reachable);
@@ -129,6 +153,7 @@ export function createDeviceHealthService({
     // long protocol timeout on an offline device.
     const skipBacnet = pingable && !reachable;
     if (bacnet && deviceInstance != null && !skipBacnet) {
+      probed = true;
       try {
         const ref = equip.deviceRef || { deviceInstance };
         const props = await bacnet.readPoint(ref, OBJECT_DEVICE, deviceInstance);
@@ -141,7 +166,7 @@ export function createDeviceHealthService({
     // Reachability-only mode (no netscan): let the BACnet read stand in for reach.
     if (!pingable && bacnetResponsive != null) reachable = bacnetResponsive;
 
-    return { reachable, rttMs, bacnetResponsive, systemStatus, at: now() };
+    return { reachable, rttMs, bacnetResponsive, systemStatus, probed, at: now() };
   }
 
   function persistHealth(equip, health) {
@@ -181,28 +206,34 @@ export function createDeviceHealthService({
 
     /** Health-check every modeled device. Returns a status tally. */
     async checkAll() {
-      const devices = listDevices();
-      const ts = now();
-      let online = 0, degraded = 0, offline = 0, unknown = 0;
-      for (const equip of devices) {
-        let health;
-        try {
-          const signal = await gatherSignal(equip);
-          health = computeHealth(equip.health || null, signal, { offlineThreshold });
-        } catch {
-          // A gather failure shouldn't abort the sweep; treat as a miss.
-          health = computeHealth(equip.health || null,
-            { reachable: false, rttMs: null, bacnetResponsive: null, systemStatus: null, at: ts },
-            { offlineThreshold });
+      if (checking) return { online: 0, degraded: 0, offline: 0, unknown: 0, total: 0, skipped: true };
+      checking = true;
+      try {
+        const devices = listDevices();
+        const ts = now();
+        let online = 0, degraded = 0, offline = 0, unknown = 0;
+        for (const equip of devices) {
+          let health;
+          try {
+            const signal = await gatherSignal(equip);
+            health = computeHealth(equip.health || null, signal, { offlineThreshold });
+          } catch {
+            // A gather failure shouldn't abort the sweep; treat as a miss.
+            health = computeHealth(equip.health || null,
+              { reachable: false, rttMs: null, bacnetResponsive: null, systemStatus: null, at: ts },
+              { offlineThreshold });
+          }
+          persistHealth(equip, health);
+          writeMetric(equip, health, ts);
+          if (health.status === "online") online++;
+          else if (health.status === "degraded") degraded++;
+          else if (health.status === "offline") offline++;
+          else unknown++;
         }
-        persistHealth(equip, health);
-        writeMetric(equip, health, ts);
-        if (health.status === "online") online++;
-        else if (health.status === "degraded") degraded++;
-        else if (health.status === "offline") offline++;
-        else unknown++;
+        return { online, degraded, offline, unknown, total: devices.length };
+      } finally {
+        checking = false;
       }
-      return { online, degraded, offline, unknown, total: devices.length };
     },
 
     /**

@@ -156,7 +156,18 @@ export function createDeviceManagerUi({
         el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Every (s)"),
           el("input", {
             class: "nm-input", type: "number", min: "5", value: String(st().intervalSec || 60),
-            onchange: (e) => { st().intervalSec = Math.max(5, Number(e.target.value) || 60); saveUserState(); },
+            onchange: (e) => {
+              const sec = Math.max(5, Number(e.target.value) || 60);
+              st().intervalSec = sec;
+              saveUserState();
+              // If monitoring is live, re-register the job so the new cadence
+              // takes effect now instead of only after a stop/start.
+              const d = devicesCap();
+              if (d && d.isRunning()) {
+                d.start(sec * 1000);
+                logTo("device-manager", `Monitoring interval updated to ${sec}s.`, "ok");
+              }
+            },
           })),
         el("label", { class: "nm-field" }, el("span", { class: "nm-field-label" }, "Status"),
           el("select", {

@@ -51,21 +51,28 @@ export function createAlertsService({ inventory, rules, bacnet = null, devices =
     };
   }
 
+  /** A millisecond epoch -> ISO string for display, or null when not a number. */
+  function isoFromMs(ms) {
+    const n = Number(ms);
+    return Number.isFinite(n) ? new Date(n).toISOString() : null;
+  }
+
   /** A device-health finding -> unified alert shape. */
   function fromDeviceAlert(d) {
     const offline = d.status === "offline";
+    const lastSeen = isoFromMs(d.lastSeenAt);
     return {
       id: `device:${d.deviceInstance ?? d.equipId ?? "dev"}`,
       source: "device",
       severity: offline ? "high" : "medium",
       status: offline ? "active" : "warn",
       message: offline
-        ? `Device offline${d.lastSeenAt ? ` (last seen ${d.lastSeenAt})` : ""}`
+        ? `Device offline${lastSeen ? ` (last seen ${lastSeen})` : ""}`
         : "Device degraded — not responding to BACnet or non-operational",
       equipId: d.equipId || null,
       equipName: d.equipName || null,
       pointId: null,
-      at: d.since || null,
+      at: isoFromMs(d.since),
       ackable: false,
       ref: null,
     };
