@@ -20,6 +20,7 @@ import { initHeaderSearch } from "../ui/header-search.js";
  */
 export function registerPagehideHandler({
   flushUserStatePersistence,
+  flushInventoryStorage,
   stopLivePoll,
   getPackFlushTimer,
   setPackFlushTimer,
@@ -28,6 +29,9 @@ export function registerPagehideHandler({
 }) {
   window.addEventListener("pagehide", () => {
     flushUserStatePersistence();
+    // Flush any debounced inventory/BACnet-cache writes so a change made right
+    // before exit is durably persisted to SQLite.
+    flushInventoryStorage?.();
     stopLivePoll?.();
     const timer = getPackFlushTimer();
     if (timer) {

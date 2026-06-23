@@ -352,7 +352,7 @@ export function createApplication({ invoke, listen, convertFileSrc, appVersion, 
   if (contentRootTarget) {
     mount(ContentRoot, {
       target: contentRootTarget,
-      props: { renderTool: (id, host) => pluginPage.renderPage(id, host) },
+      props: { renderTool: (id, host, opts) => pluginPage.renderPage(id, host, opts) },
     });
   }
 
@@ -516,6 +516,7 @@ export function createApplication({ invoke, listen, convertFileSrc, appVersion, 
     getAllManifests: () => ALL_MANIFESTS,
     createAppInventoryStorage,
     hydrateInventoryStore,
+    flushInventoryStorage: () => inventoryStorage.flush(),
     flushUserStatePersistence,
     getAuthState,
     activeAuthUser,

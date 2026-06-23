@@ -82,6 +82,27 @@ export function createSqlInventoryStorage({ invoke, getState, setInventory, save
     }, 200);
   }
 
+  // Flush any debounced writes immediately. Called on app suspend/close so a
+  // change made right before exit isn't lost in the 200ms save window.
+  function flush() {
+    if (saveTimer) {
+      clearTimeout(saveTimer);
+      saveTimer = null;
+      invoke("inventory_save_snapshot", { userId: null, orgId: null, snapshot: mirror })
+        .catch((err) => console.warn("[inventory-sql] snapshot flush failed:", err));
+    }
+    if (bacnetTimer) {
+      clearTimeout(bacnetTimer);
+      bacnetTimer = null;
+      const state = getState();
+      const list = Array.isArray(state?.bacnetDiscoveryCache)
+        ? state.bacnetDiscoveryCache.slice(0, MAX_PERSIST_DEVICES)
+        : [];
+      invoke("bacnet_cache_save", { userId: null, orgId: null, devices: list })
+        .catch((err) => console.warn("[inventory-sql] bacnet cache flush failed:", err));
+    }
+  }
+
   async function hydrateBacnetCache() {
     const rows = await invoke("bacnet_cache_load", { userId: null, orgId: null });
     let list = Array.isArray(rows) ? rows : [];
@@ -132,6 +153,7 @@ export function createSqlInventoryStorage({ invoke, getState, setInventory, save
     remove,
     hydrate,
     saveBacnetCache,
+    flush,
     isActive: () => active,
   };
 }

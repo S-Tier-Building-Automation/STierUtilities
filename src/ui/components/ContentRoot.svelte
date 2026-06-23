@@ -61,7 +61,12 @@
       pool.set(id, host);
       renderTool(id, host); // first mount — build once
     }
-    // Return visit to an already-built tool: just reveal it, no rebuild.
+    // Return visit to an already-built tool: keep its body (scroll/focus/in-flight
+    // state) but refresh the shell chrome so the header status pill / favorite star
+    // reflect any change that happened while the tool was hidden.
+    else {
+      renderTool(id, host, { chromeOnly: true });
+    }
     host.style.display = "";
     activeId = id;
   }

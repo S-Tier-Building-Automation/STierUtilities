@@ -184,8 +184,17 @@ pub fn decode_f32(hi: u16, lo: u16, word_swap: bool) -> f32 {
 // ---- Networking ----
 
 fn transact(host: &str, port: u16, request: &[u8]) -> Result<Vec<u8>, String> {
+    use std::net::ToSocketAddrs;
     let addr = format!("{host}:{port}");
-    let mut stream = TcpStream::connect(&addr).map_err(|e| format!("connect {addr}: {e}"))?;
+    // Bound the connect: a bare TcpStream::connect to an offline host blocks for
+    // the OS default (20-30s). connect_timeout caps it at DEFAULT_TIMEOUT.
+    let socket_addr = addr
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve {addr}: {e}"))?
+        .next()
+        .ok_or_else(|| format!("could not resolve address {addr}"))?;
+    let mut stream = TcpStream::connect_timeout(&socket_addr, DEFAULT_TIMEOUT)
+        .map_err(|e| format!("connect {addr}: {e}"))?;
     stream
         .set_read_timeout(Some(DEFAULT_TIMEOUT))
         .map_err(|e| e.to_string())?;
@@ -203,8 +212,11 @@ fn transact(host: &str, port: u16, request: &[u8]) -> Result<Vec<u8>, String> {
 
 // ---- Tauri commands ----
 
+// The three command bodies do blocking TCP I/O via `transact`. They are `async`
+// and run the blocking work inside `spawn_blocking` so a slow/unreachable Modbus
+// host never freezes the main thread (and thus the UI).
 #[tauri::command]
-pub fn modbus_read_registers(
+pub async fn modbus_read_registers(
     host: String,
     port: Option<u16>,
     unit_id: Option<u8>,
@@ -218,15 +230,19 @@ pub fn modbus_read_registers(
     let port = port.unwrap_or(502);
     let unit = unit_id.unwrap_or(1);
     let kind = RegisterKind::parse(kind.as_deref().unwrap_or("holding"))?;
-    let txid = 1;
-    let req = build_read_request(txid, unit, kind, address, count);
-    let resp = transact(&host, port, &req)?;
-    let registers = parse_read_response(txid, kind.function(), &resp)?;
-    Ok(RegisterReadResult { address, count, registers })
+    tauri::async_runtime::spawn_blocking(move || -> Result<RegisterReadResult, String> {
+        let txid = 1;
+        let req = build_read_request(txid, unit, kind, address, count);
+        let resp = transact(&host, port, &req)?;
+        let registers = parse_read_response(txid, kind.function(), &resp)?;
+        Ok(RegisterReadResult { address, count, registers })
+    })
+    .await
+    .map_err(|e| format!("modbus task panicked: {e}"))?
 }
 
 #[tauri::command]
-pub fn modbus_write_register(
+pub async fn modbus_write_register(
     host: String,
     port: Option<u16>,
     unit_id: Option<u8>,
@@ -235,14 +251,18 @@ pub fn modbus_write_register(
 ) -> Result<(), String> {
     let port = port.unwrap_or(502);
     let unit = unit_id.unwrap_or(1);
-    let txid = 1;
-    let req = build_write_single_request(txid, unit, address, value);
-    let resp = transact(&host, port, &req)?;
-    parse_write_response(txid, WRITE_SINGLE, &resp)
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let txid = 1;
+        let req = build_write_single_request(txid, unit, address, value);
+        let resp = transact(&host, port, &req)?;
+        parse_write_response(txid, WRITE_SINGLE, &resp)
+    })
+    .await
+    .map_err(|e| format!("modbus task panicked: {e}"))?
 }
 
 #[tauri::command]
-pub fn modbus_write_registers(
+pub async fn modbus_write_registers(
     host: String,
     port: Option<u16>,
     unit_id: Option<u8>,
@@ -254,10 +274,14 @@ pub fn modbus_write_registers(
     }
     let port = port.unwrap_or(502);
     let unit = unit_id.unwrap_or(1);
-    let txid = 1;
-    let req = build_write_multiple_request(txid, unit, address, &values);
-    let resp = transact(&host, port, &req)?;
-    parse_write_response(txid, WRITE_MULTIPLE, &resp)
+    tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
+        let txid = 1;
+        let req = build_write_multiple_request(txid, unit, address, &values);
+        let resp = transact(&host, port, &req)?;
+        parse_write_response(txid, WRITE_MULTIPLE, &resp)
+    })
+    .await
+    .map_err(|e| format!("modbus task panicked: {e}"))?
 }
 
 #[cfg(test)]

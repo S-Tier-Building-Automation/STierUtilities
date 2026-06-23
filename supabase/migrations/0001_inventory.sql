@@ -22,35 +22,42 @@ create table if not exists public.org_members (
   primary key (org_id, user_id)
 );
 
+-- `updated_at` is the CLIENT logical timestamp used for last-write-wins conflict
+-- resolution (newest record wins). `server_updated_at` is the server-assigned
+-- write-ordering timestamp the pull cursor advances on, so a stale offline edit
+-- pushed late can't be missed by other clients' cursors. Keeping them separate is
+-- what lets LWW stay correct while the cursor stays monotonic.
 create table if not exists public.inventory_entities (
-  org_id       text not null,
-  id           text not null,            -- e.g. "equip:<uuid>"
-  type         text not null,
-  name         text,
-  data         jsonb not null,           -- full entity body (tags, sourceRefs, ...)
-  content_hash text not null,
-  created_at   timestamptz,
-  updated_at   timestamptz not null default now(),
-  deleted      boolean not null default false,
-  rev          bigint not null default 1,
+  org_id            text not null,
+  id                text not null,            -- e.g. "equip:<uuid>"
+  type              text not null,
+  name              text,
+  data              jsonb not null,           -- full entity body (tags, sourceRefs, ...)
+  content_hash      text not null,
+  created_at        timestamptz,
+  updated_at        timestamptz not null default now(),
+  server_updated_at timestamptz not null default now(),
+  deleted           boolean not null default false,
+  rev               bigint not null default 1,
   primary key (org_id, id)
 );
 create index if not exists idx_inventory_entities_sync
-  on public.inventory_entities (org_id, updated_at);
+  on public.inventory_entities (org_id, server_updated_at);
 
 create table if not exists public.bacnet_discovery_cache (
-  org_id       text not null,
-  key          text not null,
-  data         jsonb not null,
-  content_hash text not null,
-  seen_at      timestamptz,
-  updated_at   timestamptz not null default now(),
-  deleted      boolean not null default false,
-  rev          bigint not null default 1,
+  org_id            text not null,
+  key               text not null,
+  data              jsonb not null,
+  content_hash      text not null,
+  seen_at           timestamptz,
+  updated_at        timestamptz not null default now(),
+  server_updated_at timestamptz not null default now(),
+  deleted           boolean not null default false,
+  rev               bigint not null default 1,
   primary key (org_id, key)
 );
 create index if not exists idx_bacnet_cache_sync
-  on public.bacnet_discovery_cache (org_id, updated_at);
+  on public.bacnet_discovery_cache (org_id, server_updated_at);
 
 -- ---- Row Level Security: a user only sees/writes rows for orgs they belong to ----
 
@@ -71,12 +78,16 @@ create policy bacnet_cache_member_rw on public.bacnet_discovery_cache
   using (org_id in (select org_id from public.org_members where user_id = auth.uid()))
   with check (org_id in (select org_id from public.org_members where user_id = auth.uid()));
 
--- Keep updated_at fresh on every write so the pull cursor (updated_at > since)
--- stays correct even if a client forgets to set it.
+-- Stamp the server write-ordering column on every write (this is what the pull
+-- cursor advances on). Preserve the client-provided `updated_at` so last-write-
+-- wins compares true record timestamps; only backfill it when a client omitted it.
 create or replace function public.touch_updated_at()
 returns trigger language plpgsql as $$
 begin
-  new.updated_at := now();
+  new.server_updated_at := now();
+  if new.updated_at is null then
+    new.updated_at := now();
+  end if;
   return new;
 end;
 $$;

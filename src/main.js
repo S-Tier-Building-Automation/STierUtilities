@@ -29,6 +29,7 @@ const { hydrateFromStartupWarmup } = createStartupWarmup({
 
 registerPagehideHandler({
   flushUserStatePersistence: app.flushUserStatePersistence,
+  flushInventoryStorage: app.flushInventoryStorage,
   stopLivePoll: () => app.buildingWorkspace?.stopLivePoll(),
   getPackFlushTimer: app.getPackFlushTimer,
   setPackFlushTimer: app.setPackFlushTimer,

@@ -57,6 +57,23 @@ fn max_updated_at(records: &[Value]) -> Option<String> {
         .map(|s| s.to_string())
 }
 
+/// Highest pull-cursor value across `records`. Prefers the server write-ordering
+/// field (`serverUpdatedAt`) so the cursor tracks the server clock; falls back to
+/// `updatedAt` for transports that don't distinguish the two (e.g. the in-memory
+/// test transport).
+fn max_pull_cursor(records: &[Value]) -> Option<String> {
+    records
+        .iter()
+        .filter_map(|r| {
+            r.get("serverUpdatedAt")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .or_else(|| r.get("updatedAt").and_then(|v| v.as_str()))
+        })
+        .max()
+        .map(|s| s.to_string())
+}
+
 /// Run one inventory sync round-trip against `transport`, advancing the cursors.
 pub fn sync_entities(
     conn: &mut rusqlite::Connection,
@@ -81,7 +98,9 @@ pub fn sync_entities(
 
     let remote = transport.pull(ENTITIES_TABLE, last_pull)?;
     let pulled = remote.len();
-    let pull_high = max_updated_at(&remote);
+    // Advance the pull cursor on the server write-ordering field, not the client
+    // LWW timestamp, so late-arriving stale edits aren't skipped by the cursor.
+    let pull_high = max_pull_cursor(&remote);
     let applied = inventory_db::apply_entity_records(conn, org_id, user_id, &remote)?;
     if let Some(ts) = pull_high.as_deref() {
         inventory_db::set_sync_cursor(conn, org_id, user_id, ENTITIES_TABLE, Some(ts), None)?;
@@ -138,11 +157,13 @@ pub fn rest_url(base_url: &str, table: &str) -> String {
     format!("{}/rest/v1/{}", base_url.trim_end_matches('/'), table)
 }
 
-/// Build a PostgREST pull query: org-scoped, changed-since, ordered by updated_at.
+/// Build a PostgREST pull query: org-scoped, changed-since, ordered by the server
+/// write-ordering column (`server_updated_at`) so the cursor is monotonic on the
+/// server's clock rather than the client-supplied LWW timestamp.
 pub fn pull_url(base_url: &str, table: &str, org_id: &str, since: Option<&str>) -> String {
-    let mut u = format!("{}?org_id=eq.{}&order=updated_at.asc", rest_url(base_url, table), org_id);
+    let mut u = format!("{}?org_id=eq.{}&order=server_updated_at.asc", rest_url(base_url, table), org_id);
     if let Some(s) = since {
-        u.push_str(&format!("&updated_at=gt.{s}"));
+        u.push_str(&format!("&server_updated_at=gt.{s}"));
     }
     u
 }
@@ -165,12 +186,15 @@ pub fn push_row(org_id: &str, record: &Value) -> Value {
     })
 }
 
-/// Map a PostgREST row back into the local sync-record shape `apply_entity_records` expects.
+/// Map a PostgREST row back into the local sync-record shape `apply_entity_records`
+/// expects. `updatedAt` is the client LWW timestamp; `serverUpdatedAt` is the
+/// server write-ordering value the pull cursor advances on.
 pub fn pull_record(row: &Value) -> Value {
     serde_json::json!({
         "id": row.get("id").and_then(|v| v.as_str()).unwrap_or(""),
         "data": row.get("data").cloned().unwrap_or(Value::Null),
         "updatedAt": row.get("updated_at").and_then(|v| v.as_str()).unwrap_or(""),
+        "serverUpdatedAt": row.get("server_updated_at").and_then(|v| v.as_str()).unwrap_or(""),
         "deleted": row.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false),
         "rev": row.get("rev").and_then(|v| v.as_i64()).unwrap_or(1),
     })
@@ -364,15 +388,22 @@ pub fn inventory_sync_status(app: tauri::AppHandle) -> Result<SyncStatus, String
 
 /// Run one inventory sync round-trip against the configured Supabase project for
 /// the active org/user scope.
+// Async + spawn_blocking: this command does blocking `ureq` HTTP and SQLite I/O.
+// Running it on the main thread would freeze the UI for the duration of the
+// network round-trip (and any timeout), so the blocking work is offloaded.
 #[cfg(windows)]
 #[tauri::command]
-pub fn inventory_sync_now(app: tauri::AppHandle) -> Result<SyncReport, String> {
-    let token = load_session_token()?.ok_or("no Supabase session; sign in first")?;
-    let cfg = load_config(&app)?.ok_or("Supabase is not configured")?;
-    let (user_id, org_id) = inventory_db::active_scope(&app)?;
-    let mut conn = inventory_db::open_db_for(&app)?;
-    let mut transport = SupabaseTransport::new(cfg, token, org_id.clone());
-    sync_entities(&mut conn, &org_id, &user_id, &mut transport)
+pub async fn inventory_sync_now(app: tauri::AppHandle) -> Result<SyncReport, String> {
+    tauri::async_runtime::spawn_blocking(move || -> Result<SyncReport, String> {
+        let token = load_session_token()?.ok_or("no Supabase session; sign in first")?;
+        let cfg = load_config(&app)?.ok_or("Supabase is not configured")?;
+        let (user_id, org_id) = inventory_db::active_scope(&app)?;
+        let mut conn = inventory_db::open_db_for(&app)?;
+        let mut transport = SupabaseTransport::new(cfg, token, org_id.clone());
+        sync_entities(&mut conn, &org_id, &user_id, &mut transport)
+    })
+    .await
+    .map_err(|e| format!("sync task panicked: {e}"))?
 }
 
 #[cfg(test)]
@@ -445,7 +476,7 @@ mod tests {
         );
         assert_eq!(
             pull_url("https://x.supabase.co", "inventory_entities", "org1", Some("2025-01-01T00:00:00Z")),
-            "https://x.supabase.co/rest/v1/inventory_entities?org_id=eq.org1&order=updated_at.asc&updated_at=gt.2025-01-01T00:00:00Z"
+            "https://x.supabase.co/rest/v1/inventory_entities?org_id=eq.org1&order=server_updated_at.asc&server_updated_at=gt.2025-01-01T00:00:00Z"
         );
         let rec = json!({
             "id": "equip:1",
@@ -460,14 +491,35 @@ mod tests {
         assert_eq!(row["type"], "equip");
         assert_eq!(row["name"], "AHU");
         assert!(row["content_hash"].as_str().unwrap().len() > 0);
-        // Round-trips back to the local record shape.
+        // Round-trips back to the local record shape, exposing both the client LWW
+        // timestamp (updatedAt) and the server cursor field (serverUpdatedAt).
         let pg_row = json!({
             "id": "equip:1", "data": { "type": "equip" },
-            "updated_at": "2025-01-01T00:00:00Z", "deleted": false, "rev": 3
+            "updated_at": "2025-01-01T00:00:00Z",
+            "server_updated_at": "2025-01-02T00:00:00Z",
+            "deleted": false, "rev": 3
         });
         let back = pull_record(&pg_row);
         assert_eq!(back["updatedAt"], "2025-01-01T00:00:00Z");
+        assert_eq!(back["serverUpdatedAt"], "2025-01-02T00:00:00Z");
         assert_eq!(back["id"], "equip:1");
+    }
+
+    #[test]
+    fn pull_cursor_prefers_server_field_with_fallback() {
+        // Supabase rows carry serverUpdatedAt -> the cursor tracks the server clock
+        // even when a row's client updatedAt is far in the future/past.
+        let server_rows = vec![
+            json!({ "updatedAt": "2030-01-01T00:00:00Z", "serverUpdatedAt": "2025-01-01T00:00:00Z" }),
+            json!({ "updatedAt": "2020-01-01T00:00:00Z", "serverUpdatedAt": "2025-06-01T00:00:00Z" }),
+        ];
+        assert_eq!(max_pull_cursor(&server_rows).as_deref(), Some("2025-06-01T00:00:00Z"));
+        // Transports without the field (e.g. MemoryTransport) fall back to updatedAt.
+        let mem_rows = vec![
+            json!({ "updatedAt": "2025-01-01T00:00:00Z" }),
+            json!({ "updatedAt": "2025-03-01T00:00:00Z" }),
+        ];
+        assert_eq!(max_pull_cursor(&mem_rows).as_deref(), Some("2025-03-01T00:00:00Z"));
     }
 
     #[test]

@@ -116,6 +116,17 @@ export function createPluginPageUi({
     ));
   }
 
+  // Rebuild only the shell-owned chrome (breadcrumb + header with status pill and
+  // favorite star), leaving the tool body in place. Used on return visits so the
+  // header reflects status/favorite changes that happened while the tool was
+  // hidden, without rebuilding (and discarding the state of) the live body.
+  function refreshChrome(root, tool) {
+    root.querySelectorAll(":scope > .breadcrumb, :scope > .plugin-header").forEach((n) => n.remove());
+    const frag = document.createDocumentFragment();
+    buildChrome(frag, tool);
+    root.insertBefore(frag, root.firstChild);
+  }
+
   /**
    * Render a tool page into `container` (the ContentRoot keep-alive host; falls
    * back to #view-root). Two kinds of tool:
@@ -124,12 +135,21 @@ export function createPluginPageUi({
    *    only the chrome and re-attach the live body, so the component instance —
    *    and its $state — survive while the status pill/star stay current.
    *  - Legacy tool (tool.renderPage): body rebuilt imperatively each call.
+   * `chromeOnly` (set on return visits) rebuilds just the chrome and preserves the
+   * existing body for BOTH kinds — so a legacy tool's scroll/focus/in-flight state
+   * is not lost, while its header still reflects the latest status/favorite.
    */
-  function renderPage(id, container) {
+  function renderPage(id, container, { chromeOnly = false } = {}) {
     const root = container || document.getElementById("view-root");
     const tool = toolById(id);
     if (!tool) {
       root.replaceChildren(el("p", { class: "empty-state" }, "Unknown plugin."));
+      return;
+    }
+
+    // Return visit to an already-built page: refresh chrome only, keep the body.
+    if (chromeOnly && root.__stMountedId === id) {
+      refreshChrome(root, tool);
       return;
     }
 
@@ -152,6 +172,7 @@ export function createPluginPageUi({
     root.replaceChildren();
     buildChrome(root, tool);
     if (tool.renderPage) root.appendChild(tool.renderPage(tool));
+    root.__stMountedId = id;
   }
 
   return { renderPage, mcpToolRenderers };

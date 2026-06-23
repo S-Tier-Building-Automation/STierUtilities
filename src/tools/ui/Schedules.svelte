@@ -108,8 +108,11 @@
   function buildCommandValue() {
     if (commandKind === "null") return { kind: "null" };
     if (commandKind === "boolean") return { kind: "boolean", value: String(commandValue).toLowerCase() === "true" || commandValue === "1" };
-    if (commandKind === "real") return { kind: "real", value: Number(commandValue) };
-    return { kind: commandKind, value: Math.trunc(Number(commandValue)) };
+    // Reject non-numeric / NaN / Infinity before we write to a live device.
+    const num = Number(commandValue);
+    if (!Number.isFinite(num)) throw new Error(`"${commandValue}" is not a valid number`);
+    if (commandKind === "real") return { kind: "real", value: num };
+    return { kind: commandKind, value: Math.trunc(num) };
   }
 
   async function commandPresentValue() {
