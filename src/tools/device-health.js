@@ -176,7 +176,9 @@ export function createDeviceHealthService({
   function writeMetric(equip, health, ts) {
     if (!timeseries) return;
     const fields = { online: health.status === "online" ? 1 : 0 };
-    if (typeof health.lastRttMs === "number") fields.rtt_ms = health.lastRttMs;
+    // typeof NaN === "number", and the timeseries service rejects non-finite
+    // fields — one bad rtt would otherwise abort the whole sweep.
+    if (Number.isFinite(health.lastRttMs)) fields.rtt_ms = health.lastRttMs;
     timeseries.write({
       measurement: "bacnet_device",
       tags: compactTags({
@@ -262,6 +264,9 @@ export function createDeviceHealthService({
     /** Set a device's lifecycle state (active | maintenance | decommissioned). */
     setLifecycle(equipId, lifecycle) {
       if (!LIFECYCLE_STATES.has(lifecycle)) throw new Error(`invalid lifecycle "${lifecycle}"`);
+      // Guard against a typo'd id creating a phantom equip record.
+      const existing = inventory.getEntity(equipId);
+      if (!existing || existing.type !== "equip") throw new Error(`unknown device "${equipId}"`);
       return inventory.upsertEntity({ id: equipId, type: "equip", lifecycle });
     },
 

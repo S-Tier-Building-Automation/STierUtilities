@@ -321,7 +321,9 @@ export const TOOL_MANIFESTS = [
     provides: [{ capability: "devices", version: "1.0" }],
     requires: [
       { capability: "inventory", version: "^1.0" },
-      { capability: "bacnet.read", version: "^1.0" },
+      // Optional: the service degrades to reachability-only (netscan) monitoring
+      // when bacnet-core is unavailable, matching the factory's tryUse wiring.
+      { capability: "bacnet.read", version: "^1.0", optional: true },
       { capability: "scheduler", version: "^1.0" },
       { capability: "netscan", version: "^1.0", optional: true },
       { capability: "timeseries", version: "^1.0", optional: true },

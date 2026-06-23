@@ -169,13 +169,14 @@ test("listAlerts surfaces offline/degraded but suppresses maintenance lifecycle"
   const inv = inventoryWith([
     { id: "equip:down", name: "Down", deviceInstance: 7, address: "10.0.0.7", health: { status: "offline", since: 10, lastSeenAt: 1 } },
     { id: "equip:maint", name: "Maint", deviceInstance: 8, address: "10.0.0.8", health: { status: "offline", since: 10 }, lifecycle: "maintenance" },
+    { id: "equip:decom", name: "Decom", deviceInstance: 10, address: "10.0.0.10", health: { status: "offline", since: 10 }, lifecycle: "decommissioned" },
     { id: "equip:ok", name: "Ok", deviceInstance: 9, address: "10.0.0.9", health: { status: "online" } },
   ]);
   const scheduler = createScheduler({ timer: fakeTimer() });
   const svc = createDeviceHealthService({ inventory: inv, scheduler });
 
   const alerts = svc.listAlerts();
-  assert.equal(alerts.length, 1);
+  assert.equal(alerts.length, 1); // both maintenance and decommissioned are suppressed
   assert.equal(alerts[0].equipId, "equip:down");
   assert.equal(alerts[0].status, "offline");
   assert.equal(alerts[0].deviceInstance, 7);
@@ -187,6 +188,7 @@ test("setLifecycle validates and persists; start/stop toggle the scheduler job",
   const svc = createDeviceHealthService({ inventory: inv, scheduler });
 
   assert.throws(() => svc.setLifecycle("equip:x", "bogus"), /invalid lifecycle/);
+  assert.throws(() => svc.setLifecycle("equip:ghost", "active"), /unknown device/);
   svc.setLifecycle("equip:x", "decommissioned");
   assert.equal(inv.getEntity("equip:x").lifecycle, "decommissioned");
 

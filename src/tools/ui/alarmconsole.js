@@ -167,8 +167,9 @@ export function createAlarmConsoleUi({
     const alerts = alertsCap();
     if (!inv || !alerts) return { label: "—", cls: "pill-muted" };
     const ruleFails = alerts.listRuleFindings({ status: ["fail"] }).length;
+    const deviceFails = alerts.listDeviceAlerts ? alerts.listDeviceAlerts().length : 0;
     const liveActive = (bacnetAlarms || []).filter((a) => a.status === "active").length;
-    const total = ruleFails + liveActive;
+    const total = deviceFails + ruleFails + liveActive;
     return total ? { label: `${total} alert${total === 1 ? "" : "s"}`, cls: "pill-warn" } : { label: "Clear", cls: "pill-running" };
   }
 
