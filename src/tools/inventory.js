@@ -1,9 +1,13 @@
 // Building inventory / lightweight Haystack model service.
 // Local-first, pure, and storage-injected so tests can run without Tauri.
 
-const ENTITY_TYPES = new Set(["site", "building", "floor", "equip", "point", "sourceRef", "tag", "template", "commissioningRun", "ruleRun"]);
+import { bumpInventoryVersion } from "../platform/store.js";
+
+const ENTITY_TYPES = new Set(["site", "building", "floor", "equip", "point", "sourceRef", "tag", "template", "commissioningRun", "ruleRun", "note"]);
 const BACNET_REF_RE = /^bacnet:(\d+):(\d+):(\d+)$/;
 const NIAGARA_REF_RE = /^niagara:([^:]+):(.+)$/;
+// modbus:<unitId>:<holding|input>:<registerAddress>
+const MODBUS_REF_RE = /^modbus:(\d+):(holding|input):(\d+)$/;
 
 export const DEFAULT_TEMPLATES = [
   { id: "template:vav", type: "template", name: "VAV", tags: { equip: true, vav: true, hvac: true }, graphicId: "vav-reheat-series" },
@@ -46,11 +50,25 @@ export function parseSourceRef(ref) {
   }
   m = NIAGARA_REF_RE.exec(s);
   if (m) return { kind: "niagara", station: m[1], ord: m[2] };
+  m = MODBUS_REF_RE.exec(s);
+  if (m) {
+    return {
+      kind: "modbus",
+      unitId: Number(m[1]),
+      register: m[2],
+      address: Number(m[3]),
+    };
+  }
   return null;
 }
 
 export function bacnetSourceRef(deviceInstance, objectType, instance) {
   return `bacnet:${Number(deviceInstance)}:${Number(objectType)}:${Number(instance)}`;
+}
+
+export function modbusSourceRef(unitId, register, address) {
+  const reg = String(register).toLowerCase() === "input" ? "input" : "holding";
+  return `modbus:${Number(unitId)}:${reg}:${Number(address)}`;
 }
 
 function normalizeSourceRefs(sourceRefs) {
@@ -120,6 +138,7 @@ export function createInventory({ storage = createMemoryInventoryStorage(), now 
   function persist() {
     state.entities = [...ids.values()].map(clone);
     storage.save(state);
+    bumpInventoryVersion(); // notify store-backed Svelte tools (no native change event)
   }
 
   function loadFromStorage() {

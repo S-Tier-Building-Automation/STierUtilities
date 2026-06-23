@@ -31,6 +31,13 @@ socket2 = "0.5"
 # time/heap-address seeded xorshift). Pinned to the 0.2 line already in the tree.
 getrandom = "0.2"
 keyring = { version = "4.1.1", features = ["windows-native-keyring-store"] }
+# Embedded SQLite for the local-first controller inventory + BACnet discovery
+# cache (row-per-entity with sync metadata). `bundled` compiles SQLite from
+# source so there's no system dependency to ship.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# Lightweight blocking HTTPS client for the Supabase Cloud sync transport
+# (PostgREST upsert/select). Blocking fits the synchronous sync orchestrator.
+ureq = { version = "2", features = ["json", "tls"] }
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.61", features = [

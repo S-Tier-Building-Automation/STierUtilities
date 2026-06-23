@@ -43,6 +43,8 @@ pnpm install
 pnpm tauri dev
 ```
 
+The frontend is built with **Vite + Svelte 5**. `pnpm tauri dev` runs `pnpm dev` (the Vite dev server on `http://localhost:1420`, with HMR) automatically via `beforeDevCommand`, so editing files under `src/` hot-reloads in the window — there is no longer a "just edit and refresh the static files" path. To work on the frontend alone (in a browser, without the Tauri shell), run `pnpm dev`. `pnpm build` produces the bundled `dist/` that `pnpm tauri build` ships.
+
 The hub window opens. **Enable** ClipboardTyper from its card; middle-click anywhere to send your clipboard text to the focused local window. **Disable** restores native middle-click. Sliders inside the card live-tune timing, which can help if a remote-desktop client forwards injected input but drops Shift on shifted characters. If a tool like DeskIn receives nothing at all, it is likely blocking injected input rather than needing a slower delay.
 
 ## Build a Windows installer

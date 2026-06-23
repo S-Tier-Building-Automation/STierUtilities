@@ -1,5 +1,7 @@
 // Persistent UI preferences and local profile / folder sync.
 
+import { setRouteFromView } from "./router.js";
+
 export const STORAGE_KEY = "microtools.user_state.v2";
 
 /** Clamp persisted sidebar width to the resizer bounds (160–360px). */
@@ -22,6 +24,7 @@ export function normalizeUserState(stored = {}) {
     nmRailWidth: Number.isFinite(stored.nmRailWidth) ? stored.nmRailWidth : 240,
     sidebarWidth: Number.isFinite(stored.sidebarWidth) ? stored.sidebarWidth : 200,
     view: typeof stored.view === "string" ? stored.view : "home",
+    theme: stored.theme === "light" || stored.theme === "system" ? stored.theme : "dark",
     sidebarCollapsed: Boolean(stored.sidebarCollapsed),
     activityToolFilter: typeof stored.activityToolFilter === "string" ? stored.activityToolFilter : "all",
     activityKindFilter: typeof stored.activityKindFilter === "string" ? stored.activityKindFilter : "all",
@@ -87,6 +90,8 @@ export function createUserStateManager({
   };
 
   const userState = loadUserState();
+  // Keep the reactive route store aligned with the persisted view from the start.
+  setRouteFromView(userState.view);
 
   function saveUserState() {
     userState._persistedAt = Date.now();
@@ -388,6 +393,7 @@ export function createUserStateManager({
       touchRecentTool(view.slice("plugin:".length));
     }
     userState.view = view;
+    setRouteFromView(view);
     saveUserState();
     try { window.dispatchEvent(new CustomEvent("stier:view-change")); } catch (_) {}
     renderAll();

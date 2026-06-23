@@ -40,7 +40,7 @@ import { toast } from "../../ui/toast.js";
  */
 export function createBacnetManagerUi({
   invoke, listen, el, logTo, renderAll, renderScoped, networkManager, platformHost,
-  userState, saveUserState, currentPluginId, getInventory, setView, pluginView,
+  userState, saveUserState, currentPluginId, getInventory, persistBacnetCache, setView, pluginView,
 }) {
 
 function inventoryInstance() {
@@ -834,12 +834,20 @@ function bacRecordDiscoveryDrift(devices) {
     bac.driftSummary = drift.summary;
     bac.driftMissing = drift.missing || [];
     bac.deviceStatusByKey = Object.fromEntries(drift.devices.map((d) => [d.key, d.status]));
-    userState.bacnetDiscoveryCache = devices.slice(0, BAC_MAX_PERSIST_DEVICES).map((d) => ({
+    const serialized = devices.slice(0, BAC_MAX_PERSIST_DEVICES).map((d) => ({
       key: d.key, instance: d.instance, address: d.address,
       network: d.network ?? null, mac: d.mac ?? null,
       vendorId: d.vendorId ?? null, modelName: d.modelName ?? null, name: d.name ?? null,
     }));
-    saveUserState();
+    // Persist the new baseline. The SQLite-backed store keeps the in-memory
+    // userState mirror in sync and writes the durable copy to the database;
+    // without it (no session / non-Windows) we fall back to the user-state blob.
+    if (persistBacnetCache) {
+      persistBacnetCache(serialized);
+    } else {
+      userState.bacnetDiscoveryCache = serialized;
+      saveUserState();
+    }
   } catch (_) {
     bac.driftSummary = null;
     bac.driftMissing = [];

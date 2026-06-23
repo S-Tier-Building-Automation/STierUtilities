@@ -20,6 +20,7 @@ import { initHeaderSearch } from "../ui/header-search.js";
  */
 export function registerPagehideHandler({
   flushUserStatePersistence,
+  flushInventoryStorage,
   stopLivePoll,
   getPackFlushTimer,
   setPackFlushTimer,
@@ -28,6 +29,9 @@ export function registerPagehideHandler({
 }) {
   window.addEventListener("pagehide", () => {
     flushUserStatePersistence();
+    // Flush any debounced inventory/BACnet-cache writes so a change made right
+    // before exit is durably persisted to SQLite.
+    flushInventoryStorage?.();
     stopLivePoll?.();
     const timer = getPackFlushTimer();
     if (timer) {
@@ -141,6 +145,7 @@ export async function runBootstrap({
   saveUserState,
   initSidebarSplitter,
   authBootstrapUserState,
+  hydrateInventoryStore,
   accountMenu,
   initWindowControls,
   hydrateFromStartupWarmup,
@@ -148,10 +153,7 @@ export async function runBootstrap({
   isHidden = () => false,
   pluginView = (id) => `plugin:${id}`,
 }) {
-  for (const btn of document.querySelectorAll(".sidebar-nav-item")) {
-    btn.addEventListener("click", () => setView(btn.dataset.view));
-  }
-
+  // Sidebar nav + brand are owned by the Svelte Sidebar (mounted in app-tools.js).
   initHeaderSearch({ getTools, isHidden, setView, pluginView });
 
   document
@@ -164,13 +166,18 @@ export async function runBootstrap({
   initWindowControls();
 
   await authBootstrapUserState();
+  // Hydrate the SQLite-backed inventory store for the active scope before the
+  // platform builds the inventory service (its load() is synchronous), so the
+  // first load serves the database snapshot rather than the legacy blob.
+  try {
+    await hydrateInventoryStore?.();
+  } catch (err) {
+    console.warn("[bootstrap] inventory store hydration failed:", err);
+  }
   applySidebarCollapsed();
 
-  try {
-    await tools.clipboardTyper.hydrate(await invoke("clipboardtyper_get_state"));
-  } catch (err) {
-    logTo("clipboardtyper", `Could not read state: ${err}`, "error");
-  }
+  // ClipboardTyper is now a Svelte component that hydrates + binds its own
+  // backend events in onMount; no bootstrap hydrate/bindEvents needed.
 
   try {
     const telemetry = createTimeseries();

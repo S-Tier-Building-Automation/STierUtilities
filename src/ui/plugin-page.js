@@ -4,6 +4,7 @@
 // Tools must not re-render those in renderPage(); use headerAddonFor for context only.
 // See docs/rendering-standards.md § Tool page chrome ownership.
 
+import { mount } from "svelte";
 import { openModal } from "./modal.js";
 import { openExternal } from "./dom.js";
 
@@ -70,14 +71,10 @@ export function createPluginPageUi({
     return { renderStatusPill: () => mcpStatusPill(m), renderPage: () => renderMcpToolPage(m) };
   }
 
-  function renderPage(id) {
-    const root = document.getElementById("view-root");
-    root.replaceChildren();
-    const tool = toolById(id);
-    if (!tool) {
-      root.appendChild(el("p", { class: "empty-state" }, "Unknown plugin."));
-      return;
-    }
+  // Build the shell-owned chrome (back link + plugin header with title, status
+  // pill, favorite star) into `root`. Returns nothing; the body is appended by
+  // the caller. Tools must NOT render this themselves.
+  function buildChrome(root, tool) {
     const status = tool.renderStatusPill ? tool.renderStatusPill() : null;
     const fav = isFavorite(tool.id);
     const headerAddon = headerAddonFor(tool);
@@ -117,8 +114,65 @@ export function createPluginPageUi({
         }, fav ? "★" : "☆"),
       ),
     ));
+  }
 
+  // Rebuild only the shell-owned chrome (breadcrumb + header with status pill and
+  // favorite star), leaving the tool body in place. Used on return visits so the
+  // header reflects status/favorite changes that happened while the tool was
+  // hidden, without rebuilding (and discarding the state of) the live body.
+  function refreshChrome(root, tool) {
+    root.querySelectorAll(":scope > .breadcrumb, :scope > .plugin-header").forEach((n) => n.remove());
+    const frag = document.createDocumentFragment();
+    buildChrome(frag, tool);
+    root.insertBefore(frag, root.firstChild);
+  }
+
+  /**
+   * Render a tool page into `container` (the ContentRoot keep-alive host; falls
+   * back to #view-root). Two kinds of tool:
+   *  - Svelte tool (tool.component): the body is a Svelte component mounted ONCE
+   *    and left reactive. On a self-refresh (renderAll while active) we rebuild
+   *    only the chrome and re-attach the live body, so the component instance —
+   *    and its $state — survive while the status pill/star stay current.
+   *  - Legacy tool (tool.renderPage): body rebuilt imperatively each call.
+   * `chromeOnly` (set on return visits) rebuilds just the chrome and preserves the
+   * existing body for BOTH kinds — so a legacy tool's scroll/focus/in-flight state
+   * is not lost, while its header still reflects the latest status/favorite.
+   */
+  function renderPage(id, container, { chromeOnly = false } = {}) {
+    const root = container || document.getElementById("view-root");
+    const tool = toolById(id);
+    if (!tool) {
+      root.replaceChildren(el("p", { class: "empty-state" }, "Unknown plugin."));
+      return;
+    }
+
+    // Return visit to an already-built page: refresh chrome only, keep the body.
+    if (chromeOnly && root.__stMountedId === id) {
+      refreshChrome(root, tool);
+      return;
+    }
+
+    if (tool.component) {
+      const liveBody = root.__stMountedId === id ? root.querySelector(":scope > .plugin-body") : null;
+      root.replaceChildren();
+      buildChrome(root, tool);
+      if (liveBody) {
+        root.appendChild(liveBody); // re-attach the already-mounted Svelte body
+      } else {
+        const body = el("div", { class: "plugin-body" });
+        root.appendChild(body);
+        const props = typeof tool.componentProps === "function" ? tool.componentProps() : (tool.componentProps || {});
+        mount(tool.component, { target: body, props });
+        root.__stMountedId = id;
+      }
+      return;
+    }
+
+    root.replaceChildren();
+    buildChrome(root, tool);
     if (tool.renderPage) root.appendChild(tool.renderPage(tool));
+    root.__stMountedId = id;
   }
 
   return { renderPage, mcpToolRenderers };

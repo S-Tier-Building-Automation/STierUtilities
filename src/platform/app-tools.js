@@ -1,9 +1,28 @@
 // Tool catalog, first-party UI factories, and app shell assembly.
 
+import { mount } from "svelte";
+import ContentRoot from "../ui/components/ContentRoot.svelte";
+import CommandPalette from "../ui/components/CommandPalette.svelte";
+import Sidebar from "../ui/components/Sidebar.svelte";
+import Breadcrumb from "../ui/components/Breadcrumb.svelte";
 import { TOOL_MANIFESTS } from "../tools/manifests.js";
 import { validateManifest } from "./manifest.js";
-import { createUserStateInventoryStorage } from "../tools/inventory.js";
+import { createSqlInventoryStorage } from "./services/inventory-sql-storage.js";
 import { createUserStateManager } from "./user-state.js";
+import {
+  renderAll as renderAllBridge,
+  renderScoped as renderScopedBridge,
+  configureRenderBridge,
+} from "./render-bridge.js";
+import { registerScopedRenderer } from "./scope-registry.js";
+import {
+  systemStatus as systemStatusStore,
+  activitySummary as activitySummaryStore,
+  tools as toolsStore,
+  theme as themeStore,
+  applyTheme,
+  syncFromUserState,
+} from "./store.js";
 import {
   el,
   pickHeicMovFiles,
@@ -17,28 +36,33 @@ import {
   createPluginPageUi,
   createAppShell,
 } from "../ui/index.js";
-import { createClipboardTyperUi } from "../tools/ui/clipboardtyper.js";
-import { createHeicMovUi } from "../tools/ui/heicmov.js";
 import { createNetworkManagerUi } from "../tools/ui/networkmanager.js";
 import { createBacnetManagerUi } from "../tools/ui/bacnetmanager.js";
 import { createObservabilityUi } from "../tools/ui/observability.js";
 import { createBuildingWorkspaceUi } from "../tools/ui/buildingworkspace.js";
 import { createBacnetHistorianUi } from "../tools/ui/bacnethistorian.js";
 import { createDeviceGraphicsUi } from "../tools/ui/devicegraphics.js";
-import { createBuildingAnalyticsUi } from "../tools/ui/buildinganalytics.js";
-import { createAlarmConsoleUi } from "../tools/ui/alarmconsole.js";
+import { createGraphicsBuilderUi } from "../tools/ui/graphicsbuilder.js";
+import Notes, { statusPill as notesStatusPill } from "../tools/ui/Notes.svelte";
+import DesignSystem from "../tools/ui/DesignSystem.svelte";
+// Migrated Svelte tools (Phase 3).
+import AlarmConsole, { statusPill as alarmConsoleStatusPill } from "../tools/ui/AlarmConsole.svelte";
+import Schedules, { statusPill as schedulesStatusPill } from "../tools/ui/Schedules.svelte";
+import HeicMov, { statusPill as heicMovStatusPill } from "../tools/ui/HeicMov.svelte";
+import ClipboardTyper, { statusPill as clipboardTyperStatusPill } from "../tools/ui/ClipboardTyper.svelte";
+import BuildingAnalytics, { statusPill as buildingAnalyticsStatusPill } from "../tools/ui/BuildingAnalytics.svelte";
+// Device Manager is a new imperative el()-built tool (not yet migrated to Svelte).
 import { createDeviceManagerUi } from "../tools/ui/devicemanager.js";
 
 /**
  * @param {object} deps
- * @param {{ renderAll(): void, renderScoped(scope?: string): void }} deps.appUi
  * @param {typeof import("./tauri.js").invoke} deps.invoke
  * @param {typeof import("./tauri.js").listen} deps.listen
  * @param {typeof import("./tauri.js").convertFileSrc} deps.convertFileSrc
  * @param {string} deps.appVersion
  * @param {() => object|null} [deps.getTelemetry]
  */
-export function createApplication({ appUi, invoke, listen, convertFileSrc, appVersion, getTelemetry = () => null }) {
+export function createApplication({ invoke, listen, convertFileSrc, appVersion, getTelemetry = () => null }) {
   const TOOL_RENDERERS = {};
   let pluginPage = null;
 
@@ -49,8 +73,6 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
   let buildingWorkspace = null;
   let bacnetHistorian = null;
   let deviceGraphics = null;
-  let buildingAnalytics = null;
-  let alarmConsole = null;
   let deviceManager = null;
 
   let ALL_MANIFESTS = [...TOOL_MANIFESTS];
@@ -77,7 +99,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
   function rebuildCatalog() {
     const installed = (userState.installedTools || []).filter((m) => validateManifest(m).valid);
     ALL_MANIFESTS = [...TOOL_MANIFESTS, ...installed];
-    TOOLS = ALL_MANIFESTS.map(manifestToTool).filter((t) => t.renderPage);
+    TOOLS = ALL_MANIFESTS.map(manifestToTool).filter((t) => t.renderPage || t.component);
   }
 
   function toolById(id) { return TOOLS.find((t) => t.id === id); }
@@ -97,12 +119,22 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     applySidebarCollapsed();
     inventoryInstance()?.reload?.();
     bacnetHistorian?.restore({ replace: true });
+    // The active org/user may have changed; re-hydrate the SQLite-backed store
+    // for the new scope, then reload the inventory from the fresh snapshot.
+    Promise.resolve(inventoryStorage?.hydrate?.())
+      .then((wasActive) => {
+        if (wasActive) {
+          inventoryInstance()?.reload?.();
+          bacnetHistorian?.restore({ replace: true });
+        }
+      })
+      .catch(() => {});
   }
 
   const userStateApi = createUserStateManager({
     invoke,
     pickFolder,
-    renderAll: () => appUi.renderAll(),
+    renderAll: renderAllBridge,
     getAllManifests: () => ALL_MANIFESTS,
     onCatalogRebuild: rebuildCatalog,
     onScopedStateReload: applyScopedUserState,
@@ -146,15 +178,30 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
 
   rebuildCatalog();
 
+  // Single SQLite-backed inventory storage adapter, reused for the lifetime of
+  // the app so its hydrated mirror survives re-wiring. Falls back to the legacy
+  // user-state blob storage until a scope is hydrated from the database.
+  const inventoryStorage = createSqlInventoryStorage({
+    invoke,
+    getState: () => userState,
+    setInventory: (inventory, meta = {}) => {
+      userState.inventory = inventory;
+      if (meta.legacyMigrated) userState.inventoryLegacyMigrated = true;
+      saveUserState();
+    },
+    saveUserState,
+  });
+
   function createAppInventoryStorage() {
-    return createUserStateInventoryStorage({
-      getState: () => userState,
-      setInventory: (inventory, meta = {}) => {
-        userState.inventory = inventory;
-        if (meta.legacyMigrated) userState.inventoryLegacyMigrated = true;
-        saveUserState();
-      },
-    });
+    return inventoryStorage;
+  }
+
+  function hydrateInventoryStore() {
+    return inventoryStorage.hydrate();
+  }
+
+  function persistBacnetCache(devices) {
+    inventoryStorage.saveBacnetCache(devices);
   }
 
   function activityToolLabel(toolId) {
@@ -170,34 +217,28 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     getTools: () => TOOLS,
     isHidden,
     toolLabel: activityToolLabel,
-    renderChrome: () => appUi.renderScoped("chrome"),
+    renderChrome: () => renderScopedBridge("chrome"),
   });
   const logTo = activity.logTo;
 
-  const clipboardTyper = createClipboardTyperUi({
-    invoke, el, logTo, renderAll: () => appUi.renderAll(),
-  });
-  const heicMov = createHeicMovUi({
-    invoke, convertFileSrc, el, logTo, renderAll: () => appUi.renderAll(),
-    pickHeicMovFiles, pickFolder,
-  });
   const networkManager = createNetworkManagerUi({
-    invoke, listen, el, logTo, renderAll: () => appUi.renderAll(),
+    invoke, listen, el, logTo, renderAll: renderAllBridge,
     userState, saveUserState, currentPluginId,
   });
   const observability = createObservabilityUi({
-    invoke, listen, el, logTo, renderAll: () => appUi.renderAll(),
+    invoke, listen, el, logTo, renderAll: renderAllBridge,
     getPack: () => pack, getTelemetry, currentPluginId,
   });
   bacnetManager = createBacnetManagerUi({
-    invoke, listen, el, logTo, renderAll: () => appUi.renderAll(),
-    renderScoped: (scope) => appUi.renderScoped(scope),
+    invoke, listen, el, logTo, renderAll: renderAllBridge,
+    renderScoped: renderScopedBridge,
     networkManager, platformHost, userState, saveUserState, currentPluginId,
     getInventory: () => (platform ? platform.capability("inventory.v1") : null),
+    persistBacnetCache,
     setView, pluginView,
   });
   bacnetHistorian = createBacnetHistorianUi({
-    el, logTo, renderAll: () => appUi.renderAll(),
+    el, logTo, renderAll: renderAllBridge,
     userState, saveUserState,
     getPlatform: () => platform,
     getInventory: () => (platform ? platform.capability("inventory.v1") : null),
@@ -205,8 +246,8 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
   });
   buildingWorkspace = createBuildingWorkspaceUi({
     invoke, el, logTo,
-    renderAll: () => appUi.renderAll(),
-    renderScoped: (scope) => appUi.renderScoped(scope),
+    renderAll: renderAllBridge,
+    renderScoped: renderScopedBridge,
     userState, saveUserState, getPlatform: () => platform,
     networkManager, setView, pluginView, currentPluginId, listen,
     getPack: () => pack, getTelemetry,
@@ -215,45 +256,75 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     histPersist: () => bacnetHistorian.persist(),
   });
   deviceGraphics = createDeviceGraphicsUi({
-    el, logTo, renderAll: () => appUi.renderAll(),
+    el, logTo, renderAll: renderAllBridge,
     getPlatform: () => platform,
     getInventory: () => (platform ? platform.capability("inventory.v1") : null),
     currentPluginId, userState, saveUserState,
   });
-  buildingAnalytics = createBuildingAnalyticsUi({
-    el, logTo, renderAll: () => appUi.renderAll(),
-    getPlatform: () => platform,
-    getInventory: () => (platform ? platform.capability("inventory.v1") : null),
-    userState, saveUserState, setView, pluginView,
-  });
-  alarmConsole = createAlarmConsoleUi({
-    el, logTo, renderAll: () => appUi.renderAll(),
+  const graphicsBuilder = createGraphicsBuilderUi({
+    el, logTo, renderAll: renderAllBridge,
     getPlatform: () => platform,
     getInventory: () => (platform ? platform.capability("inventory.v1") : null),
     userState, saveUserState,
   });
+  // Shared getter for the migrated Svelte tools that read the building model.
+  const toolGetInventory = () => (platform ? platform.capability("inventory.v1") : null);
+  const getPlatformFn = () => platform;
+  // HeicMov publishes its live $state proxy here (via bindState) so the shell's
+  // synchronous status pill can read it; seeded with a safe default pre-mount.
+  let heicMovState = { files: [], busy: false, busyLabel: "", progress: null };
   deviceManager = createDeviceManagerUi({
-    el, logTo, renderAll: () => appUi.renderAll(),
+    el, logTo, renderAll: renderAllBridge,
     getPlatform: () => platform,
     getInventory: () => (platform ? platform.capability("inventory.v1") : null),
     userState, saveUserState,
   });
 
   Object.assign(TOOL_RENDERERS, {
-    clipboardtyper: { renderStatusPill: clipboardTyper.renderStatusPill, renderPage: clipboardTyper.renderPage },
-    heicmov: { renderStatusPill: heicMov.renderStatusPill, renderPage: heicMov.renderPage },
+    clipboardtyper: {
+      renderStatusPill: clipboardTyperStatusPill,
+      component: ClipboardTyper,
+      componentProps: { invoke, logTo, listen },
+    },
+    heicmov: {
+      renderStatusPill: () => heicMovStatusPill(heicMovState),
+      component: HeicMov,
+      componentProps: {
+        invoke, convertFileSrc, logTo, pickHeicMovFiles, pickFolder,
+        bindState: (s) => { heicMovState = s; },
+      },
+    },
     networkmanager: { renderStatusPill: networkManager.renderStatusPill, renderPage: networkManager.renderPage },
     "bacnet-manager": { renderStatusPill: bacnetManager.renderStatusPill, renderPage: bacnetManager.renderPage },
     observability: { renderStatusPill: observability.renderStatusPill, renderPage: observability.renderPage },
     "building-workspace": { renderStatusPill: buildingWorkspace.renderStatusPill, renderPage: buildingWorkspace.renderPage },
     "bacnet-historian": { renderStatusPill: bacnetHistorian.renderStatusPill, renderPage: bacnetHistorian.renderPage },
     "device-graphics": { renderStatusPill: deviceGraphics.renderStatusPill, renderPage: deviceGraphics.renderPage },
-    "building-analytics": { renderStatusPill: buildingAnalytics.renderStatusPill, renderPage: buildingAnalytics.renderPage },
-    "alarm-console": { renderStatusPill: alarmConsole.renderStatusPill, renderPage: alarmConsole.renderPage },
+    "building-analytics": {
+      renderStatusPill: () => buildingAnalyticsStatusPill(toolGetInventory, userState),
+      component: BuildingAnalytics,
+      componentProps: { logTo, getPlatform: getPlatformFn, getInventory: toolGetInventory, userState, saveUserState, setView, pluginView },
+    },
+    "alarm-console": {
+      renderStatusPill: () => alarmConsoleStatusPill(getPlatformFn, toolGetInventory),
+      component: AlarmConsole,
+      componentProps: { logTo, getPlatform: getPlatformFn, getInventory: toolGetInventory, userState, saveUserState },
+    },
+    "graphics-builder": { renderStatusPill: graphicsBuilder.renderStatusPill, renderPage: graphicsBuilder.renderPage },
+    schedules: {
+      renderStatusPill: () => schedulesStatusPill(getPlatformFn, userState),
+      component: Schedules,
+      componentProps: { logTo, getPlatform: getPlatformFn, getInventory: toolGetInventory, userState, saveUserState },
+    },
+    notes: {
+      renderStatusPill: () => notesStatusPill(toolGetInventory, userState),
+      component: Notes,
+      componentProps: { getInventory: toolGetInventory, userState, saveUserState, logTo },
+    },
+    "design-system": { renderStatusPill: () => ({ label: "Reference", cls: "pill-idle" }), component: DesignSystem },
     "device-manager": { renderStatusPill: deviceManager.renderStatusPill, renderPage: deviceManager.renderPage },
   });
   rebuildCatalog();
-  clipboardTyper.bindEvents(listen);
 
   const settingsPage = createSettingsPageUi({
     invoke, el,
@@ -273,6 +344,17 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     mcpRemove: (id) => settingsPage.mcpRemove(id),
   });
   rebuildCatalog();
+
+  // Mount the Svelte ContentRoot that owns the keep-alive pool for tool pages.
+  // It registers its imperative {showTool, showBuiltin} API via content-host.js,
+  // which app-shell.renderCurrentPage drives. Built-in pages still use #view-root.
+  const contentRootTarget = document.getElementById("app-content-root");
+  if (contentRootTarget) {
+    mount(ContentRoot, {
+      target: contentRootTarget,
+      props: { renderTool: (id, host, opts) => pluginPage.renderPage(id, host, opts) },
+    });
+  }
 
   const library = createLibraryUi({
     el, getUserState: () => userState, saveUserState, getTools: () => TOOLS,
@@ -333,7 +415,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     getAuthSyncBusy, getAuthSyncMessage,
     authCreateLocalAccount, authSwitchOrg, authCreateOrg, authSignOut,
     authExportSnapshot, authPickSyncFolder, authClearSyncFolder, authSyncNow,
-    renderAll: () => appUi.renderAll(),
+    renderAll: renderAllBridge,
   });
 
   const appShell = createAppShell({
@@ -350,17 +432,79 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
       activity,
       plugin: pluginPage,
     },
-    getBuildingWorkspace: () => buildingWorkspace,
-    getBacnetManager: () => bacnetManager,
     getActivitySummary: () => activity.activitySummary(),
     getSystemStatus,
     getRecentTools,
     toolById,
   });
 
+  // Route the legacy renderAll()/renderScoped() API through the render bridge.
+  // Chrome + page rendering stay imperative (app-shell) for now; the bridge just
+  // composes them and lets tools register scoped renderers instead of the shell
+  // hard-coding tool-specific dispatch.
+  configureRenderBridge({
+    renderChrome: appShell.renderChrome,
+    renderPage: () => appShell.renderScoped("page"),
+    pushStatus: () => {
+      systemStatusStore.set(getSystemStatus());
+      activitySummaryStore.set(activity.activitySummary());
+      // Refresh the chrome stores from the source-of-truth userState/catalog so
+      // the Svelte Sidebar reacts on the same triggers the old renderChrome used.
+      syncFromUserState(userState);
+      toolsStore.set(TOOLS);
+    },
+  });
+  registerScopedRenderer("building-workspace", () => buildingWorkspace?.renderWorkspaceScope?.());
+  registerScopedRenderer("building-workspace:tab", () => buildingWorkspace?.renderTabScope?.());
+  registerScopedRenderer("building-workspace:model", () =>
+    buildingWorkspace?.renderModelScope?.({ tree: true, details: true, header: true }));
+  registerScopedRenderer("bacnet-manager:devices", () => bacnetManager?.renderDevicesScope?.());
+  registerScopedRenderer("bacnet-manager:inbox", () => bacnetManager?.renderInboxScope?.());
+  // Seed the reactive stores from current state (consumed by Svelte chrome in Phase 2).
+  syncFromUserState(userState);
+  toolsStore.set(TOOLS);
+
+  // Theme: apply current preference to <html data-theme>, then keep DOM + persisted
+  // state in sync when the theme store changes (toggle / command palette).
+  applyTheme(userState.theme);
+  themeStore.subscribe((t) => {
+    applyTheme(t);
+    if (userState.theme !== t) {
+      userState.theme = t;
+      saveUserState();
+    }
+  });
+
+  // Command palette (Ctrl/Cmd-K) — global overlay, mounted once on the body.
+  mount(CommandPalette, {
+    target: document.body,
+    props: {
+      setView,
+      pluginView,
+      checkForUpdates: appShell.checkForUpdates,
+      setSidebarCollapsed,
+      getSidebarCollapsed: () => userState.sidebarCollapsed,
+    },
+  });
+
+  // Reactive chrome: Svelte Sidebar + route-driven Breadcrumb replace the
+  // imperative renderSidebar()/renderHeaderBreadcrumb() in app-shell. They mount
+  // into the existing static containers (clearing the placeholder markup).
+  const sidebarEl = document.querySelector("aside.sidebar");
+  if (sidebarEl) {
+    sidebarEl.replaceChildren();
+    mount(Sidebar, { target: sidebarEl, props: { setView, pluginView, appVersion } });
+  }
+  const breadcrumbEl = document.getElementById("header-breadcrumb");
+  if (breadcrumbEl) {
+    breadcrumbEl.replaceChildren();
+    mount(Breadcrumb, { target: breadcrumbEl, props: { setView } });
+  }
+
   return {
-    renderAll: appShell.renderAll,
-    renderScoped: appShell.renderScoped,
+    renderAll: renderAllBridge,
+    renderScoped: renderScopedBridge,
+    renderChrome: appShell.renderChrome,
     checkForUpdates: appShell.checkForUpdates,
     getTools: () => TOOLS,
     isHidden,
@@ -371,6 +515,8 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     rebuildCatalog,
     getAllManifests: () => ALL_MANIFESTS,
     createAppInventoryStorage,
+    hydrateInventoryStore,
+    flushInventoryStorage: () => inventoryStorage.flush(),
     flushUserStatePersistence,
     getAuthState,
     activeAuthUser,
@@ -385,7 +531,7 @@ export function createApplication({ appUi, invoke, listen, convertFileSrc, appVe
     getPack: () => pack,
     getPackFlushTimer: () => packFlushTimer,
     setPackFlushTimer: (timer) => { packFlushTimer = timer; },
-    tools: { clipboardTyper, networkManager, observability, bacnetHistorian },
+    tools: { networkManager, observability, bacnetHistorian },
     get buildingWorkspace() { return buildingWorkspace; },
     get bacnetManager() { return bacnetManager; },
     get networkManager() { return networkManager; },

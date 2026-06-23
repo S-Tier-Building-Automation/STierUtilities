@@ -2,6 +2,7 @@
 
 import { updater, tauriProcess } from "../platform/tauri.js";
 import { el } from "./dom.js";
+import { getContentHost } from "../platform/content-host.js";
 import {
   attachPaneDrag,
   clampPaneWidth,
@@ -58,8 +59,6 @@ export function initSidebarSplitter({ userState, saveUserState, applySidebarColl
  * @param {() => void} deps.applySidebarCollapsed
  * @param {(on: boolean) => void} deps.setSidebarCollapsed
  * @param {object} deps.pages — { home, library, settings, account, services, activity, plugin }
- * @param {() => object|null} deps.getBuildingWorkspace
- * @param {() => object|null} [deps.getBacnetManager]
  * @param {() => object} [deps.getActivitySummary]
  * @param {() => object} [deps.getSystemStatus]
  * @param {() => string[]} [deps.getRecentTools]
@@ -68,7 +67,7 @@ export function initSidebarSplitter({ userState, saveUserState, applySidebarColl
 export function createAppShell({
   appVersion, getTools, isFavorite, isHidden, setView, pluginView,
   currentView, currentPluginId, applySidebarCollapsed, setSidebarCollapsed,
-  pages, getBuildingWorkspace, getBacnetManager = () => null,
+  pages,
   getActivitySummary = () => ({ errors: 0, warns: 0 }),
   getSystemStatus = () => ({}),
   getRecentTools = () => [],
@@ -337,9 +336,10 @@ export function createAppShell({
   }
 
   function renderChrome() {
-    renderSidebar();
+    // Sidebar + breadcrumb are now reactive Svelte components (mounted in
+    // app-tools.js) driven by the shared stores; the shell only keeps the
+    // account-menu active state, which still lives in the static header markup.
     const view = currentView();
-    renderHeaderBreadcrumb();
     document.getElementById("header-account-menu")?.classList.toggle(
       "active",
       view === "account" || view === "settings" || view === "services",
@@ -348,39 +348,28 @@ export function createAppShell({
 
   function renderCurrentPage() {
     const view = currentView();
+    const contentHost = getContentHost();
+    // Tool pages live in ContentRoot's keep-alive pool (DOM preserved across
+    // navigation); built-in pages render into #view-root as before.
+    if (view.startsWith("plugin:")) {
+      contentHost?.showTool(view.slice("plugin:".length));
+      return;
+    }
+    contentHost?.showBuiltin();
     if (view === "home") pages.home.renderPage();
     else if (view === "settings") pages.settings.renderPage();
     else if (view === "account") pages.account.renderPage();
     else if (view === "services") pages.services.renderPage();
     else if (view === "activity") pages.activity.renderPage();
-    else if (view.startsWith("plugin:")) pages.plugin.renderPage(view.slice("plugin:".length));
     else pages.library.renderPage();
   }
 
+  // Scope dispatch for tool-specific renderers now lives in the scope-registry
+  // (see render-bridge.js); the shell only knows the generic chrome/all/page
+  // scopes. render-bridge.renderScoped("page") calls in here for the page render.
   function renderScoped(scope = "page") {
-    const bw = getBuildingWorkspace();
     if (scope === "chrome") {
       renderChrome();
-      return;
-    }
-    if (scope === "building-workspace") {
-      bw?.renderWorkspaceScope?.();
-      return;
-    }
-    if (scope === "building-workspace:tab") {
-      bw?.renderTabScope?.();
-      return;
-    }
-    if (scope === "building-workspace:model") {
-      bw?.renderModelScope?.({ tree: true, details: true, header: true });
-      return;
-    }
-    if (scope === "bacnet-manager:devices") {
-      getBacnetManager()?.renderDevicesScope?.();
-      return;
-    }
-    if (scope === "bacnet-manager:inbox") {
-      getBacnetManager()?.renderInboxScope?.();
       return;
     }
     if (scope === "all") {

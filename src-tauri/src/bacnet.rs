@@ -2136,6 +2136,59 @@ pub async fn bacnet_write_property(
     .map_err(|e| format!("write task panicked: {e}"))?
 }
 
+/// BACnet Schedule object type (135 clause 12.24).
+const OBJECT_TYPE_SCHEDULE: u16 = 17;
+
+/// Read a Schedule object's full property set (weekly-schedule, present-value,
+/// effective-period, schedule-default, ...). Reuses ReadPropertyMultiple(ALL) so
+/// the frontend gets the normalized rendering it already understands.
+#[tauri::command]
+pub async fn bacnet_read_schedule(
+    device: DeviceRef,
+    instance: u32,
+) -> Result<Vec<PropertyEntry>, String> {
+    let client = client()?;
+    let target = resolve_device(&device)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        read_all_properties_core(&client, &target, ObjectId::new(OBJECT_TYPE_SCHEDULE, instance))
+    })
+    .await
+    .map_err(|e| format!("schedule read task panicked: {e}"))?
+}
+
+/// Command a Schedule object's present-value (a manual override of the currently
+/// scheduled output, at an optional command priority). Writing the full
+/// weekly-schedule array is a future enhancement; commanding present-value is the
+/// high-value commissioning action and reuses the audited write path.
+#[tauri::command]
+pub async fn bacnet_write_schedule(
+    device: DeviceRef,
+    instance: u32,
+    value: BacnetValue,
+    priority: Option<u8>,
+) -> Result<(), String> {
+    if let Some(p) = priority {
+        if !(1..=16).contains(&p) {
+            return Err("priority must be between 1 and 16".into());
+        }
+    }
+    let client = client()?;
+    let target = resolve_device(&device)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        write_property_core(
+            &client,
+            &target,
+            ObjectId::new(OBJECT_TYPE_SCHEDULE, instance),
+            codec::PROP_PRESENT_VALUE,
+            None,
+            &[value],
+            priority,
+        )
+    })
+    .await
+    .map_err(|e| format!("schedule write task panicked: {e}"))?
+}
+
 /// Records per ReadRange request — kept under a 480-byte device's APDU budget so
 /// even un-segmented trend logs answer (records are ~12-20 bytes each).
 const TREND_CHUNK: i32 = 20;
